@@ -21,7 +21,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install aiohttp aiofiles
 
       - name: Download and Extract list.zip
         run: |
@@ -47,71 +47,64 @@ jobs:
           import os
           import time
           import sys
-          from concurrent.futures import ThreadPoolExecutor, as_completed
-          from threading import Lock
-          import requests
+          import asyncio
+          import aiohttp
+          from urllib.parse import urlparse
 
-          print_lock = Lock()
-
-          def safe_print(*args, **kwargs):
-              with print_lock:
-                  print(*args, **kwargs, flush=True)
-
-          def load_existing_sites(filename):
+          async def load_existing_sites(filename):
               sites = set()
               if os.path.exists(filename):
                   try:
-                      with open(filename, "r", encoding="utf-8") as f:
-                          for line in f:
+                      async with aiofiles.open(filename, "r", encoding="utf-8") as f:
+                          async for line in f:
                               if line.strip():
                                   sites.add(line.strip().lower())
                   except:
                       pass
               return sites
 
-          session = requests.Session()
-          session.headers.update({'User-Agent': 'Mozilla/5.0'})
-          adapter = requests.adapters.HTTPAdapter(pool_connections=800, pool_maxsize=800, max_retries=0)
-          session.mount('https://', adapter)
-          session.mount('http://', adapter)
-
           WP_KEYWORDS = [b'wp-content', b'wp-includes', b'wordpress']
           JO_KEYWORDS = [b'joomla', b'/media/jui/', b'/components/com_']
 
-          def check_site(site):
+          def extract_domain(url):
+              try:
+                  parsed = urlparse(url)
+                  return parsed.netloc.lower()
+              except:
+                  return url.lower()
+
+          async def check_site(session, site):
               if not site.startswith(('http://', 'https://')):
                   url = 'https://' + site.strip()
               else:
                   url = site.strip()
               
               try:
-                  resp = session.get(url, timeout=8, allow_redirects=True, stream=True)
-                  chunk = resp.raw.read(4096, decode_content=True)
-                  resp.close()
-                  if resp.status_code != 200:
+                  async with session.get(url, timeout=aiohttp.ClientTimeout(total=8), allow_redirects=True) as resp:
+                      if resp.status != 200:
+                          return None, None
+                      chunk = await resp.content.read(4096)
+                      for kw in WP_KEYWORDS:
+                          if kw in chunk:
+                              return url, "wordpress"
+                      for kw in JO_KEYWORDS:
+                          if kw in chunk:
+                              return url, "joomla"
                       return None, None
-                  
-                  for kw in WP_KEYWORDS:
-                      if kw in chunk:
-                          return url, "wordpress"
-                  for kw in JO_KEYWORDS:
-                      if kw in chunk:
-                          return url, "joomla"
-                  return None, None
               except:
                   return None, None
 
-          def main():
-              safe_print("📂 Reading list...")
+          async def main():
+              print("📂 Reading list...", flush=True)
               with open("list.txt", "r", encoding="utf-8") as f:
                   sites = [line.strip() for line in f if line.strip()]
 
               total = len(sites)
-              safe_print(f"🚀 Loaded {total} websites.")
-              safe_print("=" * 50)
+              print(f"🚀 Loaded {total} websites.", flush=True)
+              print("=" * 50, flush=True)
 
-              wp_existing = load_existing_sites("wordpress_sites.txt")
-              joomla_existing = load_existing_sites("joomla_sites.txt")
+              wp_existing = await load_existing_sites("wordpress_sites.txt")
+              joomla_existing = await load_existing_sites("joomla_sites.txt")
 
               wp_new = set()
               joomla_new = set()
@@ -119,57 +112,50 @@ jobs:
               start_time = time.time()
               last_print = start_time
 
-              max_workers = 600
-              batch_size = 5000
-
-              for i in range(0, total, batch_size):
-                  batch = sites[i:i+batch_size]
+              connector = aiohttp.TCPConnector(limit=1000, limit_per_host=50, ttl_dns_cache=300)
+              async with aiohttp.ClientSession(connector=connector, headers={'User-Agent': 'Mozilla/5.0'}) as session:
+                  semaphore = asyncio.Semaphore(1000)
                   
-                  with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                      futures = {executor.submit(check_site, site): site for site in batch}
-                      
-                      for future in as_completed(futures):
-                          try:
-                              site, cms = future.result(timeout=12)
-                          except:
-                              site, cms = None, None
-                          
-                          processed += 1
-                          
-                          if site:
-                              site_lower = site.lower()
-                              if cms == "wordpress" and site_lower not in wp_existing:
-                                  wp_new.add(site)
-                              elif cms == "joomla" and site_lower not in joomla_existing:
-                                  joomla_new.add(site)
-                          
-                          now = time.time()
-                          if now - last_print >= 3:
-                              elapsed = now - start_time
-                              speed = processed / elapsed if elapsed > 1 else 0
-                              remaining = total - processed
-                              eta = remaining / speed if speed > 0 else 0
-                              pct = (processed / total) * 100
-                              safe_print(f"📊 {pct:.1f}% | {processed}/{total} | ⚡{speed:.0f}/s | WP:{len(wp_new)} | JO:{len(joomla_new)} | ETA:{eta/3600:.1f}h")
-                              last_print = now
+                  async def bounded_check(site):
+                      nonlocal processed, last_print
+                      async with semaphore:
+                          result = await check_site(session, site)
+                      processed += 1
+                      now = time.time()
+                      if now - last_print >= 3:
+                          elapsed = now - start_time
+                          speed = processed / elapsed if elapsed > 1 else 0
+                          remaining = total - processed
+                          eta = remaining / speed if speed > 0 else 0
+                          pct = (processed / total) * 100
+                          print(f"📊 {pct:.1f}% | {processed}/{total} | ⚡{speed:.0f}/s | WP:{len(wp_new)} | JO:{len(joomla_new)} | ETA:{eta/3600:.1f}h", flush=True)
+                          last_print = now
+                      if result[0]:
+                          site_url, cms = result
+                          if cms == "wordpress" and extract_domain(site_url) not in wp_existing:
+                              wp_new.add(site_url)
+                          elif cms == "joomla" and extract_domain(site_url) not in joomla_existing:
+                              joomla_new.add(site_url)
 
-              with open("wordpress_sites.txt", "a", encoding="utf-8") as f:
-                  for s in wp_new:
-                      f.write(s + "\n")
+                  tasks = [bounded_check(site) for site in sites]
+                  await asyncio.gather(*tasks)
 
-              with open("joomla_sites.txt", "a", encoding="utf-8") as f:
-                  for s in joomla_new:
-                      f.write(s + "\n")
+              # حفظ النتائج
+              if wp_new:
+                  with open("wordpress_sites.txt", "a", encoding="utf-8") as f:
+                      f.write("\n".join(wp_new) + "\n")
+              if joomla_new:
+                  with open("joomla_sites.txt", "a", encoding="utf-8") as f:
+                      f.write("\n".join(joomla_new) + "\n")
 
               elapsed = time.time() - start_time
-              safe_print("=" * 50)
-              safe_print(f"✅ DONE in {elapsed/60:.1f}min")
-              safe_print(f"📈 Scanned: {processed}")
-              safe_print(f"🟢 WordPress: {len(wp_new)}")
-              safe_print(f"🟠 Joomla: {len(joomla_new)}")
+              print("=" * 50, flush=True)
+              print(f"✅ DONE in {elapsed/60:.1f}min", flush=True)
+              print(f"📈 Scanned: {processed}", flush=True)
+              print(f"🟢 WordPress: {len(wp_new)}", flush=True)
+              print(f"🟠 Joomla: {len(joomla_new)}", flush=True)
 
-          if __name__ == "__main__":
-              main()
+          asyncio.run(main())
           PYEOF
 
       - name: Upload Results as Artifacts
