@@ -85,7 +85,7 @@ jobs:
                   async with session.get(url, timeout=aiohttp.ClientTimeout(total=8), allow_redirects=True) as resp:
                       if resp.status != 200:
                           return None, None
-                      chunk = await resp.content.read(2048)
+                      chunk = await resp.content.read(1024)  # 1KB فقط يكفي للكشف
                       for kw in WP_KEYWORDS:
                           if kw in chunk:
                               return url, "wordpress"
@@ -110,17 +110,19 @@ jobs:
 
               wp_new = set()
               joomla_new = set()
-              processed = 0
+              state = {
+                  'processed': 0,
+                  'last_print': time.time()
+              }
               start_time = time.time()
-              last_print = start_time
               lock = asyncio.Lock()
 
-              # استخدام AsyncResolver لتسريع DNS
+              # إعدادات الاتصال القصوى
               resolver = AsyncResolver(nameservers=['8.8.8.8', '1.1.1.1'])
               connector = aiohttp.TCPConnector(
-                  limit=1200,
-                  limit_per_host=100,
-                  ttl_dns_cache=300,
+                  limit=3000,
+                  limit_per_host=200,
+                  ttl_dns_cache=600,
                   use_dns_cache=True,
                   resolver=resolver
               )
@@ -129,13 +131,12 @@ jobs:
                   connector=connector,
                   headers={'User-Agent': 'Mozilla/5.0'}
               ) as session:
-                  semaphore = asyncio.Semaphore(1200)
+                  semaphore = asyncio.Semaphore(3000)
 
                   async def process_site(site):
-                      nonlocal processed, last_print
                       async with semaphore:
                           result = await check_site(session, site)
-                      processed += 1
+                      state['processed'] += 1
                       
                       if result[0]:
                           site_url, cms = result
@@ -146,18 +147,18 @@ jobs:
                               joomla_new.add(site_url)
 
                       now = time.time()
-                      if now - last_print >= 3:
+                      if now - state['last_print'] >= 3:
                           async with lock:
-                              if now - last_print >= 3:
+                              if now - state['last_print'] >= 3:
                                   elapsed = now - start_time
-                                  speed = processed / elapsed if elapsed > 1 else 0
-                                  remaining = total - processed
+                                  speed = state['processed'] / elapsed if elapsed > 1 else 0
+                                  remaining = total - state['processed']
                                   eta = remaining / speed if speed > 0 else 0
-                                  pct = (processed / total) * 100
-                                  print(f"📊 {pct:.1f}% | {processed}/{total} | ⚡{speed:.0f}/s | WP:{len(wp_new)} | JO:{len(joomla_new)} | ETA:{eta/3600:.1f}h", flush=True)
-                                  last_print = now
+                                  pct = (state['processed'] / total) * 100
+                                  print(f"📊 {pct:.1f}% | {state['processed']}/{total} | ⚡{speed:.0f}/s | WP:{len(wp_new)} | JO:{len(joomla_new)} | ETA:{eta/3600:.1f}h", flush=True)
+                                  state['last_print'] = now
 
-                  batch_size = 200000
+                  batch_size = 50000
                   for start in range(0, total, batch_size):
                       batch = sites[start:start+batch_size]
                       tasks = [process_site(site) for site in batch]
@@ -173,7 +174,7 @@ jobs:
               elapsed = time.time() - start_time
               print("=" * 50, flush=True)
               print(f"✅ DONE in {elapsed/60:.1f}min", flush=True)
-              print(f"📈 Scanned: {processed}", flush=True)
+              print(f"📈 Scanned: {state['processed']}", flush=True)
               print(f"🟢 WordPress: {len(wp_new)}", flush=True)
               print(f"🟠 Joomla: {len(joomla_new)}", flush=True)
 
