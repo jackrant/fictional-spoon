@@ -21,7 +21,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install aiohttp aiofiles
+          pip install aiohttp aiofiles aiodns
 
       - name: Download and Extract list.zip
         run: |
@@ -49,6 +49,7 @@ jobs:
           import sys
           import asyncio
           import aiohttp
+          from aiohttp.resolver import AsyncResolver
           from urllib.parse import urlparse
 
           WP_KEYWORDS = [b'wp-content', b'wp-includes', b'wordpress']
@@ -84,7 +85,7 @@ jobs:
                   async with session.get(url, timeout=aiohttp.ClientTimeout(total=8), allow_redirects=True) as resp:
                       if resp.status != 200:
                           return None, None
-                      chunk = await resp.content.read(4096)
+                      chunk = await resp.content.read(2048)
                       for kw in WP_KEYWORDS:
                           if kw in chunk:
                               return url, "wordpress"
@@ -114,9 +115,21 @@ jobs:
               last_print = start_time
               lock = asyncio.Lock()
 
-              connector = aiohttp.TCPConnector(limit=500, limit_per_host=30, ttl_dns_cache=300)
-              async with aiohttp.ClientSession(connector=connector, headers={'User-Agent': 'Mozilla/5.0'}) as session:
-                  semaphore = asyncio.Semaphore(500)
+              # استخدام AsyncResolver لتسريع DNS
+              resolver = AsyncResolver(nameservers=['8.8.8.8', '1.1.1.1'])
+              connector = aiohttp.TCPConnector(
+                  limit=1200,
+                  limit_per_host=100,
+                  ttl_dns_cache=300,
+                  use_dns_cache=True,
+                  resolver=resolver
+              )
+
+              async with aiohttp.ClientSession(
+                  connector=connector,
+                  headers={'User-Agent': 'Mozilla/5.0'}
+              ) as session:
+                  semaphore = asyncio.Semaphore(1200)
 
                   async def process_site(site):
                       nonlocal processed, last_print
@@ -144,14 +157,12 @@ jobs:
                                   print(f"📊 {pct:.1f}% | {processed}/{total} | ⚡{speed:.0f}/s | WP:{len(wp_new)} | JO:{len(joomla_new)} | ETA:{eta/3600:.1f}h", flush=True)
                                   last_print = now
 
-                  # معالجة على دفعات لتجنب استهلاك الذاكرة
-                  batch_size = 100000
+                  batch_size = 200000
                   for start in range(0, total, batch_size):
                       batch = sites[start:start+batch_size]
                       tasks = [process_site(site) for site in batch]
                       await asyncio.gather(*tasks)
 
-              # حفظ النتائج
               if wp_new:
                   with open("wordpress_sites.txt", "a", encoding="utf-8") as f:
                       f.write("\n".join(wp_new) + "\n")
