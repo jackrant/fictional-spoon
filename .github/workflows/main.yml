@@ -21,7 +21,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install aiohttp
+          pip install aiohttp aiodns
 
       - name: Download and Extract list.zip
         run: |
@@ -49,7 +49,7 @@ jobs:
           import sys
           import asyncio
           import aiohttp
-          from urllib.parse import urljoin
+          from asyncio import Semaphore, Queue
 
           def load_existing_sites(filename):
               sites = set()
@@ -63,25 +63,58 @@ jobs:
                       pass
               return sites
 
-          async def check_site(session, site, semaphore):
-              if not site.startswith(('http://', 'https://')):
-                  site = 'https://' + site.strip()
-              
+          async def fetch(session, url, semaphore):
               async with semaphore:
                   try:
-                      async with session.get(site, timeout=aiohttp.ClientTimeout(total=5), ssl=False) as resp:
+                      async with session.get(url, timeout=aiohttp.ClientTimeout(total=8), ssl=False) as resp:
                           if resp.status != 200:
-                              return None, None
+                              return None
                           text = await resp.text()
-                          text_lower = text[:3000].lower()
+                          text_lower = text[:5000].lower()
                           
                           if 'wp-content' in text_lower or 'wp-includes' in text_lower or 'wordpress' in text_lower:
-                              return site, "wordpress"
-                          if 'joomla' in text_lower or '/media/jui/' in text_lower or '/components/com_' in text_lower:
-                              return site, "joomla"
-                          return None, None
-                  except:
-                      return None, None
+                              return "wordpress"
+                          if 'joomla' in text_lower or '/media/jui/' in text_lower or 'com_content' in text_lower:
+                              return "joomla"
+                          return None
+                  except asyncio.TimeoutError:
+                      return None
+                  except aiohttp.ClientError:
+                      return None
+                  except Exception:
+                      return None
+
+          async def worker(session, queue, semaphore, results, stats):
+              while True:
+                  try:
+                      site = await asyncio.wait_for(queue.get(), timeout=1)
+                  except asyncio.TimeoutError:
+                      return
+                  
+                  if not site.startswith(('http://', 'https://')):
+                      site = 'https://' + site.strip()
+                  
+                  cms = await fetch(session, site, semaphore)
+                  
+                  if cms:
+                      results.append((site, cms))
+                  
+                  stats['processed'] += 1
+                  queue.task_done()
+
+          async def status_printer(stats, total, start_time, stop_event):
+              while not stop_event.is_set():
+                  await asyncio.sleep(2)
+                  now = time.time()
+                  elapsed = now - start_time
+                  p = stats['processed']
+                  speed = p / elapsed if elapsed > 0 else 0
+                  remaining = total - p
+                  eta = remaining / speed if speed > 0 else 0
+                  pct = (p / total) * 100
+                  wp = stats['wp']
+                  jo = stats['jo']
+                  print(f"📊 {pct:.2f}% | {p:,}/{total:,} | ⚡{speed:,.0f}/s | WP:{wp:,} | JO:{jo:,} | ETA:{eta/60:.1f}m", flush=True)
 
           async def main():
               print("📂 Reading list...", flush=True)
@@ -89,47 +122,56 @@ jobs:
                   sites = [line.strip() for line in f if line.strip()]
 
               total = len(sites)
-              print(f"🚀 Loaded {total} websites.", flush=True)
+              print(f"🚀 Loaded {total:,} websites.", flush=True)
               print("=" * 50, flush=True)
 
               wp_existing = load_existing_sites("wordpress_sites.txt")
               joomla_existing = load_existing_sites("joomla_sites.txt")
 
+              queue = Queue()
+              for site in sites:
+                  queue.put_nowait(site)
+
+              results = []
+              stats = {'processed': 0, 'wp': 0, 'jo': 0}
+              start_time = time.time()
+              stop_event = asyncio.Event()
+
+              semaphore = Semaphore(500)
+              connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300, force_close=True)
+              timeout = aiohttp.ClientTimeout(total=8, connect=5)
+
+              status_task = asyncio.create_task(status_printer(stats, total, start_time, stop_event))
+
+              async with aiohttp.ClientSession(
+                  connector=connector,
+                  timeout=timeout,
+                  headers={'User-Agent': 'Mozilla/5.0 (compatible; CMSDetector/1.0)'}
+              ) as session:
+                  
+                  workers = []
+                  num_workers = 200
+                  
+                  for _ in range(num_workers):
+                      task = asyncio.create_task(worker(session, queue, semaphore, results, stats))
+                      workers.append(task)
+                  
+                  await asyncio.gather(*workers)
+
+              stop_event.set()
+              await status_task
+
               wp_new = set()
               joomla_new = set()
-              processed = 0
-              start_time = time.time()
-              last_print = start_time
-
-              connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300, force_close=True)
-              timeout = aiohttp.ClientTimeout(total=5, connect=3)
-              semaphore = asyncio.Semaphore(2000)
-
-              async with aiohttp.ClientSession(connector=connector, timeout=timeout, headers={'User-Agent': 'Mozilla/5.0'}) as session:
-                  tasks = [check_site(session, site, semaphore) for site in sites]
-                  
-                  batch_size = 5000
-                  for i in range(0, len(tasks), batch_size):
-                      batch = tasks[i:i+batch_size]
-                      results = await asyncio.gather(*batch, return_exceptions=True)
-                      
-                      for result in results:
-                          processed += 1
-                          if isinstance(result, tuple) and result[0]:
-                              site, cms = result
-                              site_lower = site.lower()
-                              if cms == "wordpress" and site_lower not in wp_existing:
-                                  wp_new.add(site)
-                              elif cms == "joomla" and site_lower not in joomla_existing:
-                                  joomla_new.add(site)
-                      
-                      now = time.time()
-                      elapsed = now - start_time
-                      speed = processed / elapsed if elapsed > 1 else 0
-                      remaining = total - processed
-                      eta = remaining / speed if speed > 0 else 0
-                      pct = (processed / total) * 100
-                      print(f"📊 {pct:.1f}% | {processed:,}/{total:,} | ⚡{speed:,.0f}/s | WP:{len(wp_new):,} | JO:{len(joomla_new):,} | ETA:{eta/60:.0f}m", flush=True)
+              
+              for site, cms in results:
+                  site_lower = site.lower()
+                  if cms == "wordpress" and site_lower not in wp_existing:
+                      wp_new.add(site)
+                      stats['wp'] = len(wp_new)
+                  elif cms == "joomla" and site_lower not in joomla_existing:
+                      joomla_new.add(site)
+                      stats['jo'] = len(joomla_new)
 
               with open("wordpress_sites.txt", "a", encoding="utf-8") as f:
                   for s in wp_new:
@@ -142,7 +184,7 @@ jobs:
               elapsed = time.time() - start_time
               print("=" * 50, flush=True)
               print(f"✅ DONE in {elapsed/60:.1f}min", flush=True)
-              print(f"📈 Scanned: {processed:,}", flush=True)
+              print(f"📈 Scanned: {stats['processed']:,}", flush=True)
               print(f"🟢 WordPress: {len(wp_new):,}", flush=True)
               print(f"🟠 Joomla: {len(joomla_new):,}", flush=True)
 
