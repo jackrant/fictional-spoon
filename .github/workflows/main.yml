@@ -47,8 +47,7 @@ jobs:
           import os
           import time
           import sys
-          import threading
-          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
           from urllib.parse import urljoin
           from threading import Lock
 
@@ -76,17 +75,13 @@ jobs:
           def is_wordpress(site_url):
               try:
                   headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-                  resp = requests.get(site_url, headers=headers, timeout=10, allow_redirects=True)
+                  resp = requests.get(site_url, headers=headers, timeout=8, allow_redirects=True)
                   if resp.status_code != 200:
                       return False
                   text = resp.text.lower()
-                  soup = BeautifulSoup(resp.text, 'html.parser')
-                  
-                  if soup.find('meta', attrs={'name': 'generator', 'content': lambda x: x and 'wordpress' in x.lower()}):
+                  if 'wp-content' in text or 'wp-includes' in text or 'wordpress' in text:
                       return True
-                  if 'wp-content' in text or 'wp-includes' in text:
-                      return True
-                  if requests.get(urljoin(site_url, '/wp-login.php'), headers=headers, timeout=8).status_code == 200:
+                  if requests.get(urljoin(site_url, '/wp-login.php'), headers=headers, timeout=5).status_code == 200:
                       return True
                   return False
               except:
@@ -95,17 +90,13 @@ jobs:
           def is_joomla(site_url):
               try:
                   headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-                  resp = requests.get(site_url, headers=headers, timeout=10, allow_redirects=True)
+                  resp = requests.get(site_url, headers=headers, timeout=8, allow_redirects=True)
                   if resp.status_code != 200:
                       return False
                   text = resp.text.lower()
-                  soup = BeautifulSoup(resp.text, 'html.parser')
-                  
-                  if soup.find('meta', attrs={'name': 'generator', 'content': lambda x: x and 'joomla' in x.lower()}):
+                  if '/media/jui/' in text or '/components/com_' in text or 'joomla' in text:
                       return True
-                  if '/media/jui/' in text or 'joomla' in text:
-                      return True
-                  if requests.get(urljoin(site_url, '/administrator/'), headers=headers, timeout=8).status_code == 200:
+                  if requests.get(urljoin(site_url, '/administrator/'), headers=headers, timeout=5).status_code == 200:
                       return True
                   return False
               except:
@@ -114,6 +105,7 @@ jobs:
           def check_site(site):
               if not site.startswith(('http://', 'https://')):
                   site = 'https://' + site.strip()
+              
               if is_wordpress(site):
                   return site, "wordpress"
               elif is_joomla(site):
@@ -121,8 +113,9 @@ jobs:
               return None, None
 
           def main():
+              safe_print("📂 Reading list.txt...")
               with open("list.txt", "r", encoding="utf-8") as f:
-                  sites = [line.strip() for line in f if line.strip()]
+                  sites = [line.strip() for line in f if line.strip()[:5]]
 
               total = len(sites)
               safe_print(f"🚀 Loaded {total} websites.")
@@ -133,46 +126,42 @@ jobs:
 
               wp_new = set()
               joomla_new = set()
-              processed = [0]
+              processed = 0
               start_time = time.time()
-              lock = Lock()
 
-              def status_reporter():
-                  while True:
-                      time.sleep(5)
-                      with lock:
-                          elapsed = time.time() - start_time
-                          speed = processed[0] / elapsed if elapsed > 1 else 0
-                          remaining = total - processed[0]
-                          pct = (processed[0] / total) * 100 if total > 0 else 0
-                          safe_print(f"📊 [{pct:.2f}%] {processed[0]}/{total} | ⚡ {speed:.1f} sites/s | 🟢 WP: {len(wp_new)} | 🟠 Joomla: {len(joomla_new)} | ⏳ Remaining: {remaining}")
-
-              reporter_thread = threading.Thread(target=status_reporter, daemon=True)
-              reporter_thread.start()
-
-              max_workers = 200
-
-              with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                  futures = {executor.submit(check_site, site): site for site in sites}
-                  for future in as_completed(futures):
-                      try:
-                          site, cms = future.result(timeout=30)
-                      except:
-                          site, cms = None, None
+              max_workers = 300
+              batch_size = 1000
+              
+              # نضيف المواقع على دفعات بدل الكل مرة واحدة
+              for i in range(0, total, batch_size):
+                  batch = sites[i:i+batch_size]
+                  
+                  with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                      futures = {executor.submit(check_site, site): site for site in batch}
                       
-                      with lock:
-                          processed[0] += 1
-                      
-                      if site:
-                          site_lower = site.lower()
-                          if cms == "wordpress" and site_lower not in wp_existing:
-                              with lock:
+                      for future in as_completed(futures):
+                          try:
+                              site, cms = future.result(timeout=15)
+                          except:
+                              site, cms = None, None
+                          
+                          processed += 1
+                          
+                          if site:
+                              site_lower = site.lower()
+                              if cms == "wordpress" and site_lower not in wp_existing:
                                   wp_new.add(site)
-                              safe_print(f"🟢 [WP] {site}")
-                          elif cms == "joomla" and site_lower not in joomla_existing:
-                              with lock:
+                                  safe_print(f"🟢 [WP] {site}")
+                              elif cms == "joomla" and site_lower not in joomla_existing:
                                   joomla_new.add(site)
-                              safe_print(f"🟠 [JO] {site}")
+                                  safe_print(f"🟠 [JO] {site}")
+                          
+                          if processed % 100 == 0:
+                              elapsed = time.time() - start_time
+                              speed = processed / elapsed if elapsed > 1 else 0
+                              remaining = total - processed
+                              pct = (processed / total) * 100 if total > 0 else 0
+                              safe_print(f"📊 [{pct:.2f}%] {processed}/{total} | ⚡ {speed:.1f} sites/s | 🟢 WP: {len(wp_new)} | 🟠 JO: {len(joomla_new)} | ⏳ {remaining} left")
 
               with open("wordpress_sites.txt", "a", encoding="utf-8") as f:
                   for s in wp_new:
@@ -182,9 +171,11 @@ jobs:
                   for s in joomla_new:
                       f.write(s + "\n")
 
+              elapsed = time.time() - start_time
               safe_print("=" * 60)
               safe_print("✅ SCAN COMPLETED!")
-              safe_print(f"📈 Total scanned: {processed[0]}")
+              safe_print(f"⏱️  Time: {elapsed:.1f}s")
+              safe_print(f"📈 Total scanned: {processed}")
               safe_print(f"🟢 New WordPress: {len(wp_new)}")
               safe_print(f"🟠 New Joomla: {len(joomla_new)}")
 
