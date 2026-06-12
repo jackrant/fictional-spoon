@@ -21,7 +21,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4
+          pip install requests beautifulsoup4 colorama
 
       - name: Download and Extract list.zip
         run: |
@@ -41,7 +41,7 @@ jobs:
 
       - name: Run CMS Detector
         run: |
-          cat > cms_detector.py << 'EOF'
+          cat > cms_detector.py << 'PYEOF'
 import os
 import time
 import threading
@@ -136,8 +136,7 @@ def main():
     status_thread = threading.Thread(target=print_status, daemon=True)
     status_thread.start()
 
-    # عدد ثريدز عالي جداً للوصول إلى \~5000 موقع/ثانية
-    max_workers = 400
+    max_workers = 350
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(check_site, site): site for site in sites}
@@ -151,7 +150,6 @@ def main():
                     joomla_new.add(site)
             processed += 1
 
-    # حفظ النتائج
     with open("wordpress_sites.txt", "a", encoding="utf-8") as f:
         for s in wp_new:
             f.write(s + "\n")
@@ -167,7 +165,7 @@ def main():
 
 if __name__ == "__main__":
     main()
-EOF
+PYEOF
 
           python cms_detector.py
 
@@ -178,6 +176,7 @@ EOF
           path: |
             wordpress_sites.txt
             joomla_sites.txt
+            list.txt
           retention-days: 30
 
       - name: Show Final Statistics
