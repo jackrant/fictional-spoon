@@ -41,133 +41,131 @@ jobs:
 
       - name: Run CMS Detector
         run: |
-          cat > cms_detector.py << 'PYEOF'
-import os
-import time
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urljoin
+          python << 'PYEOF'
+          import os
+          import time
+          import threading
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from urllib.parse import urljoin
 
-import requests
-from bs4 import BeautifulSoup
+          import requests
+          from bs4 import BeautifulSoup
 
-def load_existing_sites(filename):
-    sites = set()
-    if os.path.exists(filename):
-        try:
-            with open(filename, "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.strip():
-                        sites.add(line.strip().lower())
-        except:
-            pass
-    return sites
+          def load_existing_sites(filename):
+              sites = set()
+              if os.path.exists(filename):
+                  try:
+                      with open(filename, "r", encoding="utf-8") as f:
+                          for line in f:
+                              if line.strip():
+                                  sites.add(line.strip().lower())
+                  except:
+                      pass
+              return sites
 
-def is_wordpress(site_url):
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        resp = requests.get(site_url, headers=headers, timeout=10, allow_redirects=True)
-        if resp.status_code != 200:
-            return False
-        text = resp.text.lower()
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        
-        if soup.find('meta', attrs={'name': 'generator', 'content': lambda x: x and 'wordpress' in x.lower()}):
-            return True
-        if 'wp-content' in text or 'wp-includes' in text:
-            return True
-        if requests.get(urljoin(site_url, '/wp-login.php'), headers=headers, timeout=8).status_code == 200:
-            return True
-        return False
-    except:
-        return False
+          def is_wordpress(site_url):
+              try:
+                  headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+                  resp = requests.get(site_url, headers=headers, timeout=10, allow_redirects=True)
+                  if resp.status_code != 200:
+                      return False
+                  text = resp.text.lower()
+                  soup = BeautifulSoup(resp.text, 'html.parser')
+                  
+                  if soup.find('meta', attrs={'name': 'generator', 'content': lambda x: x and 'wordpress' in x.lower()}):
+                      return True
+                  if 'wp-content' in text or 'wp-includes' in text:
+                      return True
+                  if requests.get(urljoin(site_url, '/wp-login.php'), headers=headers, timeout=8).status_code == 200:
+                      return True
+                  return False
+              except:
+                  return False
 
-def is_joomla(site_url):
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        resp = requests.get(site_url, headers=headers, timeout=10, allow_redirects=True)
-        if resp.status_code != 200:
-            return False
-        text = resp.text.lower()
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        
-        if soup.find('meta', attrs={'name': 'generator', 'content': lambda x: x and 'joomla' in x.lower()}):
-            return True
-        if '/media/jui/' in text or 'joomla' in text:
-            return True
-        if requests.get(urljoin(site_url, '/administrator/'), headers=headers, timeout=8).status_code == 200:
-            return True
-        return False
-    except:
-        return False
+          def is_joomla(site_url):
+              try:
+                  headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+                  resp = requests.get(site_url, headers=headers, timeout=10, allow_redirects=True)
+                  if resp.status_code != 200:
+                      return False
+                  text = resp.text.lower()
+                  soup = BeautifulSoup(resp.text, 'html.parser')
+                  
+                  if soup.find('meta', attrs={'name': 'generator', 'content': lambda x: x and 'joomla' in x.lower()}):
+                      return True
+                  if '/media/jui/' in text or 'joomla' in text:
+                      return True
+                  if requests.get(urljoin(site_url, '/administrator/'), headers=headers, timeout=8).status_code == 200:
+                      return True
+                  return False
+              except:
+                  return False
 
-def check_site(site):
-    if not site.startswith(('http://', 'https://')):
-        site = 'https://' + site.strip()
-    if is_wordpress(site):
-        return site, "wordpress"
-    elif is_joomla(site):
-        return site, "joomla"
-    return None, None
+          def check_site(site):
+              if not site.startswith(('http://', 'https://')):
+                  site = 'https://' + site.strip()
+              if is_wordpress(site):
+                  return site, "wordpress"
+              elif is_joomla(site):
+                  return site, "joomla"
+              return None, None
 
-def main():
-    with open("list.txt", "r", encoding="utf-8") as f:
-        sites = [line.strip() for line in f if line.strip()]
+          def main():
+              with open("list.txt", "r", encoding="utf-8") as f:
+                  sites = [line.strip() for line in f if line.strip()]
 
-    total = len(sites)
-    print(f"Loaded {total} websites.")
+              total = len(sites)
+              print(f"Loaded {total} websites.")
 
-    wp_existing = load_existing_sites("wordpress_sites.txt")
-    joomla_existing = load_existing_sites("joomla_sites.txt")
+              wp_existing = load_existing_sites("wordpress_sites.txt")
+              joomla_existing = load_existing_sites("joomla_sites.txt")
 
-    wp_new = set()
-    joomla_new = set()
-    processed = 0
-    start_time = time.time()
+              wp_new = set()
+              joomla_new = set()
+              processed = 0
+              start_time = time.time()
 
-    def print_status():
-        while True:
-            elapsed = time.time() - start_time
-            speed = processed / elapsed if elapsed > 1 else 0
-            remaining = total - processed
-            print(f"WordPress: {len(wp_new)} | Joomla: {len(joomla_new)} | Keep: {remaining} | Links/s: {speed:.1f}")
-            time.sleep(8)
+              def print_status():
+                  while True:
+                      elapsed = time.time() - start_time
+                      speed = processed / elapsed if elapsed > 1 else 0
+                      remaining = total - processed
+                      print(f"WordPress: {len(wp_new)} | Joomla: {len(joomla_new)} | Keep: {remaining} | Links/s: {speed:.1f}")
+                      time.sleep(8)
 
-    status_thread = threading.Thread(target=print_status, daemon=True)
-    status_thread.start()
+              status_thread = threading.Thread(target=print_status, daemon=True)
+              status_thread.start()
 
-    max_workers = 350
+              max_workers = 350
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(check_site, site): site for site in sites}
-        for future in as_completed(futures):
-            site, cms = future.result()
-            if site:
-                site_lower = site.lower()
-                if cms == "wordpress" and site_lower not in wp_existing:
-                    wp_new.add(site)
-                elif cms == "joomla" and site_lower not in joomla_existing:
-                    joomla_new.add(site)
-            processed += 1
+              with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                  futures = {executor.submit(check_site, site): site for site in sites}
+                  for future in as_completed(futures):
+                      site, cms = future.result()
+                      if site:
+                          site_lower = site.lower()
+                          if cms == "wordpress" and site_lower not in wp_existing:
+                              wp_new.add(site)
+                          elif cms == "joomla" and site_lower not in joomla_existing:
+                              joomla_new.add(site)
+                      processed += 1
 
-    with open("wordpress_sites.txt", "a", encoding="utf-8") as f:
-        for s in wp_new:
-            f.write(s + "\n")
+              with open("wordpress_sites.txt", "a", encoding="utf-8") as f:
+                  for s in wp_new:
+                      f.write(s + "\n")
 
-    with open("joomla_sites.txt", "a", encoding="utf-8") as f:
-        for s in joomla_new:
-            f.write(s + "\n")
+              with open("joomla_sites.txt", "a", encoding="utf-8") as f:
+                  for s in joomla_new:
+                      f.write(s + "\n")
 
-    print("\n=== SCAN COMPLETED ===")
-    print(f"New WordPress: {len(wp_new)}")
-    print(f"New Joomla   : {len(joomla_new)}")
-    print(f"Total scanned: {total}")
+              print("\n=== SCAN COMPLETED ===")
+              print(f"New WordPress: {len(wp_new)}")
+              print(f"New Joomla   : {len(joomla_new)}")
+              print(f"Total scanned: {total}")
 
-if __name__ == "__main__":
-    main()
-PYEOF
-
-          python cms_detector.py
+          if __name__ == "__main__":
+              main()
+          PYEOF
 
       - name: Upload Results as Artifacts
         uses: actions/upload-artifact@v4
