@@ -40,11 +40,12 @@ jobs:
           fi
 
       - name: Run CMS Detector
+        env:
+          PYTHONUNBUFFERED: 1
         run: |
           python << 'PYEOF'
           import os
           import time
-          import threading
           import sys
           from concurrent.futures import ThreadPoolExecutor, as_completed
           from urllib.parse import urljoin
@@ -116,8 +117,8 @@ jobs:
                   sites = [line.strip() for line in f if line.strip()]
 
               total = len(sites)
-              print(f"Loaded {total} websites.")
-              print("=" * 60)
+              print(f"Loaded {total} websites.", flush=True)
+              print("=" * 60, flush=True)
 
               wp_existing = load_existing_sites("wordpress_sites.txt")
               joomla_existing = load_existing_sites("joomla_sites.txt")
@@ -137,20 +138,17 @@ jobs:
                           site_lower = site.lower()
                           if cms == "wordpress" and site_lower not in wp_existing:
                               wp_new.add(site)
-                              print(f"[WORDPRESS] {site}")
-                              sys.stdout.flush()
+                              print(f"[WORDPRESS] {site}", flush=True)
                           elif cms == "joomla" and site_lower not in joomla_existing:
                               joomla_new.add(site)
-                              print(f"[JOOMLA] {site}")
-                              sys.stdout.flush()
+                              print(f"[JOOMLA] {site}", flush=True)
                       processed += 1
                       
                       if processed % 50 == 0 or processed == total:
                           elapsed = time.time() - start_time
                           speed = processed / elapsed if elapsed > 1 else 0
                           remaining = total - processed
-                          print(f"[STATUS] Scanned: {processed}/{total} | WP: {len(wp_new)} | Joomla: {len(joomla_new)} | Remaining: {remaining} | Speed: {speed:.1f} sites/s")
-                          sys.stdout.flush()
+                          print(f"[STATUS] Scanned: {processed}/{total} | WP: {len(wp_new)} | Joomla: {len(joomla_new)} | Remaining: {remaining} | Speed: {speed:.1f} sites/s", flush=True)
 
               with open("wordpress_sites.txt", "a", encoding="utf-8") as f:
                   for s in wp_new:
@@ -160,12 +158,11 @@ jobs:
                   for s in joomla_new:
                       f.write(s + "\n")
 
-              print("=" * 60)
-              print("=== SCAN COMPLETED ===")
-              print(f"Total scanned: {total}")
-              print(f"New WordPress: {len(wp_new)}")
-              print(f"New Joomla   : {len(joomla_new)}")
-              sys.stdout.flush()
+              print("=" * 60, flush=True)
+              print("=== SCAN COMPLETED ===", flush=True)
+              print(f"Total scanned: {total}", flush=True)
+              print(f"New WordPress: {len(wp_new)}", flush=True)
+              print(f"New Joomla   : {len(joomla_new)}", flush=True)
 
           if __name__ == "__main__":
               main()
