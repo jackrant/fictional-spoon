@@ -51,18 +51,6 @@ jobs:
           import aiohttp
           from urllib.parse import urlparse
 
-          async def load_existing_sites(filename):
-              sites = set()
-              if os.path.exists(filename):
-                  try:
-                      async with aiofiles.open(filename, "r", encoding="utf-8") as f:
-                          async for line in f:
-                              if line.strip():
-                                  sites.add(line.strip().lower())
-                  except:
-                      pass
-              return sites
-
           WP_KEYWORDS = [b'wp-content', b'wp-includes', b'wordpress']
           JO_KEYWORDS = [b'joomla', b'/media/jui/', b'/components/com_']
 
@@ -72,6 +60,19 @@ jobs:
                   return parsed.netloc.lower()
               except:
                   return url.lower()
+
+          async def load_existing_sites(filename):
+              sites = set()
+              if os.path.exists(filename):
+                  try:
+                      async with aiofiles.open(filename, "r", encoding="utf-8") as f:
+                          async for line in f:
+                              line = line.strip()
+                              if line:
+                                  sites.add(line.lower())
+                  except:
+                      pass
+              return sites
 
           async def check_site(session, site):
               if not site.startswith(('http://', 'https://')):
@@ -111,34 +112,44 @@ jobs:
               processed = 0
               start_time = time.time()
               last_print = start_time
+              lock = asyncio.Lock()
 
-              connector = aiohttp.TCPConnector(limit=1000, limit_per_host=50, ttl_dns_cache=300)
+              connector = aiohttp.TCPConnector(limit=500, limit_per_host=30, ttl_dns_cache=300)
               async with aiohttp.ClientSession(connector=connector, headers={'User-Agent': 'Mozilla/5.0'}) as session:
-                  semaphore = asyncio.Semaphore(1000)
-                  
-                  async def bounded_check(site):
+                  semaphore = asyncio.Semaphore(500)
+
+                  async def process_site(site):
                       nonlocal processed, last_print
                       async with semaphore:
                           result = await check_site(session, site)
                       processed += 1
-                      now = time.time()
-                      if now - last_print >= 3:
-                          elapsed = now - start_time
-                          speed = processed / elapsed if elapsed > 1 else 0
-                          remaining = total - processed
-                          eta = remaining / speed if speed > 0 else 0
-                          pct = (processed / total) * 100
-                          print(f"📊 {pct:.1f}% | {processed}/{total} | ⚡{speed:.0f}/s | WP:{len(wp_new)} | JO:{len(joomla_new)} | ETA:{eta/3600:.1f}h", flush=True)
-                          last_print = now
+                      
                       if result[0]:
                           site_url, cms = result
-                          if cms == "wordpress" and extract_domain(site_url) not in wp_existing:
+                          domain = extract_domain(site_url)
+                          if cms == "wordpress" and domain not in wp_existing:
                               wp_new.add(site_url)
-                          elif cms == "joomla" and extract_domain(site_url) not in joomla_existing:
+                          elif cms == "joomla" and domain not in joomla_existing:
                               joomla_new.add(site_url)
 
-                  tasks = [bounded_check(site) for site in sites]
-                  await asyncio.gather(*tasks)
+                      now = time.time()
+                      if now - last_print >= 3:
+                          async with lock:
+                              if now - last_print >= 3:
+                                  elapsed = now - start_time
+                                  speed = processed / elapsed if elapsed > 1 else 0
+                                  remaining = total - processed
+                                  eta = remaining / speed if speed > 0 else 0
+                                  pct = (processed / total) * 100
+                                  print(f"📊 {pct:.1f}% | {processed}/{total} | ⚡{speed:.0f}/s | WP:{len(wp_new)} | JO:{len(joomla_new)} | ETA:{eta/3600:.1f}h", flush=True)
+                                  last_print = now
+
+                  # معالجة على دفعات لتجنب استهلاك الذاكرة
+                  batch_size = 100000
+                  for start in range(0, total, batch_size):
+                      batch = sites[start:start+batch_size]
+                      tasks = [process_site(site) for site in batch]
+                      await asyncio.gather(*tasks)
 
               # حفظ النتائج
               if wp_new:
