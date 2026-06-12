@@ -48,7 +48,6 @@ jobs:
           import time
           import sys
           from concurrent.futures import ThreadPoolExecutor, as_completed
-          from urllib.parse import urljoin
           from threading import Lock
           import requests
 
@@ -71,48 +70,36 @@ jobs:
               return sites
 
           session = requests.Session()
-          session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
-          adapter = requests.adapters.HTTPAdapter(pool_connections=500, pool_maxsize=500, max_retries=0)
+          session.headers.update({'User-Agent': 'Mozilla/5.0'})
+          adapter = requests.adapters.HTTPAdapter(pool_connections=800, pool_maxsize=800, max_retries=0)
           session.mount('https://', adapter)
           session.mount('http://', adapter)
 
-          def is_wordpress(site_url):
-              try:
-                  resp = session.get(site_url, timeout=5, allow_redirects=True, stream=True)
-                  chunk = resp.raw.read(8192, decode_content=True)
-                  resp.close()
-                  if resp.status_code != 200:
-                      return False
-                  text = chunk.decode('utf-8', errors='ignore').lower()
-                  if 'wp-content' in text or 'wp-includes' in text or 'wordpress' in text:
-                      return True
-                  return False
-              except:
-                  return False
-
-          def is_joomla(site_url):
-              try:
-                  resp = session.get(site_url, timeout=5, allow_redirects=True, stream=True)
-                  chunk = resp.raw.read(8192, decode_content=True)
-                  resp.close()
-                  if resp.status_code != 200:
-                      return False
-                  text = chunk.decode('utf-8', errors='ignore').lower()
-                  if 'joomla' in text or '/media/jui/' in text or '/components/com_' in text:
-                      return True
-                  return False
-              except:
-                  return False
+          WP_KEYWORDS = [b'wp-content', b'wp-includes', b'wordpress']
+          JO_KEYWORDS = [b'joomla', b'/media/jui/', b'/components/com_']
 
           def check_site(site):
               if not site.startswith(('http://', 'https://')):
-                  site = 'https://' + site.strip()
+                  url = 'https://' + site.strip()
+              else:
+                  url = site.strip()
               
-              if is_wordpress(site):
-                  return site, "wordpress"
-              if is_joomla(site):
-                  return site, "joomla"
-              return None, None
+              try:
+                  resp = session.get(url, timeout=8, allow_redirects=True, stream=True)
+                  chunk = resp.raw.read(4096, decode_content=True)
+                  resp.close()
+                  if resp.status_code != 200:
+                      return None, None
+                  
+                  for kw in WP_KEYWORDS:
+                      if kw in chunk:
+                          return url, "wordpress"
+                  for kw in JO_KEYWORDS:
+                      if kw in chunk:
+                          return url, "joomla"
+                  return None, None
+              except:
+                  return None, None
 
           def main():
               safe_print("📂 Reading list...")
@@ -132,8 +119,8 @@ jobs:
               start_time = time.time()
               last_print = start_time
 
-              max_workers = 400
-              batch_size = 2000
+              max_workers = 600
+              batch_size = 5000
 
               for i in range(0, total, batch_size):
                   batch = sites[i:i+batch_size]
@@ -143,7 +130,7 @@ jobs:
                       
                       for future in as_completed(futures):
                           try:
-                              site, cms = future.result(timeout=10)
+                              site, cms = future.result(timeout=12)
                           except:
                               site, cms = None, None
                           
@@ -163,7 +150,7 @@ jobs:
                               remaining = total - processed
                               eta = remaining / speed if speed > 0 else 0
                               pct = (processed / total) * 100
-                              safe_print(f"📊 {pct:.1f}% | {processed}/{total} | ⚡{speed:.0f}/s | WP:{len(wp_new)} | JO:{len(joomla_new)} | ETA:{eta/60:.0f}m")
+                              safe_print(f"📊 {pct:.1f}% | {processed}/{total} | ⚡{speed:.0f}/s | WP:{len(wp_new)} | JO:{len(joomla_new)} | ETA:{eta/3600:.1f}h")
                               last_print = now
 
               with open("wordpress_sites.txt", "a", encoding="utf-8") as f:
