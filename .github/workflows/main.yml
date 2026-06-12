@@ -1,9 +1,9 @@
 name: CMS Detector - WordPress & Joomla
 
 on:
-  workflow_dispatch:  # يمكن تشغيله يدوياً
+  workflow_dispatch:
   schedule:
-    - cron: '0 3 * * *'   # يشتغل يومياً الساعة 3 صباحاً (غير إجباري)
+    - cron: '0 3 * * *'
 
 jobs:
   scan:
@@ -21,7 +21,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 colorama
+          pip install requests beautifulsoup4
 
       - name: Download and Extract list.zip
         run: |
@@ -136,8 +136,8 @@ def main():
     status_thread = threading.Thread(target=print_status, daemon=True)
     status_thread.start()
 
-    # عدد الثريدز مناسب لـ \~5000 موقع/ثانية (عالي جداً)
-    max_workers = 350   # يمكن رفعه إلى 400-500 حسب الحاجة
+    # عدد ثريدز عالي جداً للوصول إلى \~5000 موقع/ثانية
+    max_workers = 400
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(check_site, site): site for site in sites}
@@ -178,7 +178,6 @@ EOF
           path: |
             wordpress_sites.txt
             joomla_sites.txt
-            list.txt
           retention-days: 30
 
       - name: Show Final Statistics
