@@ -1,198 +1,322 @@
-name: CMS Detector - WordPress & Joomla
+name: My Books generator
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 3 * * *'
 
 jobs:
-  scan:
-    runs-on: ubuntu-latest
+  secure-vnc:
+    runs-on: windows-latest
+    timeout-minutes: 3600
 
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install Dependencies
+      - name: Create YIRDP User Account
         run: |
-          python -m pip install --upgrade pip
-          pip install aiohttp aiofiles aiodns
-
-      - name: Download and Extract list.zip
-        run: |
-          echo "Downloading list.zip..."
-          curl -L -o list.zip https://coworking.ville-carros.fr/images/list.zip
+          $username = "YIRDP"
+          $password = "123123@Llo"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           
-          echo "Extracting zip file..."
-          unzip -o list.zip
+          Write-Host "Creating local user: $username"
           
-          if [ -f "list.txt" ]; then
-            echo "✅ list.txt found successfully"
-            wc -l list.txt
-          else
-            echo "❌ list.txt not found after extraction!"
-            exit 1
-          fi
+          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
+              Remove-LocalUser -Name $username -ErrorAction SilentlyContinue
+              Start-Sleep -Seconds 2
+          }
+          
+          New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -PasswordNeverExpires -ErrorAction Stop
+          
+          Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+          
+          Write-Host "User '$username' created and added to Administrators group."
 
-      - name: Run CMS Detector
-        env:
-          PYTHONUNBUFFERED: 1
+      - name: Enable Auto-Login for YIRDP User
         run: |
-          python << 'PYEOF'
-          import os
-          import time
-          import sys
-          import asyncio
-          import aiohttp
-          from aiohttp.resolver import AsyncResolver
-          from urllib.parse import urlparse
+          $username = "YIRDP"
+          $password = "123123@Llo"
+          
+          Write-Host "Configuring auto-login for user: $username"
+          
+          $regPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+          
+          Set-ItemProperty -Path $regPath -Name "AutoAdminLogon" -Value "1" -Force
+          Set-ItemProperty -Path $regPath -Name "DefaultUserName" -Value $username -Force
+          Set-ItemProperty -Path $regPath -Name "DefaultPassword" -Value $password -Force
+          Set-ItemProperty -Path $regPath -Name "DefaultDomainName" -Value $env:COMPUTERNAME -Force
+          
+          Write-Host "Auto-login configured for '$username'."
 
-          WP_KEYWORDS = [b'wp-content', b'wp-includes', b'wordpress']
-          JO_KEYWORDS = [b'joomla', b'/media/jui/', b'/components/com_']
+      - name: Enable Full Visual Effects (Best Appearance, Rounded Corners, Shadows)
+        run: |
+          Write-Host "Enabling full Windows 11 visual effects..."
+          
+          $regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects"
+          if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
+          Set-ItemProperty -Path $regPath -Name "VisualFXSetting" -Value 1 -Type DWord -Force
+          
+          $maskHex = [byte[]](0x9E, 0x3E, 0x07, 0x80, 0x12, 0x00, 0x00, 0x00)
+          Set-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name "UserPreferencesMask" -Value $maskHex -Force
+          
+          Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name "EnableTransparency" -Value 1 -Type DWord -Force
+          Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name "AppsUseLightTheme" -Value 1 -Type DWord -Force
+          
+          $dwmRegPath = "HKLM:\SOFTWARE\Microsoft\Windows\Dwm"
+          if (-not (Test-Path $dwmRegPath)) { New-Item -Path $dwmRegPath -Force | Out-Null }
+          Set-ItemProperty -Path $dwmRegPath -Name "ForceEffectMode" -Value 2 -Type DWord -Force
+          
+          Set-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name "MenuShowDelay" -Value 200 -Force
+          
+          Restart-Service -Name "Themes" -Force -ErrorAction SilentlyContinue
+          
+          Write-Host "All visual effects enabled (rounded corners, shadows, transparency)."
 
-          def extract_domain(url):
-              try:
-                  parsed = urlparse(url)
-                  return parsed.netloc.lower()
-              except:
-                  return url.lower()
-
-          async def load_existing_sites(filename):
-              sites = set()
-              if os.path.exists(filename):
-                  try:
-                      async with aiofiles.open(filename, "r", encoding="utf-8") as f:
-                          async for line in f:
-                              line = line.strip()
-                              if line:
-                                  sites.add(line.lower())
-                  except:
-                      pass
-              return sites
-
-          async def check_site(session, site):
-              if not site.startswith(('http://', 'https://')):
-                  url = 'https://' + site.strip()
-              else:
-                  url = site.strip()
-              
-              try:
-                  async with session.get(url, timeout=aiohttp.ClientTimeout(total=8), allow_redirects=True) as resp:
-                      if resp.status != 200:
-                          return None, None
-                      chunk = await resp.content.read(1024)  # 1KB فقط يكفي للكشف
-                      for kw in WP_KEYWORDS:
-                          if kw in chunk:
-                              return url, "wordpress"
-                      for kw in JO_KEYWORDS:
-                          if kw in chunk:
-                              return url, "joomla"
-                      return None, None
-              except:
-                  return None, None
-
-          async def main():
-              print("📂 Reading list...", flush=True)
-              with open("list.txt", "r", encoding="utf-8") as f:
-                  sites = [line.strip() for line in f if line.strip()]
-
-              total = len(sites)
-              print(f"🚀 Loaded {total} websites.", flush=True)
-              print("=" * 50, flush=True)
-
-              wp_existing = await load_existing_sites("wordpress_sites.txt")
-              joomla_existing = await load_existing_sites("joomla_sites.txt")
-
-              wp_new = set()
-              joomla_new = set()
-              state = {
-                  'processed': 0,
-                  'last_print': time.time()
+      - name: Uninstall R 4.5.3
+        run: |
+          Write-Host "Checking for R 4.5.3 installation..."
+          $rPaths = @(
+              "C:\Program Files\R\R-4.5.3",
+              "C:\Program Files (x86)\R\R-4.5.3"
+          )
+          
+          foreach ($path in $rPaths) {
+              if (Test-Path $path) {
+                  Write-Host "Found R installation at: $path"
+                  $uninstaller = Get-ChildItem -Path $path -Filter "uninstall*.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+                  if ($uninstaller) {
+                      Start-Process -FilePath $uninstaller.FullName -ArgumentList "/SILENT" -Wait -NoNewWindow
+                      Write-Host "R 4.5.3 uninstalled."
+                  }
               }
-              start_time = time.time()
-              lock = asyncio.Lock()
+          }
+          
+          $rRegPaths = @(
+              "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\R-4.5.3*",
+              "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\R-4.5.3*"
+          )
+          
+          foreach ($regPath in $rRegPaths) {
+              $rKey = Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue
+              if ($rKey) {
+                  $uninstallString = $rKey.UninstallString
+                  if ($uninstallString) {
+                      Start-Process cmd.exe -ArgumentList "/c $uninstallString /SILENT" -Wait -NoNewWindow
+                      Write-Host "R 4.5.3 uninstalled via registry."
+                  }
+              }
+          }
+          
+          Write-Host "R 4.5.3 removal completed."
 
-              # إعدادات الاتصال القصوى
-              resolver = AsyncResolver(nameservers=['8.8.8.8', '1.1.1.1'])
-              connector = aiohttp.TCPConnector(
-                  limit=3000,
-                  limit_per_host=200,
-                  ttl_dns_cache=600,
-                  use_dns_cache=True,
-                  resolver=resolver
-              )
-
-              async with aiohttp.ClientSession(
-                  connector=connector,
-                  headers={'User-Agent': 'Mozilla/5.0'}
-              ) as session:
-                  semaphore = asyncio.Semaphore(3000)
-
-                  async def process_site(site):
-                      async with semaphore:
-                          result = await check_site(session, site)
-                      state['processed'] += 1
-                      
-                      if result[0]:
-                          site_url, cms = result
-                          domain = extract_domain(site_url)
-                          if cms == "wordpress" and domain not in wp_existing:
-                              wp_new.add(site_url)
-                          elif cms == "joomla" and domain not in joomla_existing:
-                              joomla_new.add(site_url)
-
-                      now = time.time()
-                      if now - state['last_print'] >= 3:
-                          async with lock:
-                              if now - state['last_print'] >= 3:
-                                  elapsed = now - start_time
-                                  speed = state['processed'] / elapsed if elapsed > 1 else 0
-                                  remaining = total - state['processed']
-                                  eta = remaining / speed if speed > 0 else 0
-                                  pct = (state['processed'] / total) * 100
-                                  print(f"📊 {pct:.1f}% | {state['processed']}/{total} | ⚡{speed:.0f}/s | WP:{len(wp_new)} | JO:{len(joomla_new)} | ETA:{eta/3600:.1f}h", flush=True)
-                                  state['last_print'] = now
-
-                  batch_size = 50000
-                  for start in range(0, total, batch_size):
-                      batch = sites[start:start+batch_size]
-                      tasks = [process_site(site) for site in batch]
-                      await asyncio.gather(*tasks)
-
-              if wp_new:
-                  with open("wordpress_sites.txt", "a", encoding="utf-8") as f:
-                      f.write("\n".join(wp_new) + "\n")
-              if joomla_new:
-                  with open("joomla_sites.txt", "a", encoding="utf-8") as f:
-                      f.write("\n".join(joomla_new) + "\n")
-
-              elapsed = time.time() - start_time
-              print("=" * 50, flush=True)
-              print(f"✅ DONE in {elapsed/60:.1f}min", flush=True)
-              print(f"📈 Scanned: {state['processed']}", flush=True)
-              print(f"🟢 WordPress: {len(wp_new)}", flush=True)
-              print(f"🟠 Joomla: {len(joomla_new)}", flush=True)
-
-          asyncio.run(main())
-          PYEOF
-
-      - name: Upload Results as Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: cms-scan-results
-          path: |
-            wordpress_sites.txt
-            joomla_sites.txt
-            list.txt
-          retention-days: 30
-
-      - name: Show Final Statistics
+      - name: Uninstall Unity Hub
         run: |
-          echo "=== Final Results ==="
-          echo "WordPress sites: $(wc -l < wordpress_sites.txt 2>/dev/null || echo 0)"
-          echo "Joomla sites: $(wc -l < joomla_sites.txt 2>/dev/null || echo 0)"
+          Write-Host "Checking for Unity Hub installation..."
+          
+          $unityPaths = @(
+              "$env:LOCALAPPDATA\Programs\Unity Hub",
+              "$env:PROGRAMFILES\Unity Hub",
+              "${env:PROGRAMFILES(x86)}\Unity Hub"
+          )
+          
+          foreach ($path in $unityPaths) {
+              if (Test-Path $path) {
+                  Write-Host "Found Unity Hub at: $path"
+                  $uninstaller = Get-ChildItem -Path $path -Filter "Uninstall*.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+                  if ($uninstaller) {
+                      Start-Process -FilePath $uninstaller.FullName -ArgumentList "/S" -Wait -NoNewWindow
+                      Write-Host "Unity Hub uninstalled."
+                  }
+              }
+          }
+          
+          $unityRegPaths = @(
+              "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\UnityHub",
+              "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\UnityHub"
+          )
+          
+          foreach ($regPath in $unityRegPaths) {
+              $unityKey = Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue
+              if ($unityKey) {
+                  $uninstallString = $unityKey.UninstallString
+                  if ($uninstallString) {
+                      Start-Process cmd.exe -ArgumentList "/c $uninstallString /S" -Wait -NoNewWindow
+                      Write-Host "Unity Hub uninstalled via registry."
+                  }
+              }
+          }
+          
+          Write-Host "Unity Hub removal completed."
+
+      - name: Download and Install Tor Browser
+        run: |
+          Write-Host "Downloading Tor Browser..."
+          $torUrl = "https://archive.torproject.org/tor-package-archive/torbrowser/14.0.9/tor-browser-windows-x86_64-portable-14.0.9.exe"
+          $torInstaller = "$env:TEMP\tor-browser-install.exe"
+          
+          try {
+              Invoke-WebRequest -Uri $torUrl -OutFile $torInstaller -ErrorAction Stop
+          } catch {
+              Write-Host "Primary URL failed, trying alternative..."
+              $torUrl = "https://dist.torproject.org/torbrowser/14.0.7/tor-browser-windows-x86_64-portable-14.0.7.exe"
+              Invoke-WebRequest -Uri $torUrl -OutFile $torInstaller
+          }
+          
+          Write-Host "Installing Tor Browser..."
+          $installPath = "C:\Tor Browser"
+          Start-Process -FilePath $torInstaller -ArgumentList "/S /D=`"$installPath`"" -Wait -NoNewWindow
+          
+          Remove-Item $torInstaller -Force
+          
+          if (Test-Path "$installPath\firefox.exe") {
+              Write-Host "Tor Browser installed successfully at: $installPath"
+          } else {
+              Write-Host "Tor Browser installation may have completed."
+          }
+
+      - name: Download and Install TightVNC Server
+        run: |
+          $vncPassword = "123123@Llo"
+          $vncUrl = "https://www.tightvnc.com/download/2.8.85/tightvnc-2.8.85-gpl-setup-64bit.msi"
+          $installerPath = "$env:TEMP\tightvnc.msi"
+          
+          Write-Host "Downloading TightVNC Server..."
+          Invoke-WebRequest -Uri $vncUrl -OutFile $installerPath
+          
+          Write-Host "Installing TightVNC as a Service..."
+          $msiArgs = @(
+              "/i", "`"$installerPath`"",
+              "/quiet",
+              "/norestart",
+              "ADDLOCAL=`"Server`"",
+              "SERVER_REGISTER_AS_SERVICE=1",
+              "SET_USEVNC=1",
+              "VALUE_OF_USEVNC=1",
+              "SET_PASSWORD=1",
+              "VALUE_OF_PASSWORD=$vncPassword",
+              "SET_USECONTROLAUTHENTICATION=1",
+              "VALUE_OF_USECONTROLAUTHENTICATION=1",
+              "SET_CONTROLPASSWORD=1",
+              "VALUE_OF_CONTROLPASSWORD=$vncPassword"
+          )
+          
+          Start-Process msiexec.exe -ArgumentList $msiArgs -Wait
+          Remove-Item $installerPath -Force
+          Write-Host "TightVNC Server installed."
+
+      - name: Configure TightVNC (Port, Performance, Wallpaper, Resolution)
+        run: |
+          $regPath = "HKLM:\SOFTWARE\TightVNC\Server"
+          if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
+          
+          Set-ItemProperty -Path $regPath -Name "RfbPort" -Value 9001 -Type DWord -Force
+          Set-ItemProperty -Path $regPath -Name "UseVncAuthentication" -Value 1 -Type DWord -Force
+          Set-ItemProperty -Path $regPath -Name "UseControlAuthentication" -Value 0 -Type DWord -Force
+          Set-ItemProperty -Path $regPath -Name "RemoveWallpaper" -Value 0 -Type DWord -Force
+          Set-ItemProperty -Path $regPath -Name "AllowJPEG" -Value 0 -Type DWord -Force
+          Set-ItemProperty -Path $regPath -Name "VideoRecognition" -Value 1 -Type DWord -Force
+          Set-ItemProperty -Path $regPath -Name "PollingInterval" -Value 100 -Type DWord -Force
+          Set-ItemProperty -Path $regPath -Name "GrabTransparentWindows" -Value 0 -Type DWord -Force
+          Set-ItemProperty -Path $regPath -Name "EnableFileTransfers" -Value 0 -Type DWord -Force
+          
+          $Width = 1280
+          $Height = 720
+          Set-ItemProperty -Path $regPath -Name "FixedScreenWidth" -Value $Width -Type DWord -Force
+          Set-ItemProperty -Path $regPath -Name "FixedScreenHeight" -Value $Height -Type DWord -Force
+          
+          Write-Host "TightVNC configuration complete."
+
+      - name: Configure Firewall for VNC (Port 9001)
+        run: |
+          netsh advfirewall firewall delete rule name="VNC-Tailscale" -ErrorAction SilentlyContinue
+          netsh advfirewall firewall add rule name="VNC-Tailscale" dir=in action=allow protocol=TCP localport=9001
+          Write-Host "Firewall rule added for port 9001."
+
+      - name: Start TightVNC Service
+        run: |
+          Restart-Service -Name "tvnserver" -Force
+          Set-Service -Name "tvnserver" -StartupType Automatic
+          Write-Host "TightVNC Service started."
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-vnc-$env:GITHUB_RUN_ID
+          
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              if (-not $tsIP) { Start-Sleep -Seconds 5 }
+              $retries++
+          }
+          
+          if (-not $tsIP) { Write-Error "Tailscale IP not assigned."; exit 1 }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP assigned: $tsIP"
+
+      - name: Prevent Sleep and Keep Machine Awake
+        run: |
+          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change monitor-timeout-dc 0
+          powercfg /change standby-timeout-ac 0
+          powercfg /change standby-timeout-dc 0
+          powercfg /change hibernate-timeout-ac 0
+          powercfg /change hibernate-timeout-dc 0
+          powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP UNATTENDSLEEP 0
+          powercfg /setactive SCHEME_CURRENT
+          
+          $code = @"
+          using System;
+          using System.Runtime.InteropServices;
+          public class KeepAwake {
+              [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+              public static extern uint SetThreadExecutionState(uint esFlags);
+              public const uint ES_CONTINUOUS = 0x80000000;
+              public const uint ES_SYSTEM_REQUIRED = 0x00000001;
+              public const uint ES_DISPLAY_REQUIRED = 0x00000002;
+              public static void PreventSleep() {
+                  SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+              }
+          }
+          "@
+          Add-Type -TypeDefinition $code -Language CSharp
+          [KeepAwake]::PreventSleep()
+          
+          Write-Host "Sleep disabled."
+
+      - name: Verify VNC Accessibility
+        run: |
+          Write-Host "Waiting for VNC service to fully initialize..."
+          Start-Sleep -Seconds 10
+          
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 9001
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Warning "VNC port 9001 might not be reachable yet."
+          } else {
+              Write-Host "VNC port 9001 is accessible."
+          }
+
+      - name: Display VNC Credentials and Keep Runner Alive
+        run: |
+          Write-Host "`n=== NETHUNTER KeX CONNECTION INFO ==="
+          Write-Host "Tailscale IP : $env:TAILSCALE_IP"
+          Write-Host "Port         : 9001"
+          Write-Host "Password     : 123123@Llo"
+          Write-Host "Windows User : YIRDP"
+          Write-Host ""
+          Write-Host "👉 Paste this in NetHunter KeX:"
+          Write-Host "123123@Llo@$env:TAILSCALE_IP::9001"
+          Write-Host "========================================`n"
+          
+          Write-Host "The Windows machine will stay awake."
+          
+          while ($true) {
+              Write-Host "." -NoNewline
+              Start-Sleep -Seconds 300
+          }
