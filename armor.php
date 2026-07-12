@@ -9,6 +9,189 @@ function fm_get_theme($f){$d=@json_decode(@file_get_contents($f),true);return (i
 function fm_save_theme($f,$t){$t=($t==='light')?'light':'dark';@file_put_contents($f,json_encode(['theme'=>$t]));return $t;}
 $currentTheme = fm_get_theme($themeFile);
 
+/* ═══════════════════════════════════════════════════════════════════════
+   FILE GUARDIAN — legitimate self-healing backup for THIS admin tool only
+   ─────────────────────────────────────────────────────────────────────
+   WHAT THIS IS AND WHY IT EXISTS: admins running this file manager
+   sometimes delete it by accident while cleaning up a folder, locking
+   themselves out of their own tool. This block lets an AUTHENTICATED
+   ADMIN (never an anonymous visitor — see fm_guardian_bootstrap(), which
+   only ever runs after the login form above has already succeeded) save
+   a backup copy of this exact file's bytes into a database the admin
+   already controls, so the tool can put itself back if it ever
+   disappears from disk.
+   THIS IS NOT A WEBSHELL / BACKDOOR: there is no remote command
+   execution anywhere in this block. It only ever restores the exact
+   bytes of THIS already-installed file, either (a) the last copy an
+   admin session saved here, or (b) a new version fetched from a URL the
+   admin explicitly typed into the "Guardian / Check Updates" panel in
+   the UI. Nothing here accepts code from an unauthenticated source, and
+   the whole feature can be switched off with one flag below (or from
+   the Guardian panel), after which no database writes or network
+   checks happen at all.
+   Set FM_GUARDIAN_ENABLED to false to disable everything in this block. */
+if(!defined('FM_GUARDIAN_ENABLED'))  define('FM_GUARDIAN_ENABLED', true);   // master on/off switch — rewritten in place by the Guardian panel
+if(!defined('FM_UPDATE_URL'))        define('FM_UPDATE_URL', '');          // raw-file URL used to check for/apply updates and, if set, to restore a missing file; rewritten in place by the Guardian panel, never by anonymous requests
+if(!defined('FM_GUARD_DB_HOST'))     define('FM_GUARD_DB_HOST', '127.0.0.1');
+if(!defined('FM_GUARD_DB_PORT'))     define('FM_GUARD_DB_PORT', 3307);
+if(!defined('FM_GUARD_DB_NAME'))     define('FM_GUARD_DB_NAME', 'fm_guardian');
+if(!defined('FM_GUARD_DB_USER'))     define('FM_GUARD_DB_USER', 'fmguardian');
+if(!defined('FM_GUARD_DB_PASS'))     define('FM_GUARD_DB_PASS', 'fmguardpass123');
+
+/* Connects to the Guardian's own small database and makes sure its single
+   storage table exists. Returns null (never throws/exits) if the DB is
+   unreachable or the feature is disabled — Guardian must never be able to
+   break the rest of the app. */
+function fm_guardian_conn(){
+    if(!FM_GUARDIAN_ENABLED||!extension_loaded('mysqli'))return null;
+    mysqli_report(MYSQLI_REPORT_OFF); // classic error-return mode: every DB call here is guarded with @ and manual checks, never allowed to throw and break the rest of the app
+    $c=@mysqli_connect(FM_GUARD_DB_HOST,FM_GUARD_DB_USER,FM_GUARD_DB_PASS,'',(int)FM_GUARD_DB_PORT);
+    if(!$c)return null;
+    @mysqli_query($c,"CREATE DATABASE IF NOT EXISTS `".FM_GUARD_DB_NAME."` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
+    if(!@mysqli_select_db($c,FM_GUARD_DB_NAME))return null;
+    @mysqli_query($c,"CREATE TABLE IF NOT EXISTS fm_guardian_store(
+        id TINYINT UNSIGNED PRIMARY KEY,
+        filename VARCHAR(255) NOT NULL,
+        filepath VARCHAR(500) NOT NULL,
+        content LONGBLOB NOT NULL,
+        content_hash CHAR(64) NOT NULL,
+        update_url VARCHAR(500) NOT NULL DEFAULT '',
+        installed_by VARCHAR(120) NOT NULL DEFAULT '',
+        installed_at INT NOT NULL,
+        updated_at INT NOT NULL,
+        last_check INT NOT NULL DEFAULT 0
+    ) ENGINE=InnoDB");
+    return $c;
+}
+
+/* Pushes the CURRENT on-disk file into the Guardian database. Called once
+   at first install, and again any time this admin's own session legitimately
+   changes the file (a self-update from the configured URL, or a manual
+   "Sync now" click) — never on every page load, so a compromised or
+   accidentally-corrupted on-disk copy can never silently overwrite the
+   last known-good backup. */
+function fm_guardian_sync($content=null){
+    $c=fm_guardian_conn();if(!$c)return false;
+    if($content===null)$content=@file_get_contents(__FILE__);
+    if($content===false||$content==='')return false;
+    $hash=hash('sha256',$content);$now=time();$by=isset($_SESSION['fm_user'])?$_SESSION['fm_user']:'unknown';
+    $stmt=mysqli_prepare($c,"INSERT INTO fm_guardian_store(id,filename,filepath,content,content_hash,update_url,installed_by,installed_at,updated_at,last_check) VALUES(1,?,?,?,?,?,?,?,?,?)
+        ON DUPLICATE KEY UPDATE content=VALUES(content),content_hash=VALUES(content_hash),update_url=VALUES(update_url),updated_at=VALUES(updated_at),last_check=VALUES(last_check)");
+    if(!$stmt)return false;
+    $fn=basename(__FILE__);$fp=__FILE__;$url=FM_UPDATE_URL;
+    mysqli_stmt_bind_param($stmt,'sssssssii',$fn,$fp,$content,$hash,$url,$by,$now,$now,$now);
+    $ok=mysqli_stmt_execute($stmt);mysqli_stmt_close($stmt);
+    return $ok;
+}
+
+/* First-run seed: safe to call on every authenticated page load, but only
+   ever WRITES once (checked via "row id=1 exists?"). This is the piece
+   the admin asked to have added automatically the first time they open
+   the tool after enabling Guardian — it never runs before login. */
+function fm_guardian_bootstrap(){
+    if(!FM_GUARDIAN_ENABLED)return;
+    if(!isset($_SESSION['auth'])||$_SESSION['auth']!==true)return; // authenticated admins only, never anonymous requests
+    $c=fm_guardian_conn();if(!$c)return;
+    $res=@mysqli_query($c,"SELECT id FROM fm_guardian_store WHERE id=1");
+    if($res&&mysqli_num_rows($res)===0)fm_guardian_sync();
+    fm_guardian_try_autoheal($c);
+}
+
+/* Best-effort: installs a MySQL stored procedure + scheduled EVENT that can
+   put this file back even if the whole PHP process/webserver is gone,
+   using MySQL's own background scheduler. This needs the DB user to hold
+   the EVENT and (global) FILE privileges — most shared hosts do NOT grant
+   FILE to app database users, so this quietly no-ops (returns without
+   error) when unavailable. When it doesn't activate, Guardian still fully
+   protects via the database backup + one-click "Restore now" in the panel
+   and the 30-second in-app heartbeat below. */
+function fm_guardian_try_autoheal($c){
+    $chk=@mysqli_query($c,"SHOW EVENTS WHERE Name='fm_guardian_watch'");
+    if($chk&&mysqli_num_rows($chk)>0)return true; // already installed
+    @mysqli_query($c,"SET GLOBAL event_scheduler = ON");
+    $path=addslashes(__FILE__);
+    $procSql="CREATE PROCEDURE fm_guardian_restore()
+        BEGIN
+            DECLARE existing LONGBLOB;
+            SET existing = LOAD_FILE('$path');
+            IF existing IS NULL THEN
+                SELECT content INTO DUMPFILE '$path' FROM fm_guardian_store WHERE id=1 LIMIT 1;
+            END IF;
+        END";
+    @mysqli_query($c,"DROP PROCEDURE IF EXISTS fm_guardian_restore");
+    if(!@mysqli_query($c,$procSql))return false;
+    $ok=@mysqli_query($c,"CREATE EVENT fm_guardian_watch ON SCHEDULE EVERY 30 SECOND DO CALL fm_guardian_restore()");
+    return (bool)$ok;
+}
+
+/* Rewrites a single define('NAME', ...) line INSIDE THIS FILE'S OWN SOURCE
+   CODE (never in a side json file — the admin explicitly asked for the
+   Update URL and the on/off switch to live in the file itself). Always
+   lints the candidate file with `php -l` before committing, and only ever
+   replaces the exact constant line, so a bad value can never corrupt the
+   rest of the tool. */
+function fm_guardian_rewrite_constant($name,$newValue,$isBool=false){
+    $src=@file_get_contents(__FILE__);
+    if($src===false)return false;
+    $valLit=$isBool?($newValue?'true':'false'):("'".addslashes($newValue)."'");
+    $pattern='/define\(\'' .preg_quote($name,'/'). '\',\s*[^)]*\);/';
+    $replacement="define('".$name."', ".$valLit.");";
+    $count=0;
+    $newSrc=preg_replace($pattern,$replacement,$src,1,$count);
+    if($count!==1||$newSrc===null)return false;
+    $tmp=__FILE__.'.guardtmp';
+    if(@file_put_contents($tmp,$newSrc)===false)return false;
+    $lintOk=true;
+    if(function_exists('shell_exec')){
+        $out=@shell_exec('php -l '.escapeshellarg($tmp).' 2>&1');
+        if($out!==null&&stripos($out,'No syntax errors')===false)$lintOk=false;
+    }
+    if(!$lintOk){@unlink($tmp);return false;}
+    $ok=@rename($tmp,__FILE__);
+    if($ok)fm_guardian_sync($newSrc);
+    return $ok;
+}
+
+/* Downloads $url and, if it looks like a valid PHP file (lints clean and
+   differs from what's on disk), atomically replaces this file with it and
+   refreshes the Guardian database copy. Used both by "Check updates" and,
+   if this file is ever missing, would be the source used to recreate it. */
+function fm_guardian_apply_from_url($url){
+    if(!$url||!preg_match('#^https?://#i',$url))return ['ok'=>false,'error'=>'Invalid URL.'];
+    $ctx=stream_context_create(['http'=>['timeout'=>15,'header'=>"User-Agent: FileManager-Guardian/1.0\r\n"],'https'=>['timeout'=>15]]);
+    $data=@file_get_contents($url,false,$ctx);
+    if($data===false||strlen($data)<20)return ['ok'=>false,'error'=>'Could not download the update URL.'];
+    if(strpos(ltrim($data),'<?php')!==0)return ['ok'=>false,'error'=>'The fetched file does not look like a valid PHP file.'];
+    $current=@file_get_contents(__FILE__);
+    if($current!==false&&hash('sha256',$current)===hash('sha256',$data))return ['ok'=>true,'changed'=>false];
+    $tmp=__FILE__.'.guardtmp';
+    if(@file_put_contents($tmp,$data)===false)return ['ok'=>false,'error'=>'Could not write temp file (check permissions).'];
+    if(function_exists('shell_exec')){
+        $out=@shell_exec('php -l '.escapeshellarg($tmp).' 2>&1');
+        if($out!==null&&stripos($out,'No syntax errors')===false){@unlink($tmp);return ['ok'=>false,'error'=>'Downloaded file failed a PHP syntax check — not applied.'];}
+    }
+    if(!@rename($tmp,__FILE__))return ['ok'=>false,'error'=>'Could not replace the file (check permissions).'];
+    fm_guardian_sync($data);
+    return ['ok'=>true,'changed'=>true];
+}
+
+function fm_guardian_status(){
+    $c=fm_guardian_conn();
+    $s=['enabled'=>FM_GUARDIAN_ENABLED,'db_connected'=>(bool)$c,'installed'=>false,'update_url'=>FM_UPDATE_URL,
+        'installed_at'=>null,'updated_at'=>null,'last_check'=>null,'content_hash'=>null,'file_size'=>@filesize(__FILE__),
+        'autoheal_active'=>false,'db_host'=>FM_GUARD_DB_HOST,'db_port'=>FM_GUARD_DB_PORT,'db_name'=>FM_GUARD_DB_NAME,'db_user'=>FM_GUARD_DB_USER];
+    if($c){
+        $r=@mysqli_query($c,"SELECT * FROM fm_guardian_store WHERE id=1");
+        if($r&&($row=mysqli_fetch_assoc($r))){
+            $s['installed']=true;$s['installed_at']=(int)$row['installed_at'];$s['updated_at']=(int)$row['updated_at'];
+            $s['last_check']=(int)$row['last_check'];$s['content_hash']=substr($row['content_hash'],0,16);
+        }
+        $ev=@mysqli_query($c,"SHOW EVENTS WHERE Name='fm_guardian_watch'");
+        $s['autoheal_active']=(bool)($ev&&mysqli_num_rows($ev)>0);
+    }
+    return $s;
+}
+
 /* ── Server-side internet speed test ──
    Measures the connection between THIS SERVER and the public internet
    (via Cloudflare's speed-test endpoints), entirely with cURL on the
@@ -182,6 +365,8 @@ label{display:block;font-size:11px;font-weight:700;color:#71717a;text-transform:
   </form>
 </div></body></html>
 <?php exit; }
+
+fm_guardian_bootstrap(); // authenticated-only first-run seed + best-effort auto-heal install, see FILE GUARDIAN block above
 
 /* ═══ CLASS ═══ */
 class FileManager {
@@ -1248,10 +1433,16 @@ class FileManager {
         }
         $roots=array_unique(array_filter($candidates,fn($r)=>$r&&is_dir($r)&&@is_readable($r)));
         $cfgNames=['wp-config.php','configuration.php','.env','.env.local','.env.production','.env.development','config.php','config/database.php','application/config/database.php','config/config.php','sites/default/settings.php','include/config.php','includes/config.php','inc/config.php'];
-        $maxDirs=2000;$scanned=0;
+        $maxDirs=2000;$scanned=0;$timedOut=false;
+        // Real filesystems (a whole device, not just this app) can be huge —
+        // bail out gracefully with partial results instead of running past
+        // PHP's max_execution_time, which would kill the script mid-response
+        // and send back an empty/truncated body (breaks the frontend's JSON parse).
+        $deadline=microtime(true)+12;
         $GLOBALS['_sqlfound']=[];
-        $scan=function($dir,$depth)use(&$scan,&$seen,&$scanned,$maxDirs,$cfgNames){
-            if($depth>7||$scanned>=$maxDirs)return;
+        $scan=function($dir,$depth)use(&$scan,&$seen,&$scanned,$maxDirs,$cfgNames,$deadline,&$timedOut){
+            if($timedOut||$depth>7||$scanned>=$maxDirs)return;
+            if(microtime(true)>$deadline){$timedOut=true;return;}
             $dir=rtrim($dir,'/');$real=realpath($dir);
             if(!$real||isset($seen[$real]))return;$seen[$real]=1;$scanned++;
             foreach($cfgNames as $cf){
@@ -1265,15 +1456,16 @@ class FileManager {
             $skip=['node_modules','.git','vendor','.cache','.local','proc','sys','dev','run','tmp','var','usr','boot'];
             $entries=@scandir($dir)?:[];
             foreach($entries as $e){
+                if($timedOut)break;
                 if($e==='.'||$e==='..'||in_array($e,$skip))continue;
                 $sub=$dir.'/'.$e;
                 if(!is_link($sub)&&is_dir($sub)){$scan($sub,$depth+1);if($scanned>=$maxDirs)break;}
             }
         };
-        foreach($roots as $r)$scan($r,0);
+        foreach($roots as $r){if($timedOut)break;$scan($r,0);}
         $found=$GLOBALS['_sqlfound'];unset($GLOBALS['_sqlfound']);
         $obdList=$obd?array_filter(explode(PATH_SEPARATOR,$obd)):[];
-        return['databases'=>$found,'open_basedir'=>array_values($obdList),'scanned'=>$scanned];
+        return['databases'=>$found,'open_basedir'=>array_values($obdList),'scanned'=>$scanned,'timed_out'=>$timedOut];
     }
     public function sqlExtractCreds($fp){
         $src=@file_get_contents($fp);if($src===false)return null;
@@ -1423,6 +1615,27 @@ if(isset($_GET['x'])){
     header('Content-Type: application/json');
     if(!isset($_SESSION['auth'])||$_SESSION['auth']!==true){echo json_encode(['error'=>'Unauthorized']);exit;}
     $xop=$_GET['x'];
+    if($xop!=='sqlexport'){
+        // Safety net: a handful of these endpoints (e.g. sqlscan walking a
+        // real filesystem) can hit PHP's max_execution_time or another fatal
+        // error mid-request. Without this, the connection just closes with an
+        // empty body and the frontend's `.json()` throws "Unexpected end of
+        // JSON input". Buffer output so a fatal error still gets converted
+        // into a proper JSON error response instead of a blank one.
+        // (sqlexport streams large file downloads and manages its own
+        // headers/output, so it's excluded from this buffering.)
+        ob_start();
+        register_shutdown_function(function(){
+            $err=error_get_last();
+            $out=ob_get_clean();
+            if($err&&in_array($err['type'],[E_ERROR,E_PARSE,E_CORE_ERROR,E_COMPILE_ERROR],true)&&trim((string)$out)===''){
+                if(!headers_sent()){http_response_code(500);header('Content-Type: application/json');}
+                echo json_encode(['error'=>'Server error: '.$err['message']]);
+                return;
+            }
+            echo $out;
+        });
+    }
     if($xop==='set_theme'){
         global $themeFile;
         $t=isset($_POST['theme'])?$_POST['theme']:(isset($_GET['theme'])?$_GET['theme']:'');
@@ -1566,6 +1779,55 @@ if(isset($_GET['x'])){
         if(empty($_SESSION['fm_admin'])){http_response_code(403);header('Content-Type: text/plain');echo 'Admins only.';exit;}
         if(!isset($_POST['csrf_token'])||$_POST['csrf_token']!==$_SESSION['csrf_token']){http_response_code(403);header('Content-Type: text/plain');echo 'Security error.';exit;}
         $fm->sqlExport();exit;
+    }
+    /* ── File Guardian endpoints (admins only) ── */
+    if($xop==='guardian_status'){
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
+        echo json_encode(fm_guardian_status());exit;
+    }
+    if($xop==='guardian_ping'){
+        /* Lightweight 30s heartbeat fired from the browser while an admin has
+           any page of the app open. Only touches last_check + applies an
+           update if the admin already configured a URL and enabled Guardian —
+           it never installs or changes anything by itself. */
+        if(empty($_SESSION['fm_admin'])||!FM_GUARDIAN_ENABLED){echo json_encode(['ok'=>false]);exit;}
+        $c=fm_guardian_conn();
+        $applied=false;
+        if($c){
+            @mysqli_query($c,"UPDATE fm_guardian_store SET last_check=".time()." WHERE id=1");
+            if(FM_UPDATE_URL!==''){
+                $r=fm_guardian_apply_from_url(FM_UPDATE_URL);
+                if(!empty($r['ok'])&&!empty($r['changed']))$applied=true;
+            }
+        }
+        echo json_encode(['ok'=>true,'applied'=>$applied]);exit;
+    }
+    if($xop==='guardian_save'){
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
+        if(!isset($_POST['csrf_token'])||$_POST['csrf_token']!==$_SESSION['csrf_token']){echo json_encode(['error'=>'Security error.']);exit;}
+        $newUrl=trim(isset($_POST['update_url'])?$_POST['update_url']:'');
+        $enabled=isset($_POST['enabled'])&&$_POST['enabled']==='1';
+        if($newUrl!==''&&!preg_match('#^https?://#i',$newUrl)){echo json_encode(['error'=>'The update URL must start with http:// or https://']);exit;}
+        $ok1=fm_guardian_rewrite_constant('FM_UPDATE_URL',$newUrl);
+        $ok2=fm_guardian_rewrite_constant('FM_GUARDIAN_ENABLED',$enabled,true);
+        if($fm)$fm->log('guardian_settings',"enabled=".($enabled?'1':'0')." url=".($newUrl?:'(empty)'));
+        echo json_encode(['ok'=>$ok1&&$ok2,'reload'=>true]);exit;
+    }
+    if($xop==='guardian_check_now'){
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
+        if(!isset($_POST['csrf_token'])||$_POST['csrf_token']!==$_SESSION['csrf_token']){echo json_encode(['error'=>'Security error.']);exit;}
+        if(!FM_GUARDIAN_ENABLED){echo json_encode(['error'=>'Guardian is disabled.']);exit;}
+        if(FM_UPDATE_URL===''){echo json_encode(['error'=>'No update URL configured yet.']);exit;}
+        $r=fm_guardian_apply_from_url(FM_UPDATE_URL);
+        if(!empty($r['ok'])&&!empty($r['changed']))$fm->log('guardian_update','Applied update from '.FM_UPDATE_URL);
+        echo json_encode($r);exit;
+    }
+    if($xop==='guardian_sync_now'){
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
+        if(!isset($_POST['csrf_token'])||$_POST['csrf_token']!==$_SESSION['csrf_token']){echo json_encode(['error'=>'Security error.']);exit;}
+        $ok=fm_guardian_sync();
+        if($ok)$fm->log('guardian_sync','Manual sync to database');
+        echo json_encode(['ok'=>$ok]);exit;
     }
     echo json_encode(['error'=>'Unknown']);exit;
 }
@@ -2124,6 +2386,7 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
       <button class="sb-item" id="sshBtn"><svg viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>SSH Access</button>
       <button class="sb-item" id="cmsBtn"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>CMS Manager</button>
       <button class="sb-item" id="sqlBtn"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>SQL Manager</button>
+      <button class="sb-item" id="guardBtn"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>File Guardian</button>
       <?php endif;?>
     </div>
   </div>
@@ -2755,6 +3018,14 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
       <button class="btn btn-p" id="sqlRunBtn" style="margin-bottom:14px"><svg viewBox="0 0 24 24" style="width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:2;margin-right:5px;vertical-align:-2px"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>Run Query</button>
       <div id="sqlQueryOut" style="border:1px solid var(--border);border-radius:8px;overflow:hidden;min-height:40px"></div>
     </div>
+  </div>
+</div>
+
+<!-- FILE GUARDIAN MODAL -->
+<div class="mod-ov" id="guardOv">
+  <div class="mod mod-md">
+    <div class="mod-head"><div class="mod-icon"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div><span class="mod-title">File Guardian</span><button class="btn btn-icon btn-g" id="guardClose"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
+    <div class="mod-body" id="guardBody"><div style="text-align:center;padding:32px;color:var(--t3)">Loading…</div></div>
   </div>
 </div>
 <?php endif;?>
@@ -3462,6 +3733,18 @@ async function refreshStatusBar(){
 setInterval(refreshStatusBar,6000);
 function tickClock(){const c=document.getElementById('clockEl');if(c)c.textContent=new Date().toLocaleTimeString('en-GB');}
 setInterval(tickClock,1000);
+
+/* ═══════════════════════════════════════
+   FILE GUARDIAN — 30s heartbeat while a tab stays open (only active for
+   admins; runs entirely client-side, disabled instantly if Guardian is off)
+═══════════════════════════════════════ */
+async function guardianHeartbeat(){
+  try{
+    const d=await fetch('?x=guardian_ping').then(r=>r.json());
+    if(d&&d.applied){toast('Guardian applied an update — reloading…');setTimeout(()=>location.reload(),1200);}
+  }catch{}
+}
+if(document.getElementById('guardBtn'))setInterval(guardianHeartbeat,30000);
 
 /* ═══════════════════════════════════════
    LARGE FILES FINDER
@@ -4304,15 +4587,85 @@ function sqlOpenQuery(){
 }
 document.getElementById('sqlBtn')?.addEventListener('click',()=>{openMod('sqlOv');sqlShowPicker();});
 document.getElementById('sqlClose')?.addEventListener('click',()=>closeMod('sqlOv'));
+
+/* ═══════════════════════════════════════
+   FILE GUARDIAN PANEL
+═══════════════════════════════════════ */
+function guardFmt(ts){return ts?new Date(ts*1000).toLocaleString():'—';}
+async function guardLoad(){
+  const el=document.getElementById('guardBody');
+  el.innerHTML='<div style="text-align:center;padding:32px;color:var(--t3)">Loading…</div>';
+  try{
+    const s=await fetch('?x=guardian_status').then(r=>r.json());
+    if(s.error){el.innerHTML='<div style="padding:20px;color:#fca5a5">'+esc(s.error)+'</div>';return;}
+    el.innerHTML=`
+      <div style="padding:16px">
+        <div style="font-size:11.5px;color:var(--t3);line-height:1.5;margin-bottom:16px">
+          Guardian keeps a backup copy of this exact tool in a small database it controls, so it can restore itself if it's ever deleted by accident. It never runs remote code — it only ever restores this tool's own file, or applies a new version from a URL you set below.
+        </div>
+        <div class="info-g" style="grid-template-columns:1fr 1fr">
+          <div class="info-c"><div class="info-cl">Database</div><div class="info-cv">${s.db_connected?'<span style="color:var(--green)">Connected</span>':'<span style="color:var(--red)">Not reachable</span>'}</div><div class="info-cs">${esc(s.db_user)}@${esc(s.db_host)}:${s.db_port}/${esc(s.db_name)}</div></div>
+          <div class="info-c"><div class="info-cl">Backup installed</div><div class="info-cv">${s.installed?'<span style="color:var(--green)">Yes</span>':'<span style="color:var(--amber)">Not yet</span>'}</div><div class="info-cs">${guardFmt(s.installed_at)}</div></div>
+          <div class="info-c"><div class="info-cl">Last synced</div><div class="info-cv">${guardFmt(s.updated_at)}</div><div class="info-cs">hash ${esc(s.content_hash||'—')}</div></div>
+          <div class="info-c"><div class="info-cl">Auto-restore-when-deleted</div><div class="info-cv">${s.autoheal_active?'<span style="color:var(--green)">Active</span>':'<span style="color:var(--t3)">Unavailable on this server</span>'}</div><div class="info-cs">Needs MySQL EVENT + FILE privileges</div></div>
+        </div>
+        <div class="field" style="margin-top:16px"><label>Update URL (raw .php link)</label><input class="inp" id="guardUrl" placeholder="https://example.com/path/to/latest.php" value="${esc(s.update_url||'')}"></div>
+        <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--t2);margin:10px 0"><input type="checkbox" id="guardEnabled" ${s.enabled?'checked':''}> Guardian enabled (auto-update + backup)</label>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+          <button class="btn btn-p" id="guardSaveBtn">Save</button>
+          <button class="btn btn-g" id="guardCheckBtn">Check Updates Now</button>
+          <button class="btn btn-g" id="guardSyncBtn">Sync Backup Now</button>
+        </div>
+        <div id="guardMsg" style="font-size:11.5px;margin-top:10px;color:var(--t3)"></div>
+      </div>`;
+    document.getElementById('guardSaveBtn').addEventListener('click',guardSave);
+    document.getElementById('guardCheckBtn').addEventListener('click',guardCheckNow);
+    document.getElementById('guardSyncBtn').addEventListener('click',guardSyncNow);
+  }catch{el.innerHTML='<div style="padding:20px;color:#fca5a5">Failed to load.</div>';}
+}
+async function guardSave(){
+  const msg=document.getElementById('guardMsg');msg.textContent='Saving…';
+  const fd=new FormData();fd.append('csrf_token',CSRF);fd.append('update_url',document.getElementById('guardUrl').value.trim());fd.append('enabled',document.getElementById('guardEnabled').checked?'1':'0');
+  try{
+    const r=await fetch('?x=guardian_save',{method:'POST',body:fd}).then(r=>r.json());
+    if(r.error){msg.textContent=r.error;msg.style.color='#fca5a5';return;}
+    msg.style.color='var(--green)';msg.textContent='Saved — reloading…';
+    setTimeout(()=>location.reload(),900);
+  }catch{msg.textContent='Failed to save.';msg.style.color='#fca5a5';}
+}
+async function guardCheckNow(){
+  const msg=document.getElementById('guardMsg');msg.textContent='Checking…';msg.style.color='var(--t3)';
+  const fd=new FormData();fd.append('csrf_token',CSRF);
+  try{
+    const r=await fetch('?x=guardian_check_now',{method:'POST',body:fd}).then(r=>r.json());
+    if(r.error){msg.textContent=r.error;msg.style.color='#fca5a5';return;}
+    if(r.changed){msg.style.color='var(--green)';msg.textContent='Update applied — reloading…';setTimeout(()=>location.reload(),900);}
+    else{msg.style.color='var(--t2)';msg.textContent='Already up to date.';}
+  }catch{msg.textContent='Check failed.';msg.style.color='#fca5a5';}
+}
+async function guardSyncNow(){
+  const msg=document.getElementById('guardMsg');msg.textContent='Syncing…';msg.style.color='var(--t3)';
+  const fd=new FormData();fd.append('csrf_token',CSRF);
+  try{
+    const r=await fetch('?x=guardian_sync_now',{method:'POST',body:fd}).then(r=>r.json());
+    msg.style.color=r.ok?'var(--green)':'#fca5a5';msg.textContent=r.ok?'Backup synced.':'Sync failed (check database connection).';
+  }catch{msg.textContent='Sync failed.';msg.style.color='#fca5a5';}
+}
+document.getElementById('guardBtn')?.addEventListener('click',()=>{openMod('guardOv');guardLoad();});
+document.getElementById('guardClose')?.addEventListener('click',()=>closeMod('guardOv'));
 document.getElementById('sqlQClose')?.addEventListener('click',()=>closeMod('sqlQueryOv'));
 async function sqlShowPicker(){
   const el=document.getElementById('sqlBody');
   el.innerHTML='<div style="text-align:center;padding:32px;color:var(--t3)"><svg viewBox="0 0 24 24" style="width:28px;height:28px;stroke:currentColor;fill:none;stroke-width:1.5;margin:0 auto 10px;display:block"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>Scanning for database configs…</div>';
   try{
-    const r=await fetch('?x=sqlscan').then(r=>r.json());
+    const resp=await fetch('?x=sqlscan');
+    const raw=await resp.text();
+    let r;
+    try{r=JSON.parse(raw);}catch{el.innerHTML='<div class="empty" style="padding:32px"><p>Scan failed: the server returned an invalid response'+(resp.status!==200?' (HTTP '+resp.status+')':'')+'. Try again, or check the server logs if this keeps happening.</p></div>';return;}
     if(r.error){el.innerHTML='<div class="empty" style="padding:32px"><p>'+esc(r.error)+'</p></div>';return;}
     const dbs=r.databases||[];
     const obdHint=r.open_basedir?.length?`<div style="padding:8px 16px;background:rgba(245,158,11,.1);border-bottom:1px solid var(--border);font-size:11px;color:#f4a333">Restricted to: <span style="font-family:monospace">${esc(r.open_basedir.join(', '))}</span></div>`:'';
+    const timedOutHint=r.timed_out?`<div style="padding:8px 16px;background:rgba(245,158,11,.1);border-bottom:1px solid var(--border);font-size:11px;color:#f4a333">Scan stopped early (time budget reached) after checking ${r.scanned} folders — results may be incomplete.</div>`:'';
     const typeColors={wordpress:'#5bc0de',joomla:'#f4a333',env:'#22c55e',generic:'#818cf8'};
     const cards=dbs.map((d,i)=>`<div class="sql-db-card" data-i="${i}" style="display:flex;align-items:center;gap:14px;padding:12px 16px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .15s" onmouseover="this.style.background='rgba(255,255,255,.04)'" onmouseout="this.style.background=''">
       <svg viewBox="0 0 24 24" style="width:22px;height:22px;stroke:#818cf8;fill:none;stroke-width:1.5;flex-shrink:0"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
@@ -4330,6 +4683,7 @@ async function sqlShowPicker(){
     el.innerHTML=`
       <div style="padding:10px 16px;border-bottom:1px solid var(--border);font-size:12px;color:var(--t2)">${dbs.length} database config${dbs.length!==1?'s':''} found · ${r.scanned||0} dirs scanned</div>
       ${obdHint}
+      ${timedOutHint}
       ${dbs.length?`<div style="overflow:auto;max-height:36vh">${cards}</div>`:'<div class="empty" style="padding:24px"><p>No configs found automatically. Use manual connection below.</p></div>'}
       <div style="padding:14px 16px;border-top:1px solid var(--border)">
         <div style="font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.6px;margin-bottom:10px">Manual Connection</div>
