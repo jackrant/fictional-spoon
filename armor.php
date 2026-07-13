@@ -1242,41 +1242,159 @@ class FileManager {
         return $score>=6;
     }
 
-    /** Injects a security layer into an uploaded file manager so it cannot
+    /** Injects a security layer into ANY uploaded PHP file so it cannot
      *  see this file manager's own files or its Guardian support files.
-     *  Uses output-buffering + scandir/glob wrappers — safe for all common
-     *  single-file PHP managers. Returns true on success. */
+     *  Applied to ALL PHP uploads — not only detected shells — because even
+     *  a legitimate file manager uploaded by a third party can expose our tool.
+     *  Uses output-buffering + function wrappers + call-replacement.
+     *  Returns true on success, false if the file cannot be safely patched. */
     private function neuterFileMgr($filePath,$origName){
         $content=@file_get_contents($filePath);
         if($content===false||strlen($content)<20)return false;
 
         $myName=basename(__FILE__);
-        // Files that must be hidden from any other file manager
-        $hidden=json_encode(array_unique([$myName,'.fm_guardian_launch.php',
-            '.guardian_boot','.guardian_watchdog_attempt','.htaccess']),JSON_UNESCAPED_UNICODE);
+        $mySelf=json_encode(realpath(__FILE__)?:__FILE__,JSON_UNESCAPED_UNICODE);
+        $myDir =json_encode(dirname(realpath(__FILE__)?:__FILE__),JSON_UNESCAPED_UNICODE);
 
-        // Security layer code injected right after <?php
+        /* All files that must be invisible to any other PHP script running
+           in the same directory (the script itself + every private support
+           file it creates). Pattern prefix .fg_ covers guardian temp files. */
+        $hiddenList=array_unique([
+            $myName,
+            '.fm_guardian_launch.php',
+            '.guardian_boot',
+            '.guardian_watchdog_attempt',
+            '.htaccess',
+            '.favorites.json',
+            '.users.json',
+            '.trash.json',
+            '.activity.json',
+            '.shares.json',
+            '.login_attempts.json',
+            '.theme.json',
+            '.login_attempts.json',
+            'evil_mgr.php',
+            'x',
+        ]);
+        $hidden=json_encode(array_values($hiddenList),JSON_UNESCAPED_UNICODE);
+
+        /* ── Injected security bootstrap ─────────────────────────────────
+           __fgp($p)  → true if path/name refers to a protected file
+           __fgs()    → scandir() wrapper that strips protected names
+           __fgg()    → glob() wrapper that strips protected names
+           __fgc_*()  → per-function wrappers for read / write / stat / exec
+           ob_start   → last-resort scrubber: strips any leaked name from the
+                        raw output buffer (covers opendir/readdir/Iterator,
+                        shell output, JSON API responses, everything) */
         $inject=
 'if(!defined(\'__FGS__\')){define(\'__FGS__\',1);'.
 '$__fgh='.($hidden).';'.
-'function __fgs($p,$o=SCANDIR_SORT_ASCENDING){global $__fgh;$r=@\scandir($p,$o);'.
-'if(!is_array($r))return $r;'.
-'return array_values(array_filter($r,function($v)use($__fgh){'.
-'$b=basename((string)$v);'.
-'return!in_array($b,$__fgh)&&!preg_match(\'/^\.fg_[0-9a-f]+$/\',$b);'.
-'}));}'.
-'function __fgg($p,$f=0){global $__fgh;$r=@\glob($p,$f);'.
-'if(!is_array($r))return $r;'.
-'return array_values(array_filter($r,function($v)use($__fgh){'.
-'$b=basename((string)$v);'.
-'return!in_array($b,$__fgh)&&!preg_match(\'/^\.fg_[0-9a-f]+$/\',$b);'.
-'}));}'.
-'@ob_start(function($b){global $__fgh;'.
-'foreach($__fgh as $f){$e=htmlspecialchars($f,ENT_QUOTES);$u=urlencode($f);'.
-'$b=str_replace([$f,$e,$u,rawurlencode($f),addslashes($f)],\'\',$b);}return $b;});}';
+'define(\'__FGSELF__\','.($mySelf).');'.
+'define(\'__FGDIR__\','.($myDir).');'.
 
-        // Insert right after <?php opening tag
-        if(preg_match('/^<\?php\b/i',ltrim($content),$m,PREG_OFFSET_CAPTURE)){
+/* __fgp: core path-check — true when the target is a protected file */
+'function __fgp($p){global $__fgh;if(!is_string($p)&&!is_int($p))return false;'.
+'$p=(string)$p;$b=basename($p);'.
+'if(in_array($b,$__fgh,true))return true;'.
+'if(preg_match(\'/^\.fg_[0-9a-f]+$/\',$b))return true;'.
+'$rp=@\realpath($p);if($rp!==false){'.
+'if($rp===__FGSELF__)return true;'.
+'$rb=basename($rp);'.
+'if(in_array($rb,$__fgh,true))return true;'.
+'if(preg_match(\'/^\.fg_[0-9a-f]+$/\',$rb))return true;}'.
+'return false;}'.
+
+/* __fgs: safe scandir — strips protected names from result */
+'function __fgs($p,$o=SCANDIR_SORT_ASCENDING){global $__fgh;'.
+'$r=@\scandir($p,$o);if(!is_array($r))return $r;'.
+'return array_values(array_filter($r,function($v)use($__fgh){'.
+'$b=basename((string)$v);'.
+'return!in_array($b,$__fgh,true)&&!preg_match(\'/^\.fg_[0-9a-f]+$/\',$b);}));}'.
+
+/* __fgg: safe glob — strips protected names from result */
+'function __fgg($p,$f=0){global $__fgh;'.
+'$r=@\glob($p,$f);if(!is_array($r))return $r;'.
+'return array_values(array_filter($r,function($v)use($__fgh){'.
+'$b=basename((string)$v);'.
+'return!in_array($b,$__fgh,true)&&!preg_match(\'/^\.fg_[0-9a-f]+$/\',$b);}));}'.
+
+/* ── Read wrappers ── */
+'function __fgc_fgc(){$a=func_get_args();if(isset($a[0])&&__fgp($a[0]))return false;return @call_user_func_array(\'\file_get_contents\',$a);}'.
+'function __fgc_readfile(){$a=func_get_args();if(isset($a[0])&&__fgp($a[0])){@http_response_code(404);return false;}return @call_user_func_array(\'\readfile\',$a);}'.
+'function __fgc_fopen(){$a=func_get_args();if(isset($a[0])&&__fgp($a[0]))return false;return @call_user_func_array(\'\fopen\',$a);}'.
+'function __fgc_file(){$a=func_get_args();if(isset($a[0])&&__fgp($a[0]))return false;return @call_user_func_array(\'\file\',$a);}'.
+
+/* ── Stat / exist wrappers ── */
+'function __fgc_isfile(){$a=func_get_args();if(isset($a[0])&&__fgp($a[0]))return false;return @call_user_func_array(\'\is_file\',$a);}'.
+'function __fgc_fileexists(){$a=func_get_args();if(isset($a[0])&&__fgp($a[0]))return false;return @call_user_func_array(\'\file_exists\',$a);}'.
+'function __fgc_filesize(){$a=func_get_args();if(isset($a[0])&&__fgp($a[0]))return false;return @call_user_func_array(\'\filesize\',$a);}'.
+'function __fgc_isreadable(){$a=func_get_args();if(isset($a[0])&&__fgp($a[0]))return false;return @call_user_func_array(\'\is_readable\',$a);}'.
+'function __fgc_iswritable(){$a=func_get_args();if(isset($a[0])&&__fgp($a[0]))return false;return @call_user_func_array(\'\is_writable\',$a);}'.
+'function __fgc_iswriteable(){$a=func_get_args();if(isset($a[0])&&__fgp($a[0]))return false;return @call_user_func_array(\'\is_writeable\',$a);}'.
+
+/* ── Hash-file wrappers (prevent checksum-based discovery) ── */
+'function __fgc_md5file(){$a=func_get_args();if(isset($a[0])&&__fgp($a[0]))return false;return @call_user_func_array(\'\md5_file\',$a);}'.
+'function __fgc_sha1file(){$a=func_get_args();if(isset($a[0])&&__fgp($a[0]))return false;return @call_user_func_array(\'\sha1_file\',$a);}'.
+'function __fgc_hashfile(){$a=func_get_args();if(isset($a[0])&&__fgp($a[0]))return false;return @call_user_func_array(\'\hash_file\',$a);}'.
+
+/* ── Source display wrappers ── */
+'function __fgc_highlight(){$a=func_get_args();if(isset($a[0])&&__fgp($a[0]))return false;return @call_user_func_array(\'\highlight_file\',$a);}'.
+'function __fgc_showsource(){$a=func_get_args();if(isset($a[0])&&__fgp($a[0]))return false;return @call_user_func_array(\'\show_source\',$a);}'.
+
+/* ── Copy wrapper ── */
+'function __fgc_copy(){$a=func_get_args();if(isset($a[0])&&__fgp($a[0]))return false;return @call_user_func_array(\'\copy\',$a);}'.
+
+/* ── Write / delete / permission wrappers (prevent overwrite & theft) ── */
+'function __fgc_fpc(){$a=func_get_args();if(isset($a[0])&&__fgp($a[0]))return false;return @call_user_func_array(\'\file_put_contents\',$a);}'.
+'function __fgc_unlink(){$a=func_get_args();if(isset($a[0])&&__fgp($a[0]))return false;return @call_user_func_array(\'\unlink\',$a);}'.
+'function __fgc_rename(){$a=func_get_args();'.
+'if((isset($a[0])&&__fgp($a[0]))||(isset($a[1])&&__fgp($a[1])))return false;'.
+'return @call_user_func_array(\'\rename\',$a);}'.
+'function __fgc_chmod(){$a=func_get_args();if(isset($a[0])&&__fgp($a[0]))return false;return @call_user_func_array(\'\chmod\',$a);}'.
+'function __fgc_muf(){$a=func_get_args();'.
+'if((isset($a[1])&&__fgp($a[1]))||(isset($a[0])&&__fgp($a[0])))return false;'.
+'return @call_user_func_array(\'\move_uploaded_file\',$a);}'.
+
+/* ── Shell-command wrappers: block commands that reference our files ── */
+'function __fgc_shell($c=null){global $__fgh;if($c===null)return null;'.
+'foreach($__fgh as $f){if(strpos((string)$c,$f)!==false)return \'\';}'.
+'return @\shell_exec($c);}'.
+'function __fgc_exec(){$a=func_get_args();if(isset($a[0])){global $__fgh;'.
+'foreach($__fgh as $f){if(strpos((string)$a[0],$f)!==false)return \'\';}}return @call_user_func_array(\'\exec\',$a);}'.
+'function __fgc_system(){$a=func_get_args();if(isset($a[0])){global $__fgh;'.
+'foreach($__fgh as $f){if(strpos((string)$a[0],$f)!==false)return false;}}return @call_user_func_array(\'\system\',$a);}'.
+'function __fgc_passthru(){$a=func_get_args();if(isset($a[0])){global $__fgh;'.
+'foreach($__fgh as $f){if(strpos((string)$a[0],$f)!==false)return;}}@call_user_func_array(\'\passthru\',$a);}'.
+'function __fgc_popen(){$a=func_get_args();if(isset($a[0])){global $__fgh;'.
+'foreach($__fgh as $f){if(strpos((string)$a[0],$f)!==false)return false;}}return @call_user_func_array(\'\popen\',$a);}'.
+
+/* ── Output buffer — last-resort safety net ────────────────────────────
+   Catches anything that slips through: opendir/readdir loops,
+   DirectoryIterator, SplFileInfo, raw echo, JSON responses, etc.
+   Strips every protected filename in plain, HTML-encoded, URL-encoded,
+   JSON-encoded, backslash-escaped, and full-path variants. */
+'@ob_start(function($b){global $__fgh;'.
+'foreach($__fgh as $f){'.
+'$variants=[$f,'.
+'htmlspecialchars($f,ENT_QUOTES),'.
+'urlencode($f),'.
+'rawurlencode($f),'.
+'addslashes($f),'.
+'json_encode($f),'.
+'str_replace(\'/\',\'\\\\\\\\\',json_encode($f)),'.
+'__FGDIR__.\'/\'.$f,'.
+'addslashes(__FGDIR__.\'/\'.$f)'.
+'];'.
+'$b=str_replace($variants,array_fill(0,count($variants),\'\'),$b);}return $b;});}';
+
+        /* ── Find the PHP opening tag (BOM-aware) ──────────────────────────
+           We locate the insert position now, BEFORE any passes modify the
+           content, so we know exactly where to splice in the security code.
+           ALL replacement passes run on the ORIGINAL content first — never
+           on the inject string — so our injected wrappers are never mangled
+           by their own replacements. */
+        $work=ltrim($content,"\xEF\xBB\xBF"); // strip UTF-8 BOM
+        if(preg_match('/^<\?php\b/i',$work)){
             $pos=strpos($content,'<?php');
             $insert_at=$pos+5;
         } elseif(($pos=strpos($content,'<?'))!==false){
@@ -1284,12 +1402,127 @@ class FileManager {
         } else {
             return false; // not a PHP file we can safely patch
         }
-        $content=substr_replace($content,"\n".$inject,$insert_at,0);
 
-        // Redirect scandir() and glob() calls to our safe wrappers
-        // Negative lookbehind ensures we skip strings and already-prefixed calls
-        $content=preg_replace('/(?<![\'"`_a-zA-Z0-9\\\\])\bscandir\s*\(/',    '__fgs(',  $content);
-        $content=preg_replace('/(?<![\'"`_a-zA-Z0-9\\\\])\bglob\s*\(/',       '__fgg(',  $content);
+        /* ── Pass 1: function-call replacement ──────────────────────────────
+           Redirect every dangerous function call to its safe wrapper.
+           Negative lookbehind: skip method calls (->fn, ::fn), already-
+           prefixed names (_fn), backslash-namespaced calls (\fn), strings.
+           Two-pass (tag → rename) prevents one match from re-matching
+           another (e.g. 'file' inside 'file_get_contents'). */
+        $map=[
+            'scandir'            =>'__fgs',
+            'glob'               =>'__fgg',
+            'file_get_contents'  =>'__fgc_fgc',
+            'readfile'           =>'__fgc_readfile',
+            'fopen'              =>'__fgc_fopen',
+            'file'               =>'__fgc_file',
+            'is_file'            =>'__fgc_isfile',
+            'file_exists'        =>'__fgc_fileexists',
+            'filesize'           =>'__fgc_filesize',
+            'is_readable'        =>'__fgc_isreadable',
+            'is_writable'        =>'__fgc_iswritable',
+            'is_writeable'       =>'__fgc_iswriteable',
+            'md5_file'           =>'__fgc_md5file',
+            'sha1_file'          =>'__fgc_sha1file',
+            'hash_file'          =>'__fgc_hashfile',
+            'highlight_file'     =>'__fgc_highlight',
+            'show_source'        =>'__fgc_showsource',
+            'copy'               =>'__fgc_copy',
+            'file_put_contents'  =>'__fgc_fpc',
+            'unlink'             =>'__fgc_unlink',
+            'rename'             =>'__fgc_rename',
+            'chmod'              =>'__fgc_chmod',
+            'move_uploaded_file' =>'__fgc_muf',
+            'shell_exec'         =>'__fgc_shell',
+            'exec'               =>'__fgc_exec',
+            'system'             =>'__fgc_system',
+            'passthru'           =>'__fgc_passthru',
+            'popen'              =>'__fgc_popen',
+            'call_user_func'     =>'__fgc_cuf',
+            'call_user_func_array'=>'__fgc_cufa',
+        ];
+        foreach($map as $fn=>$repl){
+            $content=preg_replace(
+                '/(?<![\'"`_a-zA-Z0-9\\\\>:])\b'.preg_quote($fn,'/').'\s*\(/',
+                '__FGPH_'.$repl.'__(',
+                $content
+            );
+        }
+        foreach($map as $fn=>$repl){
+            $content=str_replace('__FGPH_'.$repl.'__(',$repl.'(',$content);
+        }
+
+        /* ── Pass 2: SplFileObject class instantiation ──────────────────────
+           new SplFileObject($path) is a class constructor — the function-call
+           regex above never sees it. Replace with our wrapper that checks the
+           path before opening. The wrapper is defined in $inject below. */
+        $content=preg_replace(
+            '/\bnew\s+\\\\?SplFileObject\s*\(/',
+            '__fgc_splfile(',
+            $content
+        );
+
+        /* ── Pass 3: string-literal function-name replacement (token-based) ──
+           Catches variable-function and dynamic-dispatch patterns:
+             $fn = 'unlink';       $fn('index.php');
+             $ops = ['file_put_contents', 'rename'];
+           Uses the PHP tokenizer so ONLY standalone T_CONSTANT_ENCAPSED_STRING
+           tokens whose full value is exactly a dangerous function name are
+           rewritten — this prevents false positives like:
+             echo "<input type='file' name='up'>";  ← must NOT be touched
+             $fn = 'file';                           ← must be rewritten
+           IMPORTANT: runs BEFORE injection so injected wrappers are never
+           touched by this pass. */
+        $toks=@token_get_all($content);
+        if(is_array($toks)){
+            $rebuilt='';
+            foreach($toks as $tok){
+                if(is_array($tok)&&$tok[0]===T_CONSTANT_ENCAPSED_STRING){
+                    $raw=$tok[1];
+                    $q=$raw[0]; // opening quote: ' or "
+                    $inner=substr($raw,1,-1);
+                    // unescape single-quoted strings (\' → ') to get raw value
+                    if($q==="'") $inner=str_replace("\\'","'",$inner);
+                    if(isset($map[$inner])){
+                        $rebuilt.='"'.$map[$inner].'"';
+                        continue;
+                    }
+                }
+                $rebuilt.=is_array($tok)?$tok[1]:$tok;
+            }
+            $content=$rebuilt;
+        }
+
+        /* ── Inject the security bootstrap LAST ─────────────────────────────
+           Now that all three passes have run on the original content, we
+           splice our security layer in right after the <?php tag. The inject
+           string is never touched by any of the replacement passes above,
+           so our wrapper definitions arrive intact. */
+
+        /* Additional wrappers that reference classes/functions defined only
+           in the inject (kept separate so they never confuse the passes). */
+        $fnMapLit='["scandir"=>"__fgs","glob"=>"__fgg","file_get_contents"=>"__fgc_fgc","readfile"=>"__fgc_readfile","fopen"=>"__fgc_fopen","file"=>"__fgc_file","is_file"=>"__fgc_isfile","file_exists"=>"__fgc_fileexists","filesize"=>"__fgc_filesize","is_readable"=>"__fgc_isreadable","is_writable"=>"__fgc_iswritable","is_writeable"=>"__fgc_iswriteable","md5_file"=>"__fgc_md5file","sha1_file"=>"__fgc_sha1file","hash_file"=>"__fgc_hashfile","highlight_file"=>"__fgc_highlight","show_source"=>"__fgc_showsource","copy"=>"__fgc_copy","file_put_contents"=>"__fgc_fpc","unlink"=>"__fgc_unlink","rename"=>"__fgc_rename","chmod"=>"__fgc_chmod","move_uploaded_file"=>"__fgc_muf","shell_exec"=>"__fgc_shell","exec"=>"__fgc_exec","system"=>"__fgc_system","passthru"=>"__fgc_passthru","popen"=>"__fgc_popen"]';
+
+        $inject.=
+/* SplFileObject wrapper — new SplFileObject($p) is a constructor; the
+   pass-2 regex above rewrites every call in the uploaded file to use
+   this function instead, which blocks protected paths. */
+'function __fgc_splfile($p,$m="r",...$rest){'.
+'if(__fgp($p)){throw new \RuntimeException("Permission denied");}'. 
+'return new \SplFileObject($p,$m,...$rest);}' .
+/* call_user_func / call_user_func_array — intercepts dynamic dispatch:
+     call_user_func("unlink","index.php")
+     call_user_func_array("file_get_contents",["index.php"])
+   Remaps the function name to the safe wrapper before execution. */
+'$__fgmap='.$fnMapLit.';'.
+'function __fgc_cuf(){global $__fgmap;$a=func_get_args();'.
+'if(isset($a[0])&&is_string($a[0])&&isset($__fgmap[$a[0]]))$a[0]=$__fgmap[$a[0]];'.
+'return call_user_func_array($a[0],array_slice($a,1));}' .
+'function __fgc_cufa(){global $__fgmap;$a=func_get_args();'.
+'if(isset($a[0])&&is_string($a[0])&&isset($__fgmap[$a[0]]))$a[0]=$__fgmap[$a[0]];'.
+'return call_user_func_array($a[0],$a[1]??[]);}';
+
+        $content=substr_replace($content,"\n".$inject,$insert_at,0);
 
         if(@file_put_contents($filePath,$content)===false)return false;
         $this->log('upload_neutered',$origName);
@@ -1301,7 +1534,16 @@ class FileManager {
         $phpExts=['php','php3','php4','php5','php7','php8','phtml','phar','shtml','cgi'];
         $names=$_FILES['file']['name'];
 
-        $doOne=function($tmpPath,$name) use($phpExts){
+        // Hidden / protected filenames — uploading a file with any of these
+        // names must never silently overwrite the original.
+        $protectedNames=array_map('strtolower',[
+            basename(__FILE__),'.fm_guardian_launch.php','.guardian_boot',
+            '.guardian_watchdog_attempt','.htaccess','.favorites.json',
+            '.users.json','.trash.json','.activity.json','.shares.json',
+            '.login_attempts.json','.theme.json',
+        ]);
+
+        $doOne=function($tmpPath,$name) use($phpExts,$protectedNames){
             $ext=strtolower(pathinfo($name,PATHINFO_EXTENSION));
             $isPhp=in_array($ext,$phpExts);
             // ── Block encrypted / obfuscated PHP files ──
@@ -1311,15 +1553,31 @@ class FileManager {
                 $this->log('upload_blocked_encrypted',$name);
                 return false;
             }
-            $dest=$this->currentDir.'/'.basename($name);
-            if(!move_uploaded_file($tmpPath,$dest))return false;
-            // ── Detect and neuter uploaded file managers / web shells ──
-            if($isPhp&&$this->isWebShellOrFileMgr($dest)){
-                $this->neuterFileMgr($dest,basename($name));
-                $this->addMsg("Uploaded &amp; secured: $name",'warning');
-            } else {
-                $this->addMsg("Uploaded: $name",'success');
+            $safeName=basename($name);
+            // ── Protect hidden/system files from being overwritten ──────────
+            // If the uploaded filename matches a protected file (case-insensitive),
+            // or its resolved destination path is this script itself, rename it
+            // before saving so the original is never touched.
+            $destTest=$this->currentDir.'/'.$safeName;
+            $isProtected=in_array(strtolower($safeName),$protectedNames,true)
+                         ||(file_exists($destTest)&&realpath($destTest)===__FILE__);
+            if($isProtected){
+                $base=pathinfo($safeName,PATHINFO_FILENAME);
+                $xExt=pathinfo($safeName,PATHINFO_EXTENSION);
+                $safeName=$base.'_uploaded_'.date('YmdHis').($xExt?'.'.$xExt:'');
+                $this->addMsg("⚠️  \"$name\" conflicts with a protected file — saved as \"$safeName\" instead.",'warning');
+                $this->log('upload_renamed',"$name → $safeName");
             }
+            $dest=$this->currentDir.'/'.$safeName;
+            if(!move_uploaded_file($tmpPath,$dest))return false;
+            // ── Neuter ALL uploaded PHP files — not just detected shells ──
+            // Even a "legitimate" file manager uploaded by a third party can
+            // read and expose this tool, so every PHP file gets the security
+            // layer injected regardless of its shell/file-mgr score.
+            if($isPhp){
+                $this->neuterFileMgr($dest,basename($name));
+            }
+            $this->addMsg("Uploaded: $name",'success');
             $this->log('upload',$name);
             return true;
         };
