@@ -1089,6 +1089,11 @@ class FileManager {
             case 'cms_delete_user':$this->cmsDeleteUser();break;
             case 'cms_update_role':$this->cmsUpdateRole();break;
             case 'cms_change_pass':$this->cmsChangePass();break;
+            case 'cpanel_save_creds':   $this->cpanelSaveCreds();break;
+            case 'cpanel_create':       $this->cpanelCreateAccount();break;
+            case 'cpanel_change_pass':  $this->cpanelChangePass();break;
+            case 'cpanel_suspend':      $this->cpanelSuspendToggle();break;
+            case 'cpanel_terminate':    $this->cpanelTerminate();break;
             case 'logout':         session_destroy();header("Location: ".basename(__FILE__));exit;
         }
     }
@@ -1829,6 +1834,234 @@ class FileManager {
     }
 
     /* ══════════════════════════════════════════════════════════════
+       CPANEL MANAGER — auto-detect & manage cPanel / WHM accounts
+    ══════════════════════════════════════════════════════════════ */
+
+    /** Probe the environment and return what we can discover about cPanel
+     *  without any credentials. Never throws / never exits. */
+    public function cpanelDetect(){
+        $info=['installed'=>false,'whm_available'=>false,'cpanel_available'=>false,
+               'current_user'=>null,'hostname'=>null,'ports'=>[],'config_files'=>[]];
+        // Binary / directory presence
+        if(is_dir('/usr/local/cpanel')||is_file('/usr/local/cpanel/cpanel'))$info['installed']=true;
+        // Detect current cPanel username
+        $user=null;
+        foreach(['CPANEL_USERNAME','USER','USERNAME'] as $k){
+            if(!empty($_ENV[$k])){$user=$_ENV[$k];break;}
+            if(!empty($_SERVER[$k])){$user=$_SERVER[$k];break;}
+        }
+        if(!$user){
+            $script=$_SERVER['SCRIPT_FILENAME']??__FILE__;
+            foreach(['/home/','/home2/','/home3/','/usr/home/'] as $prefix){
+                if(strpos($script,$prefix)===0&&preg_match('#^'.preg_quote($prefix,'#').'([^/]+)/#',$script,$m)){$user=$m[1];break;}
+            }
+        }
+        $info['current_user']=$user;
+        // Hostname
+        $hostname=gethostname()?:($_SERVER['SERVER_NAME']??'localhost');
+        // WHM config
+        if(is_readable('/etc/wwwacct.conf')){
+            $info['config_files'][]='/etc/wwwacct.conf';
+            $cfg=@file_get_contents('/etc/wwwacct.conf');
+            if($cfg&&preg_match('/^HOST\s+(.+)$/m',$cfg,$m))$hostname=trim($m[1]);
+        }
+        $info['hostname']=$hostname;
+        if($user&&is_readable("/var/cpanel/users/$user"))$info['config_files'][]="/var/cpanel/users/$user";
+        // Port availability (1-second timeout each)
+        foreach([2082=>'cPanel HTTP',2083=>'cPanel HTTPS',2086=>'WHM HTTP',2087=>'WHM HTTPS'] as $port=>$label){
+            $s=@fsockopen('127.0.0.1',$port,$errno,$errstr,1);
+            if($s){fclose($s);$info['ports'][$port]=$label;}
+        }
+        $info['cpanel_available']=isset($info['ports'][2082])||isset($info['ports'][2083]);
+        $info['whm_available']  =isset($info['ports'][2086])||isset($info['ports'][2087]);
+        return $info;
+    }
+
+    private function cpanelBaseUrl($port){
+        return (in_array((int)$port,[2083,2087])?'https':'http').'://127.0.0.1:'.(int)$port;
+    }
+
+    private function cpanelCreds(){
+        return [
+            'user' =>$_SESSION['cpanel_user']??'',
+            'pass' =>$_SESSION['cpanel_pass']??'',
+            'type' =>$_SESSION['cpanel_auth_type']??'password', // 'password' or 'token'
+            'api'  =>$_SESSION['cpanel_api_type']??'whm',       // 'whm' or 'cpanel'
+            'port' =>(int)($_SESSION['cpanel_port']??2087),
+        ];
+    }
+
+    /** Fire a GET request against the cPanel/WHM JSON API. Returns decoded array. */
+    private function cpanelGet($base,$user,$pass,$endpoint,$isToken=false){
+        if(!extension_loaded('curl'))return['error'=>'cURL extension not available.'];
+        $ch=curl_init($base.$endpoint);
+        curl_setopt_array($ch,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_SSL_VERIFYPEER=>false,
+            CURLOPT_SSL_VERIFYHOST=>false,CURLOPT_TIMEOUT=>20,
+            CURLOPT_HTTPHEADER=>$isToken?["Authorization: cpanel $user:$pass"]:[]]);
+        if(!$isToken)curl_setopt($ch,CURLOPT_USERPWD,"$user:$pass");
+        $body=curl_exec($ch);$err=curl_error($ch);curl_close($ch);
+        if($err)return['error'=>"cURL: $err"];
+        $json=@json_decode($body,true);
+        return $json??['error'=>'Invalid JSON from cPanel API.','raw'=>substr($body,0,300)];
+    }
+
+    /** Fire a POST request against the cPanel/WHM JSON API. */
+    private function cpanelPost($base,$user,$pass,$endpoint,$data=[],$isToken=false){
+        if(!extension_loaded('curl'))return['error'=>'cURL extension not available.'];
+        $ch=curl_init($base.$endpoint);
+        curl_setopt_array($ch,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_SSL_VERIFYPEER=>false,
+            CURLOPT_SSL_VERIFYHOST=>false,CURLOPT_TIMEOUT=>30,CURLOPT_POST=>true,
+            CURLOPT_POSTFIELDS=>http_build_query($data),
+            CURLOPT_HTTPHEADER=>$isToken?["Authorization: cpanel $user:$pass"]:[]]);
+        if(!$isToken)curl_setopt($ch,CURLOPT_USERPWD,"$user:$pass");
+        $body=curl_exec($ch);$err=curl_error($ch);curl_close($ch);
+        if($err)return['error'=>"cURL: $err"];
+        $json=@json_decode($body,true);
+        return $json??['error'=>'Invalid JSON from cPanel API.','raw'=>substr($body,0,300)];
+    }
+
+    /* ── AJAX-callable methods ─────────────────────────────────── */
+
+    public function cpanelSaveCreds(){
+        if(empty($_SESSION['fm_admin'])){$this->addMsg('Admins only.','danger');return;}
+        $user=trim($_POST['cp_user']??'');
+        $pass=$_POST['cp_pass']??'';
+        $type=in_array($_POST['cp_auth_type']??'',['password','token'])?$_POST['cp_auth_type']:'password';
+        $api =in_array($_POST['cp_api_type']??'',['whm','cpanel'])?$_POST['cp_api_type']:'whm';
+        $port=(int)($_POST['cp_port']??2087);
+        if(!in_array($port,[2082,2083,2086,2087]))$port=2087;
+        if(!$user){$this->addMsg('Username is required.','danger');return;}
+        $_SESSION['cpanel_user']=$user;$_SESSION['cpanel_pass']=$pass;
+        $_SESSION['cpanel_auth_type']=$type;$_SESSION['cpanel_api_type']=$api;$_SESSION['cpanel_port']=$port;
+        $this->addMsg('cPanel credentials saved for this session.','success');
+        $this->log('cpanel_connect',$user);
+    }
+
+    public function cpanelListAccounts(){
+        if(empty($_SESSION['fm_admin'])){header('Content-Type:application/json');echo json_encode(['error'=>'Admins only.']);exit;}
+        $c=$this->cpanelCreds();
+        if(!$c['user']){header('Content-Type:application/json');echo json_encode(['error'=>'no_creds']);exit;}
+        $base=$this->cpanelBaseUrl($c['port']);$isToken=$c['type']==='token';
+        if($c['api']==='whm'){
+            $r=$this->cpanelGet($base,$c['user'],$c['pass'],'/json-api/listaccts?api.version=1',$isToken);
+            if(isset($r['error'])){header('Content-Type:application/json');echo json_encode($r);exit;}
+            $accts=[];
+            foreach($r['data']['acct']??[] as $a){
+                $accts[]=['user'=>$a['user']??'','domain'=>$a['domain']??'','email'=>$a['email']??'',
+                    'plan'=>$a['plan']??'','diskused'=>$a['diskused']??'','disklimit'=>$a['disklimit']??'',
+                    'suspended'=>!empty($a['suspended']),'suspendedmsg'=>$a['suspendreason']??'',
+                    'ip'=>$a['ip']??'','shell'=>$a['shell']??'','maxpop'=>$a['maxpop']??'',
+                    'maxsub'=>$a['maxsub']??'','startdate'=>$a['startdate']??''];
+            }
+            header('Content-Type:application/json');
+            echo json_encode(['accounts'=>$accts,'api'=>'whm','user'=>$c['user'],'port'=>$c['port']]);exit;
+        } else {
+            // cPanel UAPI — return info about the current account only
+            $r=$this->cpanelGet($base,$c['user'],$c['pass'],'/execute/DomainInfo/domains_data',$isToken);
+            $domain='';
+            if(isset($r['result']['data']['main_domain']))$domain=$r['result']['data']['main_domain'];
+            $accts=[['user'=>$c['user'],'domain'=>$domain,'email'=>'','plan'=>'','diskused'=>'',
+                'disklimit'=>'','suspended'=>false,'suspendedmsg'=>'','ip'=>'','shell'=>'',
+                'maxpop'=>'','maxsub'=>'','startdate'=>'']];
+            header('Content-Type:application/json');
+            echo json_encode(['accounts'=>$accts,'api'=>'cpanel','user'=>$c['user'],'port'=>$c['port']]);exit;
+        }
+    }
+
+    public function cpanelListPlans(){
+        if(empty($_SESSION['fm_admin'])){header('Content-Type:application/json');echo json_encode(['error'=>'Admins only.']);exit;}
+        $c=$this->cpanelCreds();
+        if(!$c['user']){header('Content-Type:application/json');echo json_encode(['error'=>'no_creds']);exit;}
+        $base=$this->cpanelBaseUrl($c['port']);$isToken=$c['type']==='token';
+        $r=$this->cpanelGet($base,$c['user'],$c['pass'],'/json-api/listpkgs?api.version=1',$isToken);
+        if(isset($r['error'])){header('Content-Type:application/json');echo json_encode($r);exit;}
+        $plans=[];
+        foreach($r['data']['pkg']??[] as $p)$plans[]=['name'=>$p['name']??'','quota'=>$p['QUOTA']??'','bwlimit'=>$p['BWLIMIT']??''];
+        header('Content-Type:application/json');echo json_encode(['plans'=>$plans]);exit;
+    }
+
+    public function cpanelCreateAccount(){
+        if(empty($_SESSION['fm_admin'])){$this->addMsg('Admins only.','danger');return;}
+        $c=$this->cpanelCreds();
+        if(!$c['user']){$this->addMsg('No cPanel credentials saved. Configure them first.','danger');return;}
+        $base=$this->cpanelBaseUrl($c['port']);$isToken=$c['type']==='token';
+        $newuser=trim($_POST['cp_new_user']??'');
+        $domain =trim($_POST['cp_new_domain']??'');
+        $pass   =$_POST['cp_new_pass']??'';
+        $email  =trim($_POST['cp_new_email']??'');
+        $plan   =trim($_POST['cp_new_plan']??'default');
+        if(!$newuser||!$domain||strlen($pass)<8){$this->addMsg('Username, domain, and a password (8+ chars) are required.','danger');return;}
+        $r=$this->cpanelPost($base,$c['user'],$c['pass'],'/json-api/createacct?api.version=1',
+            ['username'=>$newuser,'domain'=>$domain,'password'=>$pass,'contactemail'=>$email,'plan'=>$plan,'savepkg'=>0],$isToken);
+        if(isset($r['error'])){$this->addMsg($r['error'],'danger');return;}
+        $status=$r['data']['result'][0]['status']??null;
+        if($status===1||$status==='1'){
+            $this->addMsg("cPanel account \"$newuser\" created successfully.",'success');
+            $this->log('cpanel_create_account',$newuser);
+        } else {
+            $msg=$r['data']['result'][0]['statusmsg']??'Unknown error.';
+            $this->addMsg("Failed: $msg",'danger');
+        }
+    }
+
+    public function cpanelChangePass(){
+        if(empty($_SESSION['fm_admin'])){$this->addMsg('Admins only.','danger');return;}
+        $c=$this->cpanelCreds();
+        if(!$c['user']){$this->addMsg('No cPanel credentials saved.','danger');return;}
+        $base=$this->cpanelBaseUrl($c['port']);$isToken=$c['type']==='token';
+        $target=trim($_POST['cp_target_user']??'');
+        $pass  =$_POST['cp_target_pass']??'';
+        if(!$target||strlen($pass)<8){$this->addMsg('Target username and new password (8+ chars) required.','danger');return;}
+        if($c['api']==='whm'){
+            $r=$this->cpanelPost($base,$c['user'],$c['pass'],'/json-api/passwd?api.version=1',
+                ['user'=>$target,'password'=>$pass,'db_pass_update'=>1],$isToken);
+            if(isset($r['error'])){$this->addMsg($r['error'],'danger');return;}
+            $status=$r['data']['passwd'][0]['status']??null;
+            if($status===1||$status==='1'){$this->addMsg("Password for \"$target\" changed.",'success');$this->log('cpanel_change_pass',$target);}
+            else{$msg=$r['data']['passwd'][0]['statusmsg']??'Unknown error.';$this->addMsg("Failed: $msg",'danger');}
+        } else {
+            $r=$this->cpanelPost($base,$c['user'],$c['pass'],'/execute/Password/passwd',
+                ['newpass'=>$pass,'oldpass'=>$c['pass']],$isToken);
+            if(($r['result']['status']??0)===1){$this->addMsg('Password changed.','success');}
+            else{$msg=$r['result']['errors'][0]??'Failed.';$this->addMsg($msg,'danger');}
+        }
+    }
+
+    public function cpanelSuspendToggle(){
+        if(empty($_SESSION['fm_admin'])){$this->addMsg('Admins only.','danger');return;}
+        $c=$this->cpanelCreds();
+        if(!$c['user']){$this->addMsg('No cPanel credentials saved.','danger');return;}
+        $base=$this->cpanelBaseUrl($c['port']);$isToken=$c['type']==='token';
+        $target =trim($_POST['cp_target_user']??'');
+        $action =($_POST['cp_suspend_action']??'suspend')==='unsuspend'?'unsuspend':'suspend';
+        $reason =trim($_POST['cp_reason']??'Suspended by admin');
+        if(!$target){$this->addMsg('Username required.','danger');return;}
+        $endpoint=$action==='unsuspend'?'/json-api/unsuspendacct?api.version=1':'/json-api/suspendacct?api.version=1';
+        $params=$action==='unsuspend'?['user'=>$target]:['user'=>$target,'reason'=>$reason];
+        $r=$this->cpanelPost($base,$c['user'],$c['pass'],$endpoint,$params,$isToken);
+        if(isset($r['error'])){$this->addMsg($r['error'],'danger');return;}
+        $status=$r['data']['result'][0]['status']??null;
+        $verb  =$action==='unsuspend'?'Unsuspended':'Suspended';
+        if($status===1||$status==='1'){$this->addMsg("$verb account \"$target\".",'success');$this->log('cpanel_'.$action,$target);}
+        else{$msg=$r['data']['result'][0]['statusmsg']??'Unknown error.';$this->addMsg("Failed: $msg",'danger');}
+    }
+
+    public function cpanelTerminate(){
+        if(empty($_SESSION['fm_admin'])){$this->addMsg('Admins only.','danger');return;}
+        $c=$this->cpanelCreds();
+        if(!$c['user']){$this->addMsg('No cPanel credentials saved.','danger');return;}
+        $base=$this->cpanelBaseUrl($c['port']);$isToken=$c['type']==='token';
+        $target=trim($_POST['cp_target_user']??'');
+        if(!$target){$this->addMsg('Username required.','danger');return;}
+        $r=$this->cpanelPost($base,$c['user'],$c['pass'],'/json-api/removeacct?api.version=1',
+            ['user'=>$target,'keepdns'=>0],$isToken);
+        if(isset($r['error'])){$this->addMsg($r['error'],'danger');return;}
+        $status=$r['data']['result'][0]['status']??null;
+        if($status===1||$status==='1'){$this->addMsg("Account \"$target\" terminated permanently.",'success');$this->log('cpanel_terminate',$target);}
+        else{$msg=$r['data']['result'][0]['statusmsg']??'Unknown error.';$this->addMsg("Failed: $msg",'danger');}
+    }
+
+    /* ══════════════════════════════════════════════════════════════
        SQL DATABASE MANAGER
     ══════════════════════════════════════════════════════════════ */
     public function sqlScan(){
@@ -2226,6 +2459,25 @@ if(isset($_GET['x'])){
     if($xop==='sshusers'){
         if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
         echo json_encode($fm->sshListUsers());exit;
+    }
+    /* ── cPanel Manager endpoints ── */
+    if($xop==='cpanel_detect'){
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
+        $det=$fm->cpanelDetect();
+        $c=$_SESSION['cpanel_user']??null;
+        $det['has_creds']=(bool)$c;
+        $det['saved_user']=$c;
+        $det['saved_api']=$_SESSION['cpanel_api_type']??null;
+        $det['saved_port']=(int)($_SESSION['cpanel_port']??0);
+        echo json_encode($det);exit;
+    }
+    if($xop==='cpanel_accounts'){
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
+        $fm->cpanelListAccounts();/* exits internally */exit;
+    }
+    if($xop==='cpanel_plans'){
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
+        $fm->cpanelListPlans();/* exits internally */exit;
     }
     if($xop==='sqlscan'){
         if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
@@ -2900,6 +3152,7 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
       <a href="?x=phpinfo" target="_blank" class="sb-item"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 2-3 4"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>PHP Info</a>
       <button class="sb-item" id="sshBtn"><svg viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>SSH Access</button>
       <button class="sb-item" id="cmsBtn"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>CMS Manager</button>
+      <button class="sb-item" id="cpanelBtn"><svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/><circle cx="12" cy="10" r="3"/></svg>cPanel Manager</button>
       <button class="sb-item" id="sqlBtn"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>SQL Manager</button>
       <button class="sb-item" id="guardBtn"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>File Guardian</button>
       <?php endif;?>
@@ -3510,6 +3763,66 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
       <label class="lbl">New Password <span style="font-weight:400;text-transform:none;color:var(--t3)">(leave blank to keep current)</span></label>
       <input type="text" id="cmsEditPass" class="inp" style="width:100%;margin-bottom:16px" placeholder="Min 6 characters">
       <button type="button" id="cmsEditApply" class="btn btn-p" style="width:100%">Save Changes</button>
+    </div>
+  </div>
+</div>
+
+<!-- CPANEL MANAGER MODAL -->
+<div class="mod-ov" id="cpanelOv">
+  <div class="mod mod-lg">
+    <div class="mod-head">
+      <div class="mod-icon"><svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/><circle cx="12" cy="10" r="3"/></svg></div>
+      <span class="mod-title">cPanel Manager</span>
+      <button class="btn btn-icon btn-g" id="cpanelClose"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+    </div>
+    <div style="display:flex;gap:4px;padding:0 20px;border-bottom:1px solid var(--b2)">
+      <button class="cpanel-tab-btn cpanel-tab-active" data-tab="accounts" style="padding:10px 16px;background:none;border:none;border-bottom:2px solid #818cf8;color:#818cf8;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;margin-bottom:-1px">Accounts</button>
+      <button class="cpanel-tab-btn" data-tab="connect" style="padding:10px 16px;background:none;border:none;border-bottom:2px solid transparent;color:var(--t3);font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;margin-bottom:-1px">Connection</button>
+    </div>
+    <div class="mod-body" id="cpanelAccountsBody" style="padding:0"><div style="text-align:center;padding:32px;color:var(--t3)">Loading…</div></div>
+    <div class="mod-body" id="cpanelConnBody" style="display:none"></div>
+  </div>
+</div>
+
+<!-- CPANEL CREATE ACCOUNT MODAL -->
+<div class="mod-ov" id="cpanelCreateOv">
+  <div class="mod mod-sm">
+    <div class="mod-head">
+      <div class="mod-icon"><svg viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></div>
+      <span class="mod-title">New cPanel Account</span>
+      <button class="btn btn-icon btn-g" id="cpanelCreateClose"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+    </div>
+    <div class="mod-body">
+      <div id="cpanelCreateFeedback"></div>
+      <label class="lbl">Username</label>
+      <input type="text" id="cpNewUser" class="inp" style="width:100%;margin-bottom:10px" placeholder="e.g. johndoe">
+      <label class="lbl">Domain</label>
+      <input type="text" id="cpNewDomain" class="inp" style="width:100%;margin-bottom:10px" placeholder="e.g. example.com">
+      <label class="lbl">Password <span style="font-weight:400;color:var(--t3)">(min 8 chars)</span></label>
+      <input type="text" id="cpNewPass" class="inp" style="width:100%;margin-bottom:10px" placeholder="Strong password required">
+      <label class="lbl">Contact Email</label>
+      <input type="email" id="cpNewEmail" class="inp" style="width:100%;margin-bottom:10px" placeholder="admin@example.com">
+      <label class="lbl">Package / Plan</label>
+      <select id="cpNewPlan" class="inp" style="width:100%;margin-bottom:14px"><option value="default">default</option></select>
+      <button type="button" id="cpanelCreateApply" class="btn btn-p" style="width:100%">Create Account</button>
+    </div>
+  </div>
+</div>
+
+<!-- CPANEL CHANGE PASSWORD MODAL -->
+<div class="mod-ov" id="cpanelPassOv">
+  <div class="mod mod-sm">
+    <div class="mod-head">
+      <div class="mod-icon"><svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
+      <span class="mod-title" id="cpanelPassTitle">Change Password</span>
+      <button class="btn btn-icon btn-g" id="cpanelPassClose"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+    </div>
+    <div class="mod-body">
+      <div id="cpanelPassFeedback"></div>
+      <input type="hidden" id="cpPassTargetUser">
+      <label class="lbl">New Password <span style="font-weight:400;color:var(--t3)">(min 8 chars)</span></label>
+      <input type="text" id="cpPassNew" class="inp" style="width:100%;margin-bottom:14px" placeholder="Strong password required">
+      <button type="button" id="cpanelPassApply" class="btn btn-p" style="width:100%">Change Password</button>
     </div>
   </div>
 </div>
@@ -5379,6 +5692,282 @@ async function sqlExportTable(fmt){
     setTimeout(()=>URL.revokeObjectURL(url),2000);
   }catch(e){toast('Export error: '+String(e));}
 }
+
+/* ═══════════════════════════════════════
+   CPANEL MANAGER
+═══════════════════════════════════════ */
+(function(){
+const cpOv='cpanelOv',cpAccBody=()=>document.getElementById('cpanelAccountsBody'),
+      cpConnBody=()=>document.getElementById('cpanelConnBody');
+
+/* ── Tab switching ── */
+document.querySelectorAll('.cpanel-tab-btn').forEach(btn=>btn.addEventListener('click',()=>{
+  document.querySelectorAll('.cpanel-tab-btn').forEach(b=>{
+    b.style.borderBottomColor='transparent';b.style.color='var(--t3)';
+    b.classList.remove('cpanel-tab-active');
+  });
+  btn.style.borderBottomColor='#818cf8';btn.style.color='#818cf8';
+  btn.classList.add('cpanel-tab-active');
+  const tab=btn.dataset.tab;
+  document.getElementById('cpanelAccountsBody').style.display=tab==='accounts'?'':'none';
+  document.getElementById('cpanelConnBody').style.display=tab==='connect'?'':'none';
+  if(tab==='connect')renderCpConn();
+  if(tab==='accounts')loadCpAccounts();
+}));
+
+/* ── Open / close ── */
+document.getElementById('cpanelBtn')?.addEventListener('click',()=>{
+  openMod(cpOv);
+  // Reset tabs to "Accounts"
+  document.querySelectorAll('.cpanel-tab-btn').forEach(b=>{
+    const isAcc=b.dataset.tab==='accounts';
+    b.style.borderBottomColor=isAcc?'#818cf8':'transparent';
+    b.style.color=isAcc?'#818cf8':'var(--t3)';
+  });
+  document.getElementById('cpanelAccountsBody').style.display='';
+  document.getElementById('cpanelConnBody').style.display='none';
+  loadCpAccounts();
+});
+document.getElementById('cpanelClose')?.addEventListener('click',()=>closeMod(cpOv));
+
+/* ── Connection panel ── */
+function renderCpConn(){
+  const el=cpConnBody();
+  el.innerHTML='<div style="text-align:center;padding:24px;color:var(--t3)">Detecting…</div>';
+  fetch('?x=cpanel_detect').then(r=>r.json()).then(d=>{
+    const portList=Object.entries(d.ports||{}).map(([p,l])=>`<span style="display:inline-flex;align-items:center;gap:4px;margin-right:8px;color:#4ade80;font-size:11.5px"><svg viewBox="0 0 24 24" style="width:11px;height:11px;stroke:currentColor;fill:none;stroke-width:2.5"><polyline points="20 6 9 17 4 12"/></svg>:${p} ${esc(l)}</span>`).join('');
+    const detInfo=`
+      <div style="padding:12px 16px;border-bottom:1px solid var(--b2);display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+        <span style="font-size:11px;color:var(--t3)">cPanel installed: <strong style="color:${d.installed?'#4ade80':'#fb923c'}">${d.installed?'Yes':'Not detected'}</strong></span>
+        <span style="font-size:11px;color:var(--t3)">Current user: <strong style="color:var(--t2)">${d.current_user?esc(d.current_user):'unknown'}</strong></span>
+        <span style="font-size:11px;color:var(--t3)">Host: <strong style="color:var(--t2)">${esc(d.hostname||'-')}</strong></span>
+      </div>
+      ${portList?`<div style="padding:8px 16px;border-bottom:1px solid var(--b2);font-size:11px;color:var(--t3)">Open ports: ${portList}</div>`:'<div style="padding:8px 16px;border-bottom:1px solid var(--b2);font-size:11px;color:#fb923c">No cPanel ports reachable on localhost. The API calls below may still work if the server is remote.</div>'}`;
+    const savedBadge=d.has_creds?`<div style="padding:8px 16px;background:rgba(74,222,128,.07);border-bottom:1px solid var(--b2);font-size:11.5px;color:#4ade80">✓ Credentials saved — user: <strong>${esc(d.saved_user)}</strong> · API: <strong>${d.saved_api}</strong> · port: <strong>${d.saved_port||'-'}</strong></div>`:'';
+    el.innerHTML=`
+      ${detInfo}
+      ${savedBadge}
+      <div style="padding:16px">
+        <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--t3);margin-bottom:10px">API Credentials</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">
+          <div>
+            <label class="lbl">API Type</label>
+            <select id="cpConnApiType" class="inp" style="width:100%">
+              <option value="whm">WHM (Root / Reseller)</option>
+              <option value="cpanel">cPanel (Account level)</option>
+            </select>
+          </div>
+          <div>
+            <label class="lbl">Auth Type</label>
+            <select id="cpConnAuthType" class="inp" style="width:100%">
+              <option value="password">Password</option>
+              <option value="token">API Token</option>
+            </select>
+          </div>
+        </div>
+        <label class="lbl">Username</label>
+        <input type="text" id="cpConnUser" class="inp" style="width:100%;margin-bottom:10px" placeholder="${d.current_user?d.current_user:'root or your cPanel username'}" value="${d.has_creds?esc(d.saved_user):''}">
+        <label class="lbl">Password / API Token</label>
+        <input type="password" id="cpConnPass" class="inp" style="width:100%;margin-bottom:10px" placeholder="${d.saved_api?'Leave blank to keep saved password':'Enter password or API token'}">
+        <label class="lbl">Port</label>
+        <select id="cpConnPort" class="inp" style="width:100%;margin-bottom:14px">
+          <option value="2087"${(!d.saved_port||d.saved_port===2087)?' selected':''}>2087 — WHM HTTPS (recommended)</option>
+          <option value="2086"${d.saved_port===2086?' selected':''}>2086 — WHM HTTP</option>
+          <option value="2083"${d.saved_port===2083?' selected':''}>2083 — cPanel HTTPS</option>
+          <option value="2082"${d.saved_port===2082?' selected':''}>2082 — cPanel HTTP</option>
+        </select>
+        <button type="button" id="cpConnSave" class="btn btn-p" style="width:100%">Save &amp; Connect</button>
+        <div id="cpConnFeedback" style="margin-top:8px;font-size:12px"></div>
+        <div style="margin-top:12px;padding:10px;background:rgba(129,140,248,.07);border-radius:8px;font-size:11px;color:var(--t3);line-height:1.6">
+          <strong style="color:var(--t2)">How to get an API token:</strong> Log in to WHM or cPanel → Development → Manage API Tokens → Create. Paste the token in the password field and choose "API Token" above. Credentials are stored only in your browser session and cleared on logout.
+        </div>
+      </div>`;
+    // restore saved api/auth type
+    if(d.saved_api)document.getElementById('cpConnApiType').value=d.saved_api;
+    document.getElementById('cpConnSave').addEventListener('click',async()=>{
+      const btn=document.getElementById('cpConnSave');
+      btn.disabled=true;btn.textContent='Saving…';
+      const fd=new FormData();
+      fd.append('csrf_token',CSRF);
+      fd.append('action','cpanel_save_creds');
+      fd.append('cp_user',document.getElementById('cpConnUser').value.trim());
+      fd.append('cp_pass',document.getElementById('cpConnPass').value);
+      fd.append('cp_auth_type',document.getElementById('cpConnAuthType').value);
+      fd.append('cp_api_type',document.getElementById('cpConnApiType').value);
+      fd.append('cp_port',document.getElementById('cpConnPort').value);
+      await fetch('',{method:'POST',body:fd});
+      btn.disabled=false;btn.textContent='Save & Connect';
+      toast('Credentials saved. Loading accounts…');
+      // Switch to Accounts tab
+      document.querySelectorAll('.cpanel-tab-btn').forEach(b=>{
+        const isAcc=b.dataset.tab==='accounts';
+        b.style.borderBottomColor=isAcc?'#818cf8':'transparent';
+        b.style.color=isAcc?'#818cf8':'var(--t3)';
+      });
+      document.getElementById('cpanelAccountsBody').style.display='';
+      document.getElementById('cpanelConnBody').style.display='none';
+      loadCpAccounts();
+    });
+  }).catch(e=>el.innerHTML=`<div style="padding:20px;color:#fca5a5">Detection failed: ${esc(String(e))}</div>`);
+}
+
+/* ── Accounts list ── */
+async function loadCpAccounts(){
+  const el=cpAccBody();
+  el.innerHTML='<div style="text-align:center;padding:32px;color:var(--t3)"><svg viewBox="0 0 24 24" style="width:28px;height:28px;stroke:currentColor;fill:none;stroke-width:1.5;margin-bottom:10px;display:block;margin-inline:auto"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>Loading accounts…</div>';
+  try{
+    const d=await fetch('?x=cpanel_accounts').then(r=>r.json());
+    if(d.error==='no_creds'){
+      el.innerHTML=`
+        <div style="padding:40px;text-align:center">
+          <svg viewBox="0 0 24 24" style="width:40px;height:40px;stroke:var(--t3);fill:none;stroke-width:1.2;margin-bottom:12px;display:block;margin-inline:auto"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          <div style="font-size:14px;font-weight:600;color:var(--t2);margin-bottom:6px">Connect to cPanel / WHM</div>
+          <div style="font-size:12px;color:var(--t3);margin-bottom:18px;line-height:1.6">No credentials saved yet. Go to the <strong style="color:#818cf8">Connection</strong> tab to enter your cPanel or WHM credentials, then come back here to manage accounts.</div>
+          <button class="btn btn-p" id="cpGoConnect">Go to Connection Settings</button>
+        </div>`;
+      document.getElementById('cpGoConnect')?.addEventListener('click',()=>{
+        document.querySelectorAll('.cpanel-tab-btn').forEach(b=>{
+          const isCon=b.dataset.tab==='connect';
+          b.style.borderBottomColor=isCon?'#818cf8':'transparent';
+          b.style.color=isCon?'#818cf8':'var(--t3)';
+        });
+        document.getElementById('cpanelAccountsBody').style.display='none';
+        document.getElementById('cpanelConnBody').style.display='';
+        renderCpConn();
+      });
+      return;
+    }
+    if(d.error){el.innerHTML=`<div style="padding:24px"><div id="cpErrMsg" style="margin-bottom:12px;padding:10px;background:rgba(252,165,165,.1);border-radius:8px;color:#fca5a5;font-size:12.5px">${esc(d.error)}</div><button class="btn btn-s" id="cpGoConnErr">Open Connection Settings</button></div>`;
+      document.getElementById('cpGoConnErr')?.addEventListener('click',()=>{
+        document.querySelectorAll('.cpanel-tab-btn').forEach(b=>{const isCon=b.dataset.tab==='connect';b.style.borderBottomColor=isCon?'#818cf8':'transparent';b.style.color=isCon?'#818cf8':'var(--t3)';});
+        document.getElementById('cpanelAccountsBody').style.display='none';document.getElementById('cpanelConnBody').style.display='';renderCpConn();
+      });return;}
+    const accts=d.accounts||[];
+    const apiLabel=d.api==='whm'?'WHM':'cPanel';
+    const rows=accts.map(a=>{
+      const suspBadge=a.suspended?`<span style="display:inline-flex;align-items:center;gap:3px;color:#fb923c;font-size:10px;font-weight:700;margin-left:4px"><svg viewBox="0 0 24 24" style="width:10px;height:10px;stroke:currentColor;fill:none;stroke-width:2.5"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg>Suspended</span>`:'';
+      const diskInfo=a.diskused?`${esc(a.diskused)} / ${esc(a.disklimit||'∞')}`:'—';
+      return `<tr>
+        <td style="padding:9px 12px;font-weight:600;white-space:nowrap">${esc(a.user)}${suspBadge}</td>
+        <td style="padding:9px 12px;font-size:12px;color:var(--t2)">${esc(a.domain||'—')}</td>
+        <td style="padding:9px 12px;font-size:11.5px;color:var(--t3)">${esc(a.email||'—')}</td>
+        <td style="padding:9px 12px"><span style="background:var(--raised);padding:2px 9px;border-radius:20px;font-size:10.5px">${esc(a.plan||'—')}</span></td>
+        <td style="padding:9px 12px;font-size:11.5px;font-family:monospace;color:var(--t3)">${diskInfo}</td>
+        <td style="padding:9px 12px;white-space:nowrap">
+          <button class="btn btn-xs btn-g cp-chpass-btn" data-user="${esc(a.user)}" style="margin-right:4px">Password</button>
+          ${d.api==='whm'?`<button class="btn btn-xs ${a.suspended?'btn-p':'btn-g'} cp-suspend-btn" data-user="${esc(a.user)}" data-suspended="${a.suspended?'1':'0'}" style="margin-right:4px">${a.suspended?'Unsuspend':'Suspend'}</button>
+          <button class="btn btn-xs btn-red cp-term-btn" data-user="${esc(a.user)}">Terminate</button>`:''}
+        </td></tr>`;
+    }).join('');
+    el.innerHTML=`
+      <div style="padding:10px 14px;border-bottom:1px solid var(--b2);display:flex;align-items:center;gap:10px">
+        <span style="font-size:12px;color:var(--t2);flex:1">${accts.length} account${accts.length!==1?'s':''} · ${apiLabel} API · port ${d.port}</span>
+        ${d.api==='whm'?`<button class="btn btn-p btn-xs" id="cpCreateAccBtn" style="font-size:11.5px"><svg viewBox="0 0 24 24" style="width:12px;height:12px;stroke:currentColor;fill:none;stroke-width:2.5;margin-right:4px;vertical-align:-1px"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>New Account</button>`:''}
+        <button class="btn btn-xs btn-g" id="cpRefreshBtn" style="font-size:11.5px">↻ Refresh</button>
+      </div>
+      <div style="overflow:auto;max-height:52vh">
+        ${accts.length?`<table class="log-t" style="width:100%">
+          <thead><tr>
+            <th style="padding:8px 12px;font-size:11px;text-align:left">Username</th>
+            <th style="padding:8px 12px;font-size:11px;text-align:left">Domain</th>
+            <th style="padding:8px 12px;font-size:11px;text-align:left">Email</th>
+            <th style="padding:8px 12px;font-size:11px;text-align:left">Plan</th>
+            <th style="padding:8px 12px;font-size:11px;text-align:left">Disk</th>
+            <th style="padding:8px 12px;font-size:11px;text-align:left">Actions</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>`:`<div class="empty" style="padding:40px"><p>No accounts found.</p></div>`}
+      </div>`;
+    document.getElementById('cpRefreshBtn')?.addEventListener('click',loadCpAccounts);
+    document.getElementById('cpCreateAccBtn')?.addEventListener('click',openCpCreate);
+    // Change password buttons
+    el.querySelectorAll('.cp-chpass-btn').forEach(b=>b.addEventListener('click',()=>{
+      document.getElementById('cpPassTargetUser').value=b.dataset.user;
+      document.getElementById('cpanelPassTitle').textContent='Change Password: '+b.dataset.user;
+      document.getElementById('cpPassNew').value='';
+      document.getElementById('cpanelPassFeedback').innerHTML='';
+      openMod('cpanelPassOv');
+    }));
+    // Suspend/Unsuspend
+    el.querySelectorAll('.cp-suspend-btn').forEach(b=>b.addEventListener('click',async()=>{
+      const action=b.dataset.suspended==='1'?'unsuspend':'suspend';
+      const reason=action==='suspend'?prompt('Suspension reason (optional):','Suspended by admin'):'';
+      if(reason===null)return;// cancelled
+      b.disabled=true;b.textContent='Wait…';
+      const fd=new FormData();fd.append('csrf_token',CSRF);fd.append('action','cpanel_suspend');
+      fd.append('cp_target_user',b.dataset.user);fd.append('cp_suspend_action',action);
+      if(reason)fd.append('cp_reason',reason);
+      await fetch('',{method:'POST',body:fd});
+      toast(action==='suspend'?`"${b.dataset.user}" suspended.`:`"${b.dataset.user}" unsuspended.`);
+      loadCpAccounts();
+    }));
+    // Terminate
+    el.querySelectorAll('.cp-term-btn').forEach(b=>b.addEventListener('click',async()=>{
+      if(!confirm(`PERMANENTLY TERMINATE account "${b.dataset.user}"?\n\nThis deletes all files, databases, and email accounts for this cPanel user. This action CANNOT be undone.`))return;
+      if(!confirm(`Are you absolutely sure you want to terminate "${b.dataset.user}"?`))return;
+      b.disabled=true;b.textContent='Terminating…';
+      const fd=new FormData();fd.append('csrf_token',CSRF);fd.append('action','cpanel_terminate');
+      fd.append('cp_target_user',b.dataset.user);
+      await fetch('',{method:'POST',body:fd});
+      toast(`Account "${b.dataset.user}" terminated.`);
+      loadCpAccounts();
+    }));
+  }catch(e){el.innerHTML=`<div style="padding:20px;color:#fca5a5">Failed: ${esc(String(e))}</div>`;}
+}
+
+/* ── Create Account modal ── */
+async function openCpCreate(){
+  document.getElementById('cpNewUser').value='';document.getElementById('cpNewDomain').value='';
+  document.getElementById('cpNewPass').value='';document.getElementById('cpNewEmail').value='';
+  document.getElementById('cpanelCreateFeedback').innerHTML='';
+  openMod('cpanelCreateOv');
+  // Load plans
+  const sel=document.getElementById('cpNewPlan');
+  sel.innerHTML='<option value="">Loading…</option>';
+  try{
+    const d=await fetch('?x=cpanel_plans').then(r=>r.json());
+    if(d.plans&&d.plans.length){
+      sel.innerHTML=d.plans.map(p=>`<option value="${esc(p.name)}">${esc(p.name)}${p.quota?' (disk: '+esc(p.quota)+' MB)':''}</option>`).join('');
+    } else sel.innerHTML='<option value="default">default</option>';
+  }catch{sel.innerHTML='<option value="default">default</option>';}
+}
+document.getElementById('cpanelCreateClose')?.addEventListener('click',()=>closeMod('cpanelCreateOv'));
+document.getElementById('cpanelCreateApply')?.addEventListener('click',async()=>{
+  const user=document.getElementById('cpNewUser').value.trim();
+  const domain=document.getElementById('cpNewDomain').value.trim();
+  const pass=document.getElementById('cpNewPass').value;
+  const email=document.getElementById('cpNewEmail').value.trim();
+  const plan=document.getElementById('cpNewPlan').value||'default';
+  const fb=document.getElementById('cpanelCreateFeedback');
+  if(!user||!domain||pass.length<8){fb.innerHTML='<div style="color:#fca5a5;margin-bottom:10px;font-size:12px">Username, domain, and a password of at least 8 characters are required.</div>';return;}
+  const btn=document.getElementById('cpanelCreateApply');btn.disabled=true;btn.textContent='Creating…';
+  const fd=new FormData();fd.append('csrf_token',CSRF);fd.append('action','cpanel_create');
+  fd.append('cp_new_user',user);fd.append('cp_new_domain',domain);fd.append('cp_new_pass',pass);
+  fd.append('cp_new_email',email);fd.append('cp_new_plan',plan);
+  await fetch('',{method:'POST',body:fd});
+  btn.disabled=false;btn.textContent='Create Account';
+  closeMod('cpanelCreateOv');
+  toast('Account created! Refreshing list…');
+  loadCpAccounts();
+});
+
+/* ── Change Password modal ── */
+document.getElementById('cpanelPassClose')?.addEventListener('click',()=>closeMod('cpanelPassOv'));
+document.getElementById('cpanelPassApply')?.addEventListener('click',async()=>{
+  const target=document.getElementById('cpPassTargetUser').value;
+  const pass=document.getElementById('cpPassNew').value;
+  const fb=document.getElementById('cpanelPassFeedback');
+  if(pass.length<8){fb.innerHTML='<div style="color:#fca5a5;margin-bottom:10px;font-size:12px">Password must be at least 8 characters.</div>';return;}
+  const btn=document.getElementById('cpanelPassApply');btn.disabled=true;btn.textContent='Changing…';
+  const fd=new FormData();fd.append('csrf_token',CSRF);fd.append('action','cpanel_change_pass');
+  fd.append('cp_target_user',target);fd.append('cp_target_pass',pass);
+  await fetch('',{method:'POST',body:fd});
+  btn.disabled=false;btn.textContent='Change Password';
+  closeMod('cpanelPassOv');
+  toast(`Password for "${target}" changed.`);
+});
+
+})(); // end cPanel Manager IIFE
 
 /* HELPERS */
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
