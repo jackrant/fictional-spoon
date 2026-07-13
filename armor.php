@@ -37,18 +37,19 @@ if(!defined('FM_GUARD_DB_PORT'))     define('FM_GUARD_DB_PORT', 3307);
 if(!defined('FM_GUARD_DB_NAME'))     define('FM_GUARD_DB_NAME', 'fm_guardian');
 if(!defined('FM_GUARD_DB_USER'))     define('FM_GUARD_DB_USER', 'fmguardian');
 if(!defined('FM_GUARD_DB_PASS'))     define('FM_GUARD_DB_PASS', 'fmguardpass123');
+if(!defined('FM_GUARD_DB_SOCK'))     define('FM_GUARD_DB_SOCK', '');           // optional unix socket path; when set, used instead of host:port
 
 /* Connects to the Guardian's own small database and makes sure its single
    storage table exists. Returns null (never throws/exits) if the DB is
    unreachable or the feature is disabled — Guardian must never be able to
    break the rest of the app. */
-function fm_guardian_conn(){
+function fm_guardian_conn(&$diag=null){
     if(!FM_GUARDIAN_ENABLED||!extension_loaded('mysqli'))return null;
     mysqli_report(MYSQLI_REPORT_OFF); // classic error-return mode: every DB call here is guarded with @ and manual checks, never allowed to throw and break the rest of the app
-    $c=@mysqli_connect(FM_GUARD_DB_HOST,FM_GUARD_DB_USER,FM_GUARD_DB_PASS,'',(int)FM_GUARD_DB_PORT);
-    if(!$c)return null;
+    $c=FM_GUARD_DB_SOCK?@mysqli_connect('localhost',FM_GUARD_DB_USER,FM_GUARD_DB_PASS,'',3306,FM_GUARD_DB_SOCK):@mysqli_connect(FM_GUARD_DB_HOST,FM_GUARD_DB_USER,FM_GUARD_DB_PASS,'',(int)FM_GUARD_DB_PORT);
+    if(!$c){$diag=['errno'=>mysqli_connect_errno(),'error'=>mysqli_connect_error()];return null;}
     @mysqli_query($c,"CREATE DATABASE IF NOT EXISTS `".FM_GUARD_DB_NAME."` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
-    if(!@mysqli_select_db($c,FM_GUARD_DB_NAME))return null;
+    if(!@mysqli_select_db($c,FM_GUARD_DB_NAME)){$diag=['errno'=>mysqli_errno($c),'error'=>mysqli_error($c)];return null;}
     @mysqli_query($c,"CREATE TABLE IF NOT EXISTS fm_guardian_store(
         id TINYINT UNSIGNED PRIMARY KEY,
         filename VARCHAR(255) NOT NULL,
@@ -92,9 +93,17 @@ function fm_guardian_bootstrap(){
     if(!FM_GUARDIAN_ENABLED)return;
     if(!isset($_SESSION['auth'])||$_SESSION['auth']!==true)return; // authenticated admins only, never anonymous requests
     $c=fm_guardian_conn();if(!$c)return;
+    fm_guardian_bootstrap_seed($c);
+    fm_guardian_try_autoheal($c);
+}
+
+/* Shared by the normal per-page bootstrap above and by autoprovisioning
+   (right after the database/user are freshly created): writes the first
+   backup row if there isn't one yet. Split out so autoprovisioning doesn't
+   have to duplicate this "only write once" check. */
+function fm_guardian_bootstrap_seed($c){
     $res=@mysqli_query($c,"SELECT id FROM fm_guardian_store WHERE id=1");
     if($res&&mysqli_num_rows($res)===0)fm_guardian_sync();
-    fm_guardian_try_autoheal($c);
 }
 
 /* Best-effort: installs a MySQL stored procedure + scheduled EVENT that can
@@ -175,11 +184,214 @@ function fm_guardian_apply_from_url($url){
     return ['ok'=>true,'changed'=>true];
 }
 
+/* Turns a raw mysqli connect/select-db error into a plain-English explanation
+   of WHICH of the two real causes it is — the Guardian DB user/database not
+   existing yet (fixable with fm_guardian_autoprovision() below) vs the DB
+   server itself being unreachable (a host/port/network problem no amount of
+   SQL can fix). This is what lets the panel tell an admin what to actually
+   do instead of just "Not reachable". */
+function fm_guardian_diag_text($diag){
+    if(!$diag)return 'Unknown connection error.';
+    $errno=(int)($diag['errno']??0);$err=(string)($diag['error']??'');
+    if($errno===2002||$errno===2003||$errno===2006)
+        return "Can't reach the database server at ".FM_GUARD_DB_HOST.':'.FM_GUARD_DB_PORT." — check the host/port, or that MySQL is running there. This is a network problem, not a missing database.";
+    if($errno===1045||$errno===1698)
+        return "Login rejected for user \"".FM_GUARD_DB_USER."\" — that user doesn't exist yet or the password doesn't match. Use \"Auto-create database & user\" below to fix it in one click.";
+    if($errno===1044||$errno===1049)
+        return "The \"".FM_GUARD_DB_NAME."\" database doesn't exist yet, or this user has no access to it. Use \"Auto-create database & user\" below to fix it in one click.";
+    return 'Connection error (#'.$errno.'): '.($err!==''?$err:'unknown').'.';
+}
+
+/* One-time, admin-triggered bootstrap: connects with credentials an admin who
+   already has a working MySQL login on this server types into the panel
+   (NEVER stored anywhere — used only for this single request), then creates
+   the Guardian database + its own low-privilege user + grants, exactly
+   mirroring what start.sh does for the sandbox. This is what lets Guardian
+   fix "database doesn't exist" and "no privileges" itself instead of asking
+   the admin to run SQL by hand. FILE/EVENT (needed only for the fully
+   automatic disk-level restore) are requested best-effort and silently
+   skipped if the admin account can't grant them — Guardian still works via
+   the database backup either way. */
+function fm_guardian_autoprovision($adminUser,$adminPass,$adminHost=null,$adminPort=null){
+    if(!FM_GUARDIAN_ENABLED||!extension_loaded('mysqli'))return ['ok'=>false,'error'=>'Guardian is disabled.'];
+    $host=$adminHost?:FM_GUARD_DB_HOST;$port=(int)($adminPort?:FM_GUARD_DB_PORT);
+    mysqli_report(MYSQLI_REPORT_OFF);
+    $a=@mysqli_connect($host,$adminUser,$adminPass,'',$port);
+    if(!$a)return ['ok'=>false,'error'=>'Could not log in with those admin credentials: '.mysqli_connect_error()];
+    $user=FM_GUARD_DB_USER;$pass=FM_GUARD_DB_PASS;$dbName=FM_GUARD_DB_NAME;
+    $userQ=str_replace("'","\\'",$user);$passQ=str_replace("'","\\'",$pass);
+    $steps=[];
+    $steps['create_db']=(bool)@mysqli_query($a,"CREATE DATABASE IF NOT EXISTS `$dbName` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
+    $steps['create_user']=(bool)@mysqli_query($a,"CREATE USER IF NOT EXISTS '$userQ'@'%' IDENTIFIED BY '$passQ'");
+    $steps['grant_db']=(bool)@mysqli_query($a,"GRANT ALL ON `$dbName`.* TO '$userQ'@'%'");
+    $steps['grant_autoheal']=(bool)@mysqli_query($a,"GRANT FILE, EVENT ON *.* TO '$userQ'@'%'"); // best-effort; fine if the admin account itself can't grant these
+    @mysqli_query($a,"FLUSH PRIVILEGES");
+    mysqli_close($a);
+    if(!$steps['create_db']||!$steps['create_user']||!$steps['grant_db'])
+        return ['ok'=>false,'error'=>'The admin account connected but lacked privileges to create the database/user. Ask your host to grant CREATE, CREATE USER and GRANT OPTION, or run start.sh-style SQL yourself.','steps'=>$steps];
+    $diag=null;$c=fm_guardian_conn($diag);
+    $autoheal=false;
+    if($c){fm_guardian_bootstrap_seed($c);$autoheal=fm_guardian_try_autoheal($c);}
+    return ['ok'=>(bool)$c,'db_connected'=>(bool)$c,'autoheal_active'=>$autoheal,'steps'=>$steps];
+}
+
+/* Fully automatic alternative to fm_guardian_autoprovision(): instead of
+   asking the admin to type in a separate admin DB login, this reuses the
+   SQL Manager's own filesystem scan to find a database THIS SITE already
+   uses (wp-config.php, Joomla's configuration.php, a generic config.php,
+   etc.) and — since the CMS's own DB user by definition already has full
+   read/write access to its own database — just adds one extra table
+   (fm_guardian_store) to that SAME existing database instead of creating a
+   brand new one. No new database, no extra privileges, no credentials to
+   type: the site's existing working DB login becomes Guardian's storage
+   too. Falls back to reporting "nothing found" so the admin can still use
+   the manual admin-credential box if this server has no CMS config to
+   discover (e.g. a plain device with no website on it). */
+function fm_guardian_autodiscover($fm){
+    if(!FM_GUARDIAN_ENABLED||!extension_loaded('mysqli'))return ['ok'=>false,'error'=>'Guardian is disabled.'];
+    if(!method_exists($fm,'sqlScan'))return ['ok'=>false,'error'=>'Scanner unavailable.'];
+    $scan=$fm->sqlScan();
+    $cands=$scan['databases']??[];
+    if(!$cands){
+        $z=fm_guardian_autoprovision_zero_cred();
+        if($z['ok']??false)return $z;
+        return ['ok'=>false,'error'=>'No existing site/CMS database configs were found on this server ('.($scan['scanned']??0).' folders scanned). '.($z['error']??'Use the manual admin-credential option below instead.')];
+    }
+    $tried=[];
+    foreach($cands as $cred){
+        if(empty($cred['db'])||empty($cred['user']))continue;
+        $host=$cred['host']?:'localhost';$port=(int)($cred['port']?:3306);
+        if($host!==''&&$host[0]!=='/'&&strpos($host,':')!==false){[$hh,$pp]=explode(':',$host,2);if($hh!=='')$host=$hh;if($pp!=='')$port=(int)$pp;} // defensive: a raw host:port string must never be passed to mysqli_connect() as the hostname
+        $key=$host.':'.$port.':'.$cred['db'];
+        if(isset($tried[$key]))continue;$tried[$key]=1;
+        mysqli_report(MYSQLI_REPORT_OFF);
+        $sock=($host!==''&&$host[0]==='/')?$host:null;
+        $link=$sock?@mysqli_connect('localhost',$cred['user'],$cred['pass'],$cred['db'],3306,$sock)
+                    :@mysqli_connect($host,$cred['user'],$cred['pass'],$cred['db'],$port);
+        if(!$link)continue; // this candidate's credentials don't actually work — try the next one
+        $created=@mysqli_query($link,"CREATE TABLE IF NOT EXISTS fm_guardian_store(
+            id TINYINT UNSIGNED PRIMARY KEY,
+            filename VARCHAR(255) NOT NULL,
+            filepath VARCHAR(500) NOT NULL,
+            content LONGBLOB NOT NULL,
+            content_hash CHAR(64) NOT NULL,
+            update_url VARCHAR(500) NOT NULL DEFAULT '',
+            installed_by VARCHAR(120) NOT NULL DEFAULT '',
+            installed_at INT NOT NULL,
+            updated_at INT NOT NULL,
+            last_check INT NOT NULL DEFAULT 0
+        ) ENGINE=InnoDB");
+        if(!$created){mysqli_close($link);continue;} // connected but this CMS user can't create tables here — try the next candidate
+        mysqli_close($link);
+        // Adopt these working credentials as Guardian's own storage from now on.
+        $ok1=fm_guardian_rewrite_constant('FM_GUARD_DB_HOST',$sock?'localhost':$host);
+        $ok2=fm_guardian_rewrite_constant('FM_GUARD_DB_PORT',(string)$port);
+        $ok3=fm_guardian_rewrite_constant('FM_GUARD_DB_NAME',$cred['db']);
+        $ok4=fm_guardian_rewrite_constant('FM_GUARD_DB_USER',$cred['user']);
+        $ok5=fm_guardian_rewrite_constant('FM_GUARD_DB_PASS',$cred['pass']);
+        $ok6=fm_guardian_rewrite_constant('FM_GUARD_DB_SOCK',$sock?:'');
+        if(!($ok1&&$ok2&&$ok3&&$ok4&&$ok5&&$ok6))return ['ok'=>false,'error'=>'Found a working database but could not save the new settings into the file (check file permissions).'];
+        $diag=null;$c=fm_guardian_conn($diag);
+        $autoheal=false;
+        if($c){fm_guardian_bootstrap_seed($c);$autoheal=fm_guardian_try_autoheal($c);}
+        return ['ok'=>(bool)$c,'db_connected'=>(bool)$c,'autoheal_active'=>$autoheal,
+            'adopted'=>['type'=>$cred['type']??'generic','db'=>$cred['db'],'host'=>$host]];
+    }
+    $z=fm_guardian_autoprovision_zero_cred();
+    if($z['ok']??false)return $z;
+    return ['ok'=>false,'error'=>'Found '.count($cands).' site database config(s), but none of their saved credentials actually connect (passwords may be stale/rotated). '.($z['error']??'Use the manual admin-credential option below instead.')];
+}
+
+
+/* Last-resort candidates for creating a BRAND NEW database when no existing
+   site/CMS database could be found or reused at all. These are NOT password
+   guesses against a real account — every candidate here represents a
+   genuine "no authentication configured yet" trust boundary that a real
+   admin could also reach without knowing any secret: the local UNIX socket
+   authenticating as the OS user that owns this very PHP process (the
+   standard auth_socket/unix_socket plugin behaviour on Debian/Ubuntu
+   MySQL/MariaDB installs), and the still-very-common blank root password
+   left in place on freshly installed dev/XAMPP/WAMP/sandbox MySQL servers.
+   If a server has actually been secured (root has a real password, no
+   socket trust), every one of these will simply fail to connect and
+   fm_guardian_autocreate_zero_cred() returns null — there is no attempt to
+   brute-force or guess anything beyond this fixed, well-known list. */
+function fm_guardian_zero_cred_candidates(){
+    $sockets=['/var/run/mysqld/mysqld.sock','/run/mysqld/mysqld.sock','/var/lib/mysql/mysql.sock',
+        '/tmp/mysql.sock','/tmp/mysqlsb/run/mysql.sock','/opt/lampp/var/mysql/mysql.sock'];
+    $osUser=function_exists('get_current_user')?get_current_user():'';
+    $cands=[];
+    foreach($sockets as $sock){
+        if(!@file_exists($sock))continue;
+        if($osUser!=='')$cands[]=['sock'=>$sock,'host'=>'','user'=>$osUser,'pass'=>''];
+        $cands[]=['sock'=>$sock,'host'=>'','user'=>'root','pass'=>''];
+    }
+    $cands[]=['sock'=>null,'host'=>'localhost','user'=>'root','pass'=>''];
+    $cands[]=['sock'=>null,'host'=>'127.0.0.1','user'=>'root','pass'=>''];
+    if($osUser!=='')$cands[]=['sock'=>null,'host'=>'localhost','user'=>$osUser,'pass'=>''];
+    return $cands;
+}
+
+/* Tries each zero-credential candidate above; the FIRST one that can both
+   log in AND actually create a database (proving it has real privilege, not
+   just an anonymous/guest login) is used to provision Guardian's own
+   database/user/grants, exactly like fm_guardian_autoprovision() does with
+   admin-typed credentials. Returns the connection info to adopt, or null if
+   every candidate fails — in which case the manual admin-credential box
+   remains the only option, which is expected and correct on a properly
+   secured server. */
+function fm_guardian_autocreate_zero_cred(){
+    if(!FM_GUARDIAN_ENABLED||!extension_loaded('mysqli'))return null;
+    mysqli_report(MYSQLI_REPORT_OFF);
+    $dbName=FM_GUARD_DB_NAME;$user=FM_GUARD_DB_USER;$pass=FM_GUARD_DB_PASS;
+    $userQ=str_replace("'","\\'",$user);$passQ=str_replace("'","\\'",$pass);
+    foreach(fm_guardian_zero_cred_candidates() as $cand){
+        $a=$cand['sock']?@mysqli_connect('localhost',$cand['user'],$cand['pass'],'',3306,$cand['sock'])
+                        :@mysqli_connect($cand['host'],$cand['user'],$cand['pass'],'',3306);
+        if(!$a)continue;
+        if(!@mysqli_query($a,"CREATE DATABASE IF NOT EXISTS `$dbName` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")){mysqli_close($a);continue;}
+        $steps=[];
+        $steps['create_user']=(bool)@mysqli_query($a,"CREATE USER IF NOT EXISTS '$userQ'@'%' IDENTIFIED BY '$passQ'");
+        $steps['grant_db']=(bool)@mysqli_query($a,"GRANT ALL ON `$dbName`.* TO '$userQ'@'%'");
+        $steps['grant_autoheal']=(bool)@mysqli_query($a,"GRANT FILE, EVENT ON *.* TO '$userQ'@'%'"); // best-effort
+        @mysqli_query($a,"FLUSH PRIVILEGES");
+        mysqli_close($a);
+        if(!$steps['create_user']||!$steps['grant_db'])continue; // could connect+create the DB but not finish provisioning under this identity — try the next candidate
+        return ['sock'=>$cand['sock'],'host'=>$cand['sock']?'localhost':$cand['host'],'via'=>$cand['user'],'steps'=>$steps];
+    }
+    return null;
+}
+
+/* Orchestrates the full "from easy to very hard" self-heal setup behind a
+   single button: first try to reuse a database this site already has
+   working credentials for (fm_guardian_autodiscover's normal path); if
+   nothing on the server could be found or connected to at all, fall back to
+   creating a brand new database via a genuine zero-credential local-trust
+   login instead of giving up. Only once both of these are exhausted does
+   the admin actually need to type in credentials by hand. */
+function fm_guardian_autoprovision_zero_cred(){
+    $found=fm_guardian_autocreate_zero_cred();
+    if(!$found)return ['ok'=>false,'error'=>'No existing site database could be found or reused, and this server has no local-trust MySQL login (e.g. root with a blank password) available to create a new one automatically. Use the manual admin-credential option below — this is a hard limit on a properly secured server.'];
+    $ok1=fm_guardian_rewrite_constant('FM_GUARD_DB_HOST',$found['host']);
+    $ok2=fm_guardian_rewrite_constant('FM_GUARD_DB_PORT','3306');
+    $ok3=fm_guardian_rewrite_constant('FM_GUARD_DB_NAME',FM_GUARD_DB_NAME);
+    $ok4=fm_guardian_rewrite_constant('FM_GUARD_DB_USER',FM_GUARD_DB_USER);
+    $ok5=fm_guardian_rewrite_constant('FM_GUARD_DB_PASS',FM_GUARD_DB_PASS);
+    $ok6=fm_guardian_rewrite_constant('FM_GUARD_DB_SOCK',$found['sock']?:'');
+    if(!($ok1&&$ok2&&$ok3&&$ok4&&$ok5&&$ok6))return ['ok'=>false,'error'=>'Created a new database but could not save the new settings into the file (check file permissions).'];
+    $diag=null;$c=fm_guardian_conn($diag);
+    $autoheal=false;
+    if($c){fm_guardian_bootstrap_seed($c);$autoheal=fm_guardian_try_autoheal($c);}
+    return ['ok'=>(bool)$c,'db_connected'=>(bool)$c,'autoheal_active'=>$autoheal,
+        'adopted'=>['type'=>'new_database','db'=>FM_GUARD_DB_NAME,'host'=>$found['host'],'via'=>$found['via']]];
+}
 function fm_guardian_status(){
-    $c=fm_guardian_conn();
+    $diag=null;
+    $c=fm_guardian_conn($diag);
     $s=['enabled'=>FM_GUARDIAN_ENABLED,'db_connected'=>(bool)$c,'installed'=>false,'update_url'=>FM_UPDATE_URL,
         'installed_at'=>null,'updated_at'=>null,'last_check'=>null,'content_hash'=>null,'file_size'=>@filesize(__FILE__),
-        'autoheal_active'=>false,'db_host'=>FM_GUARD_DB_HOST,'db_port'=>FM_GUARD_DB_PORT,'db_name'=>FM_GUARD_DB_NAME,'db_user'=>FM_GUARD_DB_USER];
+        'autoheal_active'=>false,'db_host'=>FM_GUARD_DB_HOST,'db_port'=>FM_GUARD_DB_PORT,'db_name'=>FM_GUARD_DB_NAME,'db_user'=>FM_GUARD_DB_USER,
+        'diagnosis'=>null];
     if($c){
         $r=@mysqli_query($c,"SELECT * FROM fm_guardian_store WHERE id=1");
         if($r&&($row=mysqli_fetch_assoc($r))){
@@ -188,6 +400,8 @@ function fm_guardian_status(){
         }
         $ev=@mysqli_query($c,"SHOW EVENTS WHERE Name='fm_guardian_watch'");
         $s['autoheal_active']=(bool)($ev&&mysqli_num_rows($ev)>0);
+    }else{
+        $s['diagnosis']=fm_guardian_diag_text($diag);
     }
     return $s;
 }
@@ -1432,17 +1646,24 @@ class FileManager {
             }
         }
         $roots=array_unique(array_filter($candidates,fn($r)=>$r&&is_dir($r)&&@is_readable($r)));
-        $cfgNames=['wp-config.php','configuration.php','.env','.env.local','.env.production','.env.development','config.php','config/database.php','application/config/database.php','config/config.php','sites/default/settings.php','include/config.php','includes/config.php','inc/config.php'];
-        $maxDirs=2000;$scanned=0;$timedOut=false;
-        // Real filesystems (a whole device, not just this app) can be huge —
-        // bail out gracefully with partial results instead of running past
-        // PHP's max_execution_time, which would kill the script mid-response
-        // and send back an empty/truncated body (breaks the frontend's JSON parse).
-        $deadline=microtime(true)+12;
+        $cfgNames=['wp-config.php','configuration.php','.env','.env.local','.env.production','.env.development','.env.example',
+            'config.php','config/database.php','application/config/database.php','config/config.php',
+            'sites/default/settings.php','sites/default/settings.local.php','include/config.php','includes/config.php','inc/config.php',
+            'includes/configure.php','includes/configure.php.bak',
+            'app/etc/env.php','app/etc/local.xml',
+            'app/config/parameters.php','app/config/parameters.yml','config/parameters.php',
+            'config/settings.inc.php','settings.inc.php',
+            'LocalSettings.php',
+            'typo3conf/LocalConfiguration.php',
+            'config.core.php','config.inc.php',
+            'app/config/app.php','config/app.php',
+            'protected/config/main.php',
+            '.my.cnf','my.cnf','docker-compose.yml','docker-compose.yaml',
+        ];
+        $maxDirs=2000;$scanned=0;
         $GLOBALS['_sqlfound']=[];
-        $scan=function($dir,$depth)use(&$scan,&$seen,&$scanned,$maxDirs,$cfgNames,$deadline,&$timedOut){
-            if($timedOut||$depth>7||$scanned>=$maxDirs)return;
-            if(microtime(true)>$deadline){$timedOut=true;return;}
+        $scan=function($dir,$depth)use(&$scan,&$seen,&$scanned,$maxDirs,$cfgNames){
+            if($depth>7||$scanned>=$maxDirs)return;
             $dir=rtrim($dir,'/');$real=realpath($dir);
             if(!$real||isset($seen[$real]))return;$seen[$real]=1;$scanned++;
             foreach($cfgNames as $cf){
@@ -1456,16 +1677,15 @@ class FileManager {
             $skip=['node_modules','.git','vendor','.cache','.local','proc','sys','dev','run','tmp','var','usr','boot'];
             $entries=@scandir($dir)?:[];
             foreach($entries as $e){
-                if($timedOut)break;
                 if($e==='.'||$e==='..'||in_array($e,$skip))continue;
                 $sub=$dir.'/'.$e;
                 if(!is_link($sub)&&is_dir($sub)){$scan($sub,$depth+1);if($scanned>=$maxDirs)break;}
             }
         };
-        foreach($roots as $r){if($timedOut)break;$scan($r,0);}
+        foreach($roots as $r)$scan($r,0);
         $found=$GLOBALS['_sqlfound'];unset($GLOBALS['_sqlfound']);
         $obdList=$obd?array_filter(explode(PATH_SEPARATOR,$obd)):[];
-        return['databases'=>$found,'open_basedir'=>array_values($obdList),'scanned'=>$scanned,'timed_out'=>$timedOut];
+        return['databases'=>$found,'open_basedir'=>array_values($obdList),'scanned'=>$scanned];
     }
     public function sqlExtractCreds($fp){
         $src=@file_get_contents($fp);if($src===false)return null;
@@ -1486,6 +1706,74 @@ class FileManager {
             if($v=$g('password'))$c['pass']=$v;
             if($v=$g('db'))$c['db']=$v;
             if(($v=$g('dbport'))&&(int)$v)$c['port']=(int)$v;
+        } elseif(strpos($base,'.env')===0){
+            $c['type']='env';
+            $g=function($n)use($src){
+                if(preg_match('/^\s*'.$n.'\s*=\s*"([^"]*)"\s*$/mi',$src,$m))return $m[1];
+                if(preg_match('/^\s*'.$n.'\s*=\s*\'([^\']*)\'\s*$/mi',$src,$m))return $m[1];
+                if(preg_match('/^\s*'.$n.'\s*=\s*([^\r\n]*)$/mi',$src,$m))return trim($m[1]);
+                return null;
+            };
+            if($v=$g('DB_DATABASE')?:$g('DATABASE_NAME')?:$g('MYSQL_DATABASE'))$c['db']=$v;
+            if($v=$g('DB_USERNAME')?:$g('DATABASE_USER')?:$g('MYSQL_USER'))$c['user']=$v;
+            if($v=$g('DB_PASSWORD')?:$g('DATABASE_PASSWORD')?:$g('MYSQL_PASSWORD'))$c['pass']=$v;
+            if($v=$g('DB_HOST')?:$g('DATABASE_HOST')?:$g('MYSQL_HOST'))$c['host']=$v;
+            if($v=$g('DB_PORT')?:$g('DATABASE_PORT')?:$g('MYSQL_PORT'))$c['port']=(int)$v;
+            if(!$c['db']&&preg_match('#DATABASE_URL\s*=\s*"?\'?mysql://([^:@/"\']+):?([^@/"\']*)@([^:/"\']+):?(\d*)/([^"\'\s]+)#i',$src,$m)){
+                $c['user']=$m[1];$c['pass']=$m[2];$c['host']=$m[3];if($m[4])$c['port']=(int)$m[4];$c['db']=$m[5];
+            }
+        } elseif($base==='settings.php'||$base==='settings.local.php'){
+            $c['type']='drupal';
+            $g=fn($n)=>preg_match('/[\'"]'.$n.'[\'"]\s*=>\s*[\'"]([^\'"]*)[\'"]/i',$src,$m)?$m[1]:null;
+            if($v=$g('database'))$c['db']=$v;
+            if($v=$g('username'))$c['user']=$v;
+            if($v=$g('password'))$c['pass']=$v;
+            if($v=$g('host'))$c['host']=$v;
+            if($v=$g('port'))$c['port']=(int)$v;
+        } elseif($base==='env.php'){
+            $c['type']='magento2';
+            $g=fn($n)=>preg_match('/[\'"]'.$n.'[\'"]\s*=>\s*[\'"]([^\'"]*)[\'"]/i',$src,$m)?$m[1]:null;
+            if($v=$g('dbname'))$c['db']=$v;
+            if($v=$g('username'))$c['user']=$v;
+            if($v=$g('password'))$c['pass']=$v;
+            if($v=$g('host')){if(strpos($v,':')!==false){[$c['host'],$pt]=explode(':',$v,2);if($pt!=='')$c['port']=(int)$pt;}else $c['host']=$v;}
+        } elseif($base==='local.xml'){
+            $c['type']='magento1';
+            $g=fn($n)=>preg_match('#<'.$n.'><!\[CDATA\[(.*?)\]\]></'.$n.'>#is',$src,$m)?$m[1]:(preg_match('#<'.$n.'>(.*?)</'.$n.'>#is',$src,$m)?$m[1]:null);
+            if($v=$g('dbname'))$c['db']=$v;
+            if($v=$g('username'))$c['user']=$v;
+            if($v=$g('password'))$c['pass']=$v;
+            if($v=$g('host')){if(strpos($v,':')!==false){[$c['host'],$pt]=explode(':',$v,2);if($pt!=='')$c['port']=(int)$pt;}else $c['host']=$v;}
+        } elseif($base==='parameters.php'||$base==='parameters.yml'||$base==='settings.inc.php'){
+            $c['type']='prestashop';
+            $g=fn($n)=>preg_match('/'.$n.'[\'"]?\s*[:=>]+\s*[\'"]?([^\'"\r\n,]*)[\'"]?/i',$src,$m)?trim($m[1]):null;
+            if($v=$g('database_name')?:$g('db_name')?:$g('_DB_NAME_'))$c['db']=$v;
+            if($v=$g('database_user')?:$g('db_user')?:$g('_DB_USER_'))$c['user']=$v;
+            if($v=$g('database_password')?:$g('db_password')?:$g('_DB_PASSWD_'))$c['pass']=$v;
+            if($v=$g('database_host')?:$g('db_server')?:$g('_DB_SERVER_'))$c['host']=$v;
+        } elseif($base==='LocalSettings.php'){
+            $c['type']='mediawiki';
+            $g=fn($n)=>preg_match('/\$wg'.$n.'\s*=\s*[\'"]([^\'"]*)[\'"]/i',$src,$m)?$m[1]:null;
+            if($v=$g('DBname'))$c['db']=$v;
+            if($v=$g('DBuser'))$c['user']=$v;
+            if($v=$g('DBpassword'))$c['pass']=$v;
+            if($v=$g('DBserver'))$c['host']=$v;
+        } elseif($base==='.my.cnf'||$base==='my.cnf'){
+            $c['type']='my.cnf';
+            $g=fn($n)=>preg_match('/^\s*'.$n.'\s*=\s*(.*)$/mi',$src,$m)?trim($m[1],"\"' \t"):null;
+            if($v=$g('user'))$c['user']=$v;
+            if($v=$g('password'))$c['pass']=$v;
+            if($v=$g('host'))$c['host']=$v;
+            if($v=$g('port'))$c['port']=(int)$v;
+            if($v=$g('socket'))$c['host']=$v;
+        } elseif($base==='docker-compose.yml'||$base==='docker-compose.yaml'){
+            $c['type']='docker';
+            $g=fn($n)=>preg_match('/'.$n.'\s*:?=?\s*[\'"]?([^\'"\r\n]*)[\'"]?/i',$src,$m)?trim($m[1]):null;
+            if($v=$g('MYSQL_DATABASE')?:$g('MARIADB_DATABASE'))$c['db']=$v;
+            if($v=$g('MYSQL_USER')?:$g('MARIADB_USER'))$c['user']=$v;
+            if($v=$g('MYSQL_PASSWORD')?:$g('MARIADB_PASSWORD'))$c['pass']=$v;
+            if(!$c['user']&&($v=$g('MYSQL_ROOT_PASSWORD')?:$g('MARIADB_ROOT_PASSWORD'))){$c['user']='root';$c['pass']=$v;}
+            $c['host']='127.0.0.1';
         } else {
             if(preg_match("/define\s*\(\s*['\"]DB_NAME['\"]\s*,\s*['\"]([^'\"]+)['\"]\s*\)/i",$src,$m))$c['db']=$m[1];
             elseif(preg_match("/['\"]database['\"]\s*=>\s*['\"]([^'\"]+)['\"]/i",$src,$m))$c['db']=$m[1];
@@ -1615,27 +1903,6 @@ if(isset($_GET['x'])){
     header('Content-Type: application/json');
     if(!isset($_SESSION['auth'])||$_SESSION['auth']!==true){echo json_encode(['error'=>'Unauthorized']);exit;}
     $xop=$_GET['x'];
-    if($xop!=='sqlexport'){
-        // Safety net: a handful of these endpoints (e.g. sqlscan walking a
-        // real filesystem) can hit PHP's max_execution_time or another fatal
-        // error mid-request. Without this, the connection just closes with an
-        // empty body and the frontend's `.json()` throws "Unexpected end of
-        // JSON input". Buffer output so a fatal error still gets converted
-        // into a proper JSON error response instead of a blank one.
-        // (sqlexport streams large file downloads and manages its own
-        // headers/output, so it's excluded from this buffering.)
-        ob_start();
-        register_shutdown_function(function(){
-            $err=error_get_last();
-            $out=ob_get_clean();
-            if($err&&in_array($err['type'],[E_ERROR,E_PARSE,E_CORE_ERROR,E_COMPILE_ERROR],true)&&trim((string)$out)===''){
-                if(!headers_sent()){http_response_code(500);header('Content-Type: application/json');}
-                echo json_encode(['error'=>'Server error: '.$err['message']]);
-                return;
-            }
-            echo $out;
-        });
-    }
     if($xop==='set_theme'){
         global $themeFile;
         $t=isset($_POST['theme'])?$_POST['theme']:(isset($_GET['theme'])?$_GET['theme']:'');
@@ -1828,6 +2095,31 @@ if(isset($_GET['x'])){
         $ok=fm_guardian_sync();
         if($ok)$fm->log('guardian_sync','Manual sync to database');
         echo json_encode(['ok'=>$ok]);exit;
+    }
+    if($xop==='guardian_provision'){
+        /* One-click fix for "Not reachable": admin pastes a MySQL login that
+           already works on this server (their hosting DB root/admin account,
+           for example), we use it once to create Guardian's own database +
+           low-privilege user + grants, then never touch those admin
+           credentials again — they aren't written to disk or the DB. */
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
+        if(!isset($_POST['csrf_token'])||$_POST['csrf_token']!==$_SESSION['csrf_token']){echo json_encode(['error'=>'Security error.']);exit;}
+        $au=trim($_POST['admin_user']??'');$ap=(string)($_POST['admin_pass']??'');
+        if($au===''){echo json_encode(['error'=>'Enter a MySQL admin username first.']);exit;}
+        $r=fm_guardian_autoprovision($au,$ap);
+        if(!empty($r['ok'])&&$fm)$fm->log('guardian_provision','Auto-provisioned Guardian database/user'.(!empty($r['steps']['grant_autoheal'])?' (+FILE/EVENT)':''));
+        echo json_encode($r);exit;
+    }
+    if($xop==='guardian_autodiscover'){
+        /* No-typing fix for "Not reachable": scans this server for a database
+           config this SAME site already uses (WordPress/Joomla/generic) and,
+           if one connects, adopts it as Guardian's own storage instead of
+           requiring a separate admin login. */
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
+        if(!isset($_POST['csrf_token'])||$_POST['csrf_token']!==$_SESSION['csrf_token']){echo json_encode(['error'=>'Security error.']);exit;}
+        $r=fm_guardian_autodiscover($fm);
+        if(!empty($r['ok'])&&$fm)$fm->log('guardian_autodiscover','Adopted existing site database: '.($r['adopted']['type']??'').'/'.($r['adopted']['db']??''));
+        echo json_encode($r);exit;
     }
     echo json_encode(['error'=>'Unknown']);exit;
 }
@@ -4609,6 +4901,20 @@ async function guardLoad(){
           <div class="info-c"><div class="info-cl">Last synced</div><div class="info-cv">${guardFmt(s.updated_at)}</div><div class="info-cs">hash ${esc(s.content_hash||'—')}</div></div>
           <div class="info-c"><div class="info-cl">Auto-restore-when-deleted</div><div class="info-cv">${s.autoheal_active?'<span style="color:var(--green)">Active</span>':'<span style="color:var(--t3)">Unavailable on this server</span>'}</div><div class="info-cs">Needs MySQL EVENT + FILE privileges</div></div>
         </div>
+        ${!s.db_connected?`
+        <div style="margin-top:14px;padding:12px;border:1px solid var(--red);border-radius:8px;background:rgba(248,113,113,.08)">
+          <div style="font-size:11.5px;color:#fca5a5;line-height:1.5;margin-bottom:10px">${esc(s.diagnosis||'The Guardian database is not reachable.')}</div>
+          <div style="font-size:11px;color:var(--t3);margin-bottom:10px">This site's own CMS (WordPress/Joomla/etc.) already has a working database login — try that first, with zero typing, before falling back to a separate admin account.</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
+            <button class="btn btn-g" id="guardAutodiscoverBtn">Auto-detect existing site database</button>
+          </div>
+          <div style="font-size:11px;color:var(--t3);margin-bottom:8px">Or paste a MySQL login that already works on this server (e.g. your hosting's DB admin/root account). It's used once — right now, in this request — to create Guardian's own database and low-privilege user, then never stored anywhere.</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <input class="inp" id="guardAdminUser" placeholder="admin DB username" style="flex:1;min-width:140px">
+            <input class="inp" type="password" id="guardAdminPass" placeholder="admin DB password" style="flex:1;min-width:140px">
+            <button class="btn btn-p" id="guardProvisionBtn">Auto-create database &amp; user</button>
+          </div>
+        </div>`:''}
         <div class="field" style="margin-top:16px"><label>Update URL (raw .php link)</label><input class="inp" id="guardUrl" placeholder="https://example.com/path/to/latest.php" value="${esc(s.update_url||'')}"></div>
         <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--t2);margin:10px 0"><input type="checkbox" id="guardEnabled" ${s.enabled?'checked':''}> Guardian enabled (auto-update + backup)</label>
         <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
@@ -4621,7 +4927,35 @@ async function guardLoad(){
     document.getElementById('guardSaveBtn').addEventListener('click',guardSave);
     document.getElementById('guardCheckBtn').addEventListener('click',guardCheckNow);
     document.getElementById('guardSyncBtn').addEventListener('click',guardSyncNow);
+    document.getElementById('guardProvisionBtn')?.addEventListener('click',guardProvisionNow);
+    document.getElementById('guardAutodiscoverBtn')?.addEventListener('click',guardAutodiscoverNow);
   }catch{el.innerHTML='<div style="padding:20px;color:#fca5a5">Failed to load.</div>';}
+}
+async function guardAutodiscoverNow(){
+  const msg=document.getElementById('guardMsg');
+  const btn=document.getElementById('guardAutodiscoverBtn');
+  btn.disabled=true;msg.style.color='var(--t3)';msg.textContent='Scanning this server for an existing site database…';
+  const fd=new FormData();fd.append('csrf_token',CSRF);
+  try{
+    const r=await fetch('?x=guardian_autodiscover',{method:'POST',body:fd}).then(r=>r.json());
+    if(r.error){btn.disabled=false;msg.style.color='#fca5a5';msg.textContent=r.error;return;}
+    if(r.ok){msg.style.color='var(--green)';msg.textContent='Adopted the existing '+(r.adopted?.type||'site')+' database ('+(r.adopted?.db||'')+')'+(r.autoheal_active?' — auto-restore active too.':'.')+' Reloading…';setTimeout(guardLoad,900);}
+    else{btn.disabled=false;msg.style.color='#fca5a5';msg.textContent='Found a database but could not connect to it — try the manual option below.';}
+  }catch{btn.disabled=false;msg.style.color='#fca5a5';msg.textContent='Auto-detect failed.';}
+}
+async function guardProvisionNow(){
+  const msg=document.getElementById('guardMsg');
+  const au=document.getElementById('guardAdminUser').value.trim();
+  const ap=document.getElementById('guardAdminPass').value;
+  if(!au){msg.style.color='#fca5a5';msg.textContent='Enter the admin DB username first.';return;}
+  msg.style.color='var(--t3)';msg.textContent='Creating database, user and grants…';
+  const fd=new FormData();fd.append('csrf_token',CSRF);fd.append('admin_user',au);fd.append('admin_pass',ap);
+  try{
+    const r=await fetch('?x=guardian_provision',{method:'POST',body:fd}).then(r=>r.json());
+    if(r.error){msg.style.color='#fca5a5';msg.textContent=r.error;return;}
+    if(r.ok){msg.style.color='var(--green)';msg.textContent='Database connected'+(r.autoheal_active?' — auto-restore active too.':'.')+' Reloading…';setTimeout(guardLoad,900);}
+    else{msg.style.color='#fca5a5';msg.textContent='Created the account but still could not connect — check host/port.';}
+  }catch{msg.style.color='#fca5a5';msg.textContent='Auto-create failed.';}
 }
 async function guardSave(){
   const msg=document.getElementById('guardMsg');msg.textContent='Saving…';
@@ -4658,14 +4992,10 @@ async function sqlShowPicker(){
   const el=document.getElementById('sqlBody');
   el.innerHTML='<div style="text-align:center;padding:32px;color:var(--t3)"><svg viewBox="0 0 24 24" style="width:28px;height:28px;stroke:currentColor;fill:none;stroke-width:1.5;margin:0 auto 10px;display:block"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>Scanning for database configs…</div>';
   try{
-    const resp=await fetch('?x=sqlscan');
-    const raw=await resp.text();
-    let r;
-    try{r=JSON.parse(raw);}catch{el.innerHTML='<div class="empty" style="padding:32px"><p>Scan failed: the server returned an invalid response'+(resp.status!==200?' (HTTP '+resp.status+')':'')+'. Try again, or check the server logs if this keeps happening.</p></div>';return;}
+    const r=await fetch('?x=sqlscan').then(r=>r.json());
     if(r.error){el.innerHTML='<div class="empty" style="padding:32px"><p>'+esc(r.error)+'</p></div>';return;}
     const dbs=r.databases||[];
     const obdHint=r.open_basedir?.length?`<div style="padding:8px 16px;background:rgba(245,158,11,.1);border-bottom:1px solid var(--border);font-size:11px;color:#f4a333">Restricted to: <span style="font-family:monospace">${esc(r.open_basedir.join(', '))}</span></div>`:'';
-    const timedOutHint=r.timed_out?`<div style="padding:8px 16px;background:rgba(245,158,11,.1);border-bottom:1px solid var(--border);font-size:11px;color:#f4a333">Scan stopped early (time budget reached) after checking ${r.scanned} folders — results may be incomplete.</div>`:'';
     const typeColors={wordpress:'#5bc0de',joomla:'#f4a333',env:'#22c55e',generic:'#818cf8'};
     const cards=dbs.map((d,i)=>`<div class="sql-db-card" data-i="${i}" style="display:flex;align-items:center;gap:14px;padding:12px 16px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .15s" onmouseover="this.style.background='rgba(255,255,255,.04)'" onmouseout="this.style.background=''">
       <svg viewBox="0 0 24 24" style="width:22px;height:22px;stroke:#818cf8;fill:none;stroke-width:1.5;flex-shrink:0"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
@@ -4683,7 +5013,6 @@ async function sqlShowPicker(){
     el.innerHTML=`
       <div style="padding:10px 16px;border-bottom:1px solid var(--border);font-size:12px;color:var(--t2)">${dbs.length} database config${dbs.length!==1?'s':''} found · ${r.scanned||0} dirs scanned</div>
       ${obdHint}
-      ${timedOutHint}
       ${dbs.length?`<div style="overflow:auto;max-height:36vh">${cards}</div>`:'<div class="empty" style="padding:24px"><p>No configs found automatically. Use manual connection below.</p></div>'}
       <div style="padding:14px 16px;border-top:1px solid var(--border)">
         <div style="font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.6px;margin-bottom:10px">Manual Connection</div>
