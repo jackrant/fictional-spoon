@@ -393,7 +393,11 @@ function fm_guardian_apply_from_url($url){
     if(function_exists('curl_init')){
         $ch=curl_init($url);
         curl_setopt_array($ch,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_FOLLOWLOCATION=>true,CURLOPT_MAXREDIRS=>3,
-            CURLOPT_CONNECTTIMEOUT=>10,CURLOPT_TIMEOUT=>45,CURLOPT_SSL_VERIFYPEER=>true,
+            CURLOPT_CONNECTTIMEOUT=>8,CURLOPT_TIMEOUT=>20,CURLOPT_SSL_VERIFYPEER=>true,
+            // Force IPv4: on some hosts a broken/unreachable IPv6 route to the target is the
+            // actual cause of a "hung" TLS handshake that eventually surfaces as an SSL/connect
+            // timeout — trying IPv6 first burns most of the timeout budget before falling back.
+            CURLOPT_IPRESOLVE=>CURL_IPRESOLVE_V4,
             CURLOPT_HTTPHEADER=>['User-Agent: FileManager-Guardian/1.0']]);
         $data=curl_exec($ch);$curlErr=curl_error($ch);$httpCode=(int)curl_getinfo($ch,CURLINFO_HTTP_CODE);curl_close($ch);
         if($data===false||$curlErr)return ['ok'=>false,'error'=>'Download failed: '.($curlErr?:'cURL error')];
@@ -2073,7 +2077,11 @@ class FileManager {
         return null;
     }
 
-    /** Scan known filesystem locations for a cPanel API token for $username. */
+    /** Scan known filesystem locations for a cPanel API token for $username.
+     *  Real cPanel token files (/var/cpanel/authn/api_tokens/<user>/<name> or
+     *  /home/<user>/.cpanel/authn/api_tokens/<name>) store the raw token
+     *  string as plain text — the filename is the token's name, not JSON.
+     *  We still accept a JSON {"token":"..."} form too, for forward-compat. */
     private function cpFindToken($username){
         foreach(["/var/cpanel/authn/api_tokens/$username","/home/$username/.cpanel/authn/api_tokens"] as $tp){
             if(!is_dir($tp)||!is_readable($tp))continue;
@@ -2081,8 +2089,12 @@ class FileManager {
                 if($f==='.'||$f==='..')continue;
                 $fp="$tp/$f";
                 if(!is_file($fp)||!is_readable($fp))continue;
-                $d=@json_decode(@file_get_contents($fp),true);
-                if(isset($d['token'])&&$d['token'])return $d['token'];
+                $raw=trim((string)@file_get_contents($fp));
+                if($raw==='')continue;
+                $d=@json_decode($raw,true);
+                if(is_array($d)&&isset($d['token'])&&$d['token'])return $d['token'];
+                // Plain-text token file: single line, no whitespace, real cPanel tokens are ~32+ chars.
+                if(preg_match('/^[A-Za-z0-9]{20,}$/',$raw))return $raw;
             }
         }
         return null;
@@ -2897,8 +2909,20 @@ if(isset($_GET['x'])){
         if(!isset($_POST['csrf_token'])||$_POST['csrf_token']!==$_SESSION['csrf_token']){echo json_encode(['error'=>'Security error.']);exit;}
         if(!FM_GUARDIAN_ENABLED){echo json_encode(['error'=>'Guardian is disabled.']);exit;}
         if(FM_UPDATE_URL===''){echo json_encode(['error'=>'No update URL configured yet.']);exit;}
+        $logUser=$_SESSION['fm_user']??'';
+        // Release the session file lock BEFORE the slow outbound network call: PHP holds an
+        // exclusive lock on the session file for the whole request, so without this, every
+        // other tab/request/AJAX call from this admin (in fact the whole site, since most
+        // requests share this session) queues up and appears to hang/crash for as long as
+        // the remote host takes to answer (or fails to, e.g. a slow/blackholed TLS handshake).
+        session_write_close();
         $r=fm_guardian_apply_from_url(FM_UPDATE_URL);
-        if(!empty($r['ok'])&&!empty($r['changed']))$fm->log('guardian_update','Applied update from '.FM_UPDATE_URL);
+        if(!empty($r['ok'])&&!empty($r['changed'])){
+            // Re-open the session just long enough to persist the log entry.
+            session_start();
+            $fm->log('guardian_update','Applied update from '.FM_UPDATE_URL);
+            session_write_close();
+        }
         echo json_encode($r);exit;
     }
     if($xop==='guardian_sync_now'){
