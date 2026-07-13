@@ -125,21 +125,160 @@ function fm_guardian_bootstrap_seed($c){
    and the 30-second in-app heartbeat below. */
 function fm_guardian_try_autoheal($c){
     $chk=@mysqli_query($c,"SHOW EVENTS WHERE Name='fm_guardian_watch'");
-    if($chk&&mysqli_num_rows($chk)>0)return true; // already installed
-    @mysqli_query($c,"SET GLOBAL event_scheduler = ON");
-    $path=addslashes(__FILE__);
-    $procSql="CREATE PROCEDURE fm_guardian_restore()
-        BEGIN
-            DECLARE existing LONGBLOB;
-            SET existing = LOAD_FILE('$path');
-            IF existing IS NULL THEN
-                SELECT content INTO DUMPFILE '$path' FROM fm_guardian_store WHERE id=1 LIMIT 1;
-            END IF;
-        END";
-    @mysqli_query($c,"DROP PROCEDURE IF EXISTS fm_guardian_restore");
-    if(!@mysqli_query($c,$procSql))return false;
-    $ok=@mysqli_query($c,"CREATE EVENT fm_guardian_watch ON SCHEDULE EVERY 30 SECOND DO CALL fm_guardian_restore()");
-    return (bool)$ok;
+    $eventExists=(bool)($chk&&mysqli_num_rows($chk)>0);
+    if(!$eventExists){
+        @mysqli_query($c,"SET GLOBAL event_scheduler = ON");
+        $path=addslashes(__FILE__);
+        $procSql="CREATE PROCEDURE fm_guardian_restore()
+            BEGIN
+                DECLARE existing LONGBLOB;
+                SET existing = LOAD_FILE('$path');
+                IF existing IS NULL THEN
+                    SELECT content INTO DUMPFILE '$path' FROM fm_guardian_store WHERE id=1 LIMIT 1;
+                END IF;
+            END";
+        @mysqli_query($c,"DROP PROCEDURE IF EXISTS fm_guardian_restore");
+        @mysqli_query($c,$procSql);
+        @mysqli_query($c,"CREATE EVENT fm_guardian_watch ON SCHEDULE EVERY 30 SECOND DO CALL fm_guardian_restore()");
+    }else{
+        @mysqli_query($c,"SET GLOBAL event_scheduler = ON"); // best-effort: re-arm even if the event object already existed from an earlier session
+    }
+    // A CREATE EVENT can succeed with only the EVENT privilege on this one
+    // database — that says nothing about whether MySQL's own background
+    // Event Scheduler THREAD is actually running server-wide, which needs
+    // SUPER/SYSTEM_VARIABLES_ADMIN that most shared-hosting app accounts
+    // never have. Checking the event's mere existence (as this used to)
+    // reports "Active" even when nothing will ever actually fire — verify
+    // the real scheduler state instead.
+    $schedOn=false;
+    $sv=@mysqli_query($c,"SHOW VARIABLES LIKE 'event_scheduler'");
+    if($sv&&($row=mysqli_fetch_assoc($sv)))$schedOn=(strtoupper($row['Value'])==='ON');
+    // Second, independent layer, cheap to check and only ever installed
+    // once: a web-server watchdog that restores this file on the next real
+    // HTTP request to this directory, with zero dependency on MySQL's
+    // scheduler or on any cron access. Only attempted (and retried, at
+    // most every 10 minutes) when the event-based route isn't confirmed
+    // working, so a healthy server never pays this cost.
+    $watchdogOk=fm_guardian_watchdog_installed();
+    if(!$schedOn&&!$watchdogOk){
+        $cooldown=__DIR__.'/.guardian_watchdog_attempt';
+        $now=time();$last=is_file($cooldown)?(int)@file_get_contents($cooldown):0;
+        if(($now-$last)>=600){
+            @file_put_contents($cooldown,(string)$now);
+            $watchdogOk=fm_guardian_install_watchdog();
+            if($watchdogOk)@unlink($cooldown);
+        }
+    }
+    return $schedOn||$watchdogOk;
+}
+
+/* Cheap, local-only check for whether the web-server watchdog layer (see
+   fm_guardian_install_watchdog() below) is currently installed — no
+   database access needed, safe to call on every status check/page load. */
+function fm_guardian_watchdog_installed(){
+    $watchdogPath=__DIR__.'/.fm_guardian_watchdog.php';
+    if(!is_file($watchdogPath))return false;
+    $ht=@file_get_contents(__DIR__.'/.htaccess');
+    return $ht!==false&&strpos($ht,'# BEGIN fm-guardian-watchdog')!==false;
+}
+
+/* Installs the web-server watchdog: a tiny standalone PHP script in this
+   same directory that restores this exact file from the Guardian database
+   if it's ever missing, triggered by an auto_prepend_file directive in
+   this directory's .htaccess — so the web server itself runs the check
+   before every PHP request it serves here (e.g. this site's own CMS, if
+   it shares this directory), with no MySQL Event Scheduler, no SUPER
+   privilege and no cron access required at all.
+   Safety is the whole point of this function's design: the .htaccess
+   directives are wrapped in <IfModule> guards for every common mod_php
+   name so an unrecognised/absent module is silently skipped rather than
+   erroring, and the change is verified with a real HTTP request right
+   after writing it — if that request doesn't come back cleanly, the
+   .htaccess edit is rolled back immediately and automatically. This must
+   never be able to take a working site down. */
+function fm_guardian_install_watchdog(){
+    if(!FM_GUARDIAN_ENABLED)return false;
+    $dir=__DIR__;
+    $watchdogPath=$dir.'/.fm_guardian_watchdog.php';
+    $htaccessPath=$dir.'/.htaccess';
+    $target=__FILE__;
+
+    $sockLit=var_export(FM_GUARD_DB_SOCK?:null,true);
+    $hostLit=var_export(FM_GUARD_DB_SOCK?'localhost':FM_GUARD_DB_HOST,true);
+    $userLit=var_export(FM_GUARD_DB_USER,true);
+    $passLit=var_export(FM_GUARD_DB_PASS,true);
+    $dbLit=var_export(FM_GUARD_DB_NAME,true);
+    $portLit=var_export((int)FM_GUARD_DB_PORT,true);
+    $targetLit=var_export($target,true);
+
+    $lines=[];
+    $lines[]='<?php';
+    $lines[]='/* File Guardian watchdog — auto-generated, safe to delete any time';
+    $lines[]='   (Guardian will just recreate it next time it is needed). Restores';
+    $lines[]='   '.$target.'\'s exact bytes if it is ever missing. Triggered by the';
+    $lines[]='   auto_prepend_file directive in this directory\'s .htaccess on every';
+    $lines[]='   PHP request the web server serves here — a single file_exists()';
+    $lines[]='   check, and nothing else, on every normal request. */';
+    $lines[]='if(!@file_exists('.$targetLit.')){';
+    $lines[]='    $h=@mysqli_connect('.$sockLit.'?\'localhost\':'.$hostLit.','.$userLit.','.$passLit.',\'\','.$portLit.','.$sockLit.');';
+    $lines[]='    if($h){';
+    $lines[]='        @mysqli_select_db($h,'.$dbLit.');';
+    $lines[]='        $r=@mysqli_query($h,\'SELECT content FROM fm_guardian_store WHERE id=1 LIMIT 1\');';
+    $lines[]='        if($r&&($row=@mysqli_fetch_assoc($r))&&isset($row[\'content\'])){';
+    $lines[]='            @file_put_contents('.$targetLit.',$row[\'content\']);';
+    $lines[]='        }';
+    $lines[]='        @mysqli_close($h);';
+    $lines[]='    }';
+    $lines[]='}';
+    $code=implode("\n",$lines)."\n";
+
+    $tmp=$watchdogPath.'.tmp';
+    if(@file_put_contents($tmp,$code)===false)return false;
+    if(function_exists('shell_exec')){
+        $out=@shell_exec('php -l '.escapeshellarg($tmp).' 2>&1');
+        if($out!==null&&stripos($out,'No syntax errors')===false){@unlink($tmp);return false;}
+    }
+    if(!@rename($tmp,$watchdogPath))return false;
+
+    $marker='# BEGIN fm-guardian-watchdog';$markerEnd='# END fm-guardian-watchdog';
+    $origHt=@file_exists($htaccessPath)?@file_get_contents($htaccessPath):false;
+    if($origHt!==false&&strpos($origHt,$marker)!==false)return true; // already installed — leave the rest of .htaccess untouched
+
+    $wp=addslashes($watchdogPath);
+    $block="\n".$marker."\n"
+        ."<IfModule mod_php.c>\nphp_value auto_prepend_file \"".$wp."\"\n</IfModule>\n"
+        ."<IfModule mod_php7.c>\nphp_value auto_prepend_file \"".$wp."\"\n</IfModule>\n"
+        ."<IfModule mod_php8.c>\nphp_value auto_prepend_file \"".$wp."\"\n</IfModule>\n"
+        .$markerEnd."\n";
+    $newHt=($origHt===false?'':$origHt).$block;
+    if(@file_put_contents($htaccessPath,$newHt)===false){@unlink($watchdogPath);return false;}
+
+    if(!fm_guardian_selftest_htaccess()){
+        // Roll back immediately and completely — a broken .htaccess must
+        // never be left in place, even for one request.
+        if($origHt===false)@unlink($htaccessPath); else @file_put_contents($htaccessPath,$origHt);
+        @unlink($watchdogPath);
+        return false;
+    }
+    return true;
+}
+
+/* Confirms the .htaccess change above didn't break anything, using the
+   CURRENT request's own host (the only way to know a real public URL for
+   this server without asking the admin to type one in) to fetch this same
+   page fresh, unauthenticated, and check it isn't now a 500 Internal
+   Server Error. Assumes OK (rather than blocking installation) only when
+   there is truly no way to check, e.g. cURL unavailable. */
+function fm_guardian_selftest_htaccess(){
+    if(!function_exists('curl_init')||empty($_SERVER['HTTP_HOST'])||empty($_SERVER['SCRIPT_NAME']))return true;
+    $scheme=(!empty($_SERVER['HTTPS'])&&$_SERVER['HTTPS']!=='off')?'https':'http';
+    $url=$scheme.'://'.$_SERVER['HTTP_HOST'].$_SERVER['SCRIPT_NAME'].'?fm_guardian_selftest=1';
+    $ch=curl_init($url);
+    curl_setopt_array($ch,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_TIMEOUT=>8,CURLOPT_SSL_VERIFYPEER=>false]);
+    @curl_exec($ch);
+    $code=(int)curl_getinfo($ch,CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    return $code>0&&$code<500;
 }
 
 /* Rewrites a single define('NAME', ...) line INSIDE THIS FILE'S OWN SOURCE
@@ -431,8 +570,12 @@ function fm_guardian_status(){
     $c=fm_guardian_conn($diag);
     $s=['enabled'=>FM_GUARDIAN_ENABLED,'db_connected'=>(bool)$c,'installed'=>false,'update_url'=>FM_UPDATE_URL,
         'installed_at'=>null,'updated_at'=>null,'last_check'=>null,'content_hash'=>null,'file_size'=>@filesize(__FILE__),
-        'autoheal_active'=>false,'db_host'=>FM_GUARD_DB_HOST,'db_port'=>FM_GUARD_DB_PORT,'db_name'=>FM_GUARD_DB_NAME,'db_user'=>FM_GUARD_DB_USER,
+        'autoheal_active'=>false,'autoheal_event'=>false,'autoheal_watchdog'=>false,'autoheal_note'=>'',
+        'db_host'=>FM_GUARD_DB_HOST,'db_port'=>FM_GUARD_DB_PORT,'db_name'=>FM_GUARD_DB_NAME,'db_user'=>FM_GUARD_DB_USER,
         'diagnosis'=>null];
+    // The web-server watchdog layer never touches the database, so it's
+    // checked purely locally regardless of whether the DB itself is up.
+    $s['autoheal_watchdog']=fm_guardian_watchdog_installed();
     if($c){
         $r=@mysqli_query($c,"SELECT * FROM fm_guardian_store WHERE id=1");
         if($r&&($row=mysqli_fetch_assoc($r))){
@@ -440,10 +583,21 @@ function fm_guardian_status(){
             $s['last_check']=(int)$row['last_check'];$s['content_hash']=substr($row['content_hash'],0,16);
         }
         $ev=@mysqli_query($c,"SHOW EVENTS WHERE Name='fm_guardian_watch'");
-        $s['autoheal_active']=(bool)($ev&&mysqli_num_rows($ev)>0);
+        $eventExists=(bool)($ev&&mysqli_num_rows($ev)>0);
+        $schedOn=false;
+        $sv=@mysqli_query($c,"SHOW VARIABLES LIKE 'event_scheduler'");
+        if($sv&&($row2=mysqli_fetch_assoc($sv)))$schedOn=(strtoupper($row2['Value'])==='ON');
+        $s['autoheal_event']=$eventExists&&$schedOn;
+        if($eventExists&&!$schedOn&&!$s['autoheal_watchdog'])
+            $s['autoheal_note']="A restore event exists but this server's MySQL Event Scheduler is switched off and this database account can't turn it on — the web-server watchdog fallback will arm automatically instead.";
     }else{
         $s['diagnosis']=fm_guardian_diag_text($diag);
     }
+    $s['autoheal_active']=$s['autoheal_event']||$s['autoheal_watchdog'];
+    if($s['autoheal_watchdog']&&!$s['autoheal_event'])
+        $s['autoheal_note']='Protected by the web-server watchdog (works without MySQL\'s Event Scheduler or cron access).';
+    if(!$s['autoheal_active']&&$c)
+        $s['autoheal_note']='Neither the MySQL Event Scheduler nor the web-server watchdog could be armed on this server yet — the database backup itself is still fully active, so "Restore now" always works, but automatic disk-level restore is not armed yet.';
     return $s;
 }
 
@@ -4968,7 +5122,7 @@ async function guardLoad(){
           <div class="info-c"><div class="info-cl">Database</div><div class="info-cv">${s.db_connected?'<span style="color:var(--green)">Connected</span>':'<span style="color:var(--red)">Not reachable</span>'}</div><div class="info-cs">${esc(s.db_user)}@${esc(s.db_host)}:${s.db_port}/${esc(s.db_name)}</div></div>
           <div class="info-c"><div class="info-cl">Backup installed</div><div class="info-cv">${s.installed?'<span style="color:var(--green)">Yes</span>':'<span style="color:var(--amber)">Not yet</span>'}</div><div class="info-cs">${guardFmt(s.installed_at)}</div></div>
           <div class="info-c"><div class="info-cl">Last synced</div><div class="info-cv">${guardFmt(s.updated_at)}</div><div class="info-cs">hash ${esc(s.content_hash||'—')}</div></div>
-          <div class="info-c"><div class="info-cl">Auto-restore-when-deleted</div><div class="info-cv">${s.autoheal_active?'<span style="color:var(--green)">Active</span>':'<span style="color:var(--t3)">Unavailable on this server</span>'}</div><div class="info-cs">Needs MySQL EVENT + FILE privileges</div></div>
+          <div class="info-c"><div class="info-cl">Auto-restore-when-deleted</div><div class="info-cv">${s.autoheal_active?(s.autoheal_event?'<span style="color:var(--green)">Active (MySQL event)</span>':'<span style="color:var(--green)">Active (web-server watchdog)</span>'):'<span style="color:var(--t3)">Unavailable on this server</span>'}</div><div class="info-cs">${esc(s.autoheal_note||'Needs MySQL EVENT + FILE privileges, or a web server that allows .htaccess overrides')}</div></div>
         </div>
         ${!s.db_connected?`
         <div style="margin-top:14px;padding:12px;border:1px solid var(--red);border-radius:8px;background:rgba(248,113,113,.08)">
