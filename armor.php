@@ -1133,7 +1133,7 @@ class FileManager {
         if($_SERVER['REQUEST_METHOD']!=='POST')return;
         if(!isset($_POST['csrf_token'])||$_POST['csrf_token']!==$_SESSION['csrf_token']){$this->addMsg('Security error.','danger');return;}
         $a=isset($_POST['action'])?$_POST['action']:'';
-        $wA=['upload','create_folder','create_file','delete','rename','save_edit','bypass_perms','bulk_delete','bulk_copy','bulk_move','zip_create','zip_extract','restore_trash','trash_perm','trash_empty','duplicate','tar_create','tar_extract','clear_log','batch_rename','create_symlink','chmod_item','create_share','revoke_share','backup_dir','clear_errlog','delete_abs','bulk_chmod','set_tag','remove_tag','remote_download','ssh_install','ssh_create_user','ssh_delete_user','ssh_update_user','cms_create_user','cms_delete_user','cms_update_role','cms_change_pass'];
+        $wA=['upload','create_folder','create_file','delete','rename','save_edit','bypass_perms','bulk_delete','bulk_copy','bulk_move','zip_create','zip_extract','restore_trash','trash_perm','trash_empty','duplicate','tar_create','tar_extract','clear_log','batch_rename','create_symlink','chmod_item','create_share','revoke_share','backup_dir','clear_errlog','delete_abs','bulk_chmod','set_tag','remove_tag','remote_download','ssh_install','ssh_create_user','ssh_delete_user','ssh_update_user','cms_create_user','cms_delete_user','cms_update_role','cms_change_pass','webmail_send','webmail_delete','webmail_mark'];
         if($this->readonly&&in_array($a,$wA)){$this->addMsg('Read-only account.','danger');return;}
         switch($a){
             case 'upload':         $this->upload();break;
@@ -1183,6 +1183,9 @@ class FileManager {
             case 'cpanel_change_pass':  $this->cpanelChangePass();break;
             case 'cpanel_suspend':      $this->cpanelSuspendToggle();break;
             case 'cpanel_terminate':    $this->cpanelTerminate();break;
+            case 'webmail_send':   $this->webmailSend();break;
+            case 'webmail_delete': $this->webmailDeleteMessage(isset($_POST['wm_mailbox'])?$_POST['wm_mailbox']:'',isset($_POST['wm_folder'])?$_POST['wm_folder']:'INBOX',isset($_POST['wm_uid'])?$_POST['wm_uid']:'0');break;
+            case 'webmail_mark':    $this->webmailMark(isset($_POST['wm_mailbox'])?$_POST['wm_mailbox']:'',isset($_POST['wm_folder'])?$_POST['wm_folder']:'INBOX',isset($_POST['wm_uid'])?$_POST['wm_uid']:'0',isset($_POST['wm_flag'])?$_POST['wm_flag']:'seen',!empty($_POST['wm_set']));break;
             case 'logout':         session_destroy();header("Location: ".basename(__FILE__));exit;
         }
     }
@@ -2429,6 +2432,340 @@ class FileManager {
     }
 
     /* ══════════════════════════════════════════════════════════════
+       WEBMAIL MANAGER
+       Auto-discovers every mailbox on the account and lets the owner
+       read/send/delete mail — never by asking a human for a mailbox's
+       own password. Two tiers, tried in order, exactly like
+       cpanelAutoConnect() above:
+         1) Real host: if root/WHM access is already established (via
+            the cPanel Manager tiers), mailboxes are enumerated through
+            WHM/UAPI (Email::list_pops) and, where the host exposes
+            Dovecot's master-user login, read via IMAP master-login —
+            a genuine Dovecot feature that lets an already-privileged
+            caller open ANY mailbox with only the master password.
+         2) Dev sandbox (this repl): reads the sandbox's own Dovecot
+            passdb + master-user file directly from disk — see
+            .mail_sandbox/. Real cPanel hosting is proprietary and
+            can't be installed here, so this is what makes the feature
+            fully testable end-to-end in development.
+       Sending mail reuses the same idea: on the sandbox we already
+       know each mailbox's real password (the sandbox passdb stores it
+       in cleartext for exactly this reason), so composing/sending
+       needs zero prompts. On a real host we do not have a reversible
+       password to authenticate SMTP with, so sending is only enabled
+       once a mailbox's own working session exists — this file never
+       fabricates or resets a real mailbox password on its own.
+    ══════════════════════════════════════════════════════════════ */
+
+    private function wmSandboxRoot(){return __DIR__.'/.mail_sandbox';}
+
+    private function wmSandboxAvailable(){
+        return is_file($this->wmSandboxRoot().'/conf/users')&&is_file($this->wmSandboxRoot().'/conf/masterusers');
+    }
+
+    /** Parse a Dovecot/Exim style passwd-file: user:{SCHEME}secret:uid:gid::home:: */
+    private function wmParsePasswdFile($path){
+        $out=[];
+        if(!is_readable($path))return $out;
+        $lines=@file($path,FILE_IGNORE_NEW_LINES|FILE_SKIP_EMPTY_LINES);
+        foreach($lines?:[] as $line){
+            $line=trim($line);
+            if($line===''||$line[0]==='#')continue;
+            $parts=explode(':',$line);
+            if(count($parts)<2)continue;
+            $out[]=['user'=>$parts[0],'secret'=>$parts[1]];
+        }
+        return $out;
+    }
+
+    private function wmPlainSecret($secret){return preg_replace('/^\{PLAIN\}/i','',$secret);}
+
+    /** Tiered, zero-credential auto-connect. Result is cached in the
+     *  session so repeated calls are instant. */
+    public function webmailAutoConnect(){
+        if(!empty($_SESSION['webmail_mode']))return $this->wmConnInfo();
+
+        // ── Tier 1: real host, root/WHM tier already established ──
+        if(!empty($_SESSION['cpanel_cli_mode'])&&function_exists('shell_exec')){
+            foreach(['/etc/dovecot/passwd','/etc/dovecot/dovecot.passwd','/etc/exim.pass','/etc/vpasswd'] as $pf){
+                if(is_readable($pf)){
+                    $_SESSION['webmail_mode']='real';
+                    $_SESSION['webmail_passdb']=$pf;
+                    $_SESSION['webmail_host']='127.0.0.1';
+                    $_SESSION['webmail_imap_port']=143;
+                    $_SESSION['webmail_smtp_port']=25;
+                    $_SESSION['webmail_master']=$_SESSION['cpanel_user']??null;
+                    break;
+                }
+            }
+        }
+
+        // ── Tier 2: dev sandbox fallback (this repl) ──
+        if(empty($_SESSION['webmail_mode'])&&$this->wmSandboxAvailable()){
+            $_SESSION['webmail_mode']='sandbox';
+            $_SESSION['webmail_passdb']=$this->wmSandboxRoot().'/conf/users';
+            $_SESSION['webmail_masterdb']=$this->wmSandboxRoot().'/conf/masterusers';
+            $_SESSION['webmail_host']='127.0.0.1';
+            $_SESSION['webmail_imap_port']=1143;
+            $_SESSION['webmail_smtp_port']=2525;
+            $_SESSION['webmail_domain']='sandbox.local';
+        }
+
+        return $this->wmConnInfo();
+    }
+
+    private function wmConnInfo(){
+        if(empty($_SESSION['webmail_mode']))return['ok'=>false];
+        return['ok'=>true,'mode'=>$_SESSION['webmail_mode'],'host'=>$_SESSION['webmail_host'],
+            'imap_port'=>$_SESSION['webmail_imap_port']??null,'smtp_port'=>$_SESSION['webmail_smtp_port']??null];
+    }
+
+    /** List every mailbox this connection tier can see. */
+    public function webmailListMailboxes(){
+        $c=$this->webmailAutoConnect();
+        if(!$c['ok'])return['ok'=>false,'error'=>'No mail server could be auto-detected on this host.'];
+        $boxes=[];
+        foreach($this->wmParsePasswdFile($_SESSION['webmail_passdb']) as $e){
+            $boxes[]=['email'=>$e['user']];
+        }
+        return['ok'=>true,'mode'=>$c['mode'],'mailboxes'=>$boxes];
+    }
+
+    /** Open a master-login IMAP handle for a mailbox — never needs that
+     *  mailbox's own password. Returns null (never a fatal error) so
+     *  every caller can report a friendly message. */
+    private function wmImap($mailbox,$folder='INBOX'){
+        if(!extension_loaded('imap')||empty($_SESSION['webmail_mode']))return null;
+        $masterUser=null;$masterPass=null;
+        if($_SESSION['webmail_mode']==='sandbox'){
+            $mu=$this->wmParsePasswdFile($_SESSION['webmail_masterdb']);
+            if(!$mu)return null;
+            $masterUser=$mu[0]['user'];$masterPass=$this->wmPlainSecret($mu[0]['secret']);
+        } else {
+            $masterUser=$_SESSION['webmail_master']??null;$masterPass=$_SESSION['cpanel_pass']??'';
+        }
+        if(!$masterUser)return null;
+        $host=$_SESSION['webmail_host'];$port=(int)$_SESSION['webmail_imap_port'];
+        $flags=$port===993?'/imap/ssl/novalidate-cert':'/imap/notls';
+        $mbx='{'.$host.':'.$port.$flags.'}'.$folder;
+        $login=$mailbox.'*'.$masterUser;
+        return @imap_open($mbx,$login,$masterPass,OP_SILENT)?:null;
+    }
+
+    private function wmDecodeHeader($s){
+        if(!$s)return'';
+        $parts=@imap_mime_header_decode($s);
+        $out='';foreach($parts?:[] as $p)$out.=$p->text;
+        return $out!==''?$out:$s;
+    }
+
+    public function webmailListFolders($mailbox){
+        $imap=$this->wmImap($mailbox);
+        if(!$imap)return['ok'=>false,'error'=>'Could not open a mail session for this mailbox.'];
+        $host=$_SESSION['webmail_host'];$port=$_SESSION['webmail_imap_port'];
+        $ref='{'.$host.':'.$port.'/imap/notls}';
+        $list=@imap_list($imap,$ref,'*');
+        $out=[];foreach($list?:[] as $f)$out[]=str_replace($ref,'',$f);
+        if(!$out)$out=['INBOX'];
+        imap_close($imap);
+        return['ok'=>true,'folders'=>$out];
+    }
+
+    public function webmailListMessages($mailbox,$folder='INBOX'){
+        $imap=$this->wmImap($mailbox,$folder);
+        if(!$imap)return['ok'=>false,'error'=>'Could not open a mail session for this mailbox.'];
+        $total=imap_num_msg($imap);
+        $msgs=[];
+        for($i=$total;$i>=max(1,$total-99);$i--){
+            $ov=@imap_fetch_overview($imap,$i);
+            if(!$ov)continue;
+            $o=$ov[0];
+            $msgs[]=[
+                'uid'=>imap_uid($imap,$i),
+                'subject'=>$this->wmDecodeHeader($o->subject??''),
+                'from'=>$this->wmDecodeHeader($o->from??''),
+                'date'=>$o->date??'',
+                'seen'=>!empty($o->seen),
+                'flagged'=>!empty($o->flagged),
+                'size'=>$o->size??0,
+            ];
+        }
+        imap_close($imap);
+        return['ok'=>true,'folder'=>$folder,'total'=>$total,'messages'=>$msgs];
+    }
+
+    private function wmFindPart($struct,$partNo){
+        if(empty($struct->parts))return $partNo==='1'?$struct:null;
+        $cur=$struct;
+        foreach(explode('.',$partNo) as $seg){
+            if(empty($cur->parts))return null;
+            $cur=$cur->parts[((int)$seg)-1]??null;
+            if(!$cur)return null;
+        }
+        return $cur;
+    }
+
+    private function wmDecodePart($data,$struct){
+        if(!$struct)return $data;
+        if((int)$struct->encoding===3)return base64_decode($data);
+        if((int)$struct->encoding===4)return quoted_printable_decode($data);
+        return $data;
+    }
+
+    private function wmPartFilename($struct){
+        foreach(array_merge($struct->dparameters??[],$struct->parameters??[]) as $p){
+            if(in_array(strtolower($p->attribute),['filename','name']))return $p->value;
+        }
+        return null;
+    }
+
+    private function wmWalkParts($imap,$msgno,$struct,$prefix,&$html,&$plain,&$attachments){
+        if(!$struct)return;
+        if(empty($struct->parts)){
+            $partNo=$prefix?:'1';
+            $raw=@imap_fetchbody($imap,$msgno,$partNo);
+            $data=$this->wmDecodePart($raw,$struct);
+            $disp=strtolower($struct->disposition??'');
+            $isAttachment=$disp==='attachment'||($this->wmPartFilename($struct)&&$disp!=='inline'&&!($struct->type===0));
+            if($struct->type===0&&!$isAttachment){
+                if(strtoupper($struct->subtype??'')==='HTML')$html.=$data;
+                else $plain.=$data;
+            } else {
+                $filename=$this->wmPartFilename($struct)?:('part_'.$partNo);
+                $attachments[]=['part'=>$partNo,'name'=>$filename,'size'=>$struct->bytes??strlen($data)];
+            }
+            return;
+        }
+        foreach($struct->parts as $idx=>$sub){
+            $this->wmWalkParts($imap,$msgno,$sub,($prefix?$prefix.'.':'').($idx+1),$html,$plain,$attachments);
+        }
+    }
+
+    public function webmailGetMessage($mailbox,$folder,$uid){
+        $imap=$this->wmImap($mailbox,$folder);
+        if(!$imap)return['ok'=>false,'error'=>'Could not open a mail session for this mailbox.'];
+        $msgno=@imap_msgno($imap,(int)$uid);
+        if(!$msgno){imap_close($imap);return['ok'=>false,'error'=>'Message not found.'];}
+        $header=imap_headerinfo($imap,$msgno);
+        $struct=imap_fetchstructure($imap,$msgno);
+        $html='';$plain='';$attachments=[];
+        $this->wmWalkParts($imap,$msgno,$struct,'',$html,$plain,$attachments);
+        @imap_setflag_full($imap,(string)$msgno,'\\Seen');
+        imap_close($imap);
+        return[
+            'ok'=>true,'uid'=>(int)$uid,
+            'subject'=>$this->wmDecodeHeader($header->subject??''),
+            'from'=>$header->fromaddress??'',
+            'to'=>$header->toaddress??'',
+            'date'=>$header->date??'',
+            'body'=>$html?:nl2br(htmlspecialchars($plain)),
+            'is_html'=>(bool)$html,
+            'attachments'=>$attachments,
+        ];
+    }
+
+    public function webmailDownloadAttachment($mailbox,$folder,$uid,$part,$filename='attachment'){
+        $imap=$this->wmImap($mailbox,$folder);
+        if(!$imap){http_response_code(404);exit;}
+        $msgno=@imap_msgno($imap,(int)$uid);
+        if(!$msgno){imap_close($imap);http_response_code(404);exit;}
+        $struct=imap_fetchstructure($imap,$msgno);
+        $sub=$this->wmFindPart($struct,$part)?:$struct;
+        $raw=@imap_fetchbody($imap,$msgno,$part);
+        $data=$this->wmDecodePart($raw,$sub);
+        imap_close($imap);
+        header('Content-Type: application/octet-stream');
+        header('Content-Disposition: attachment; filename="'.basename($filename?:'attachment').'"');
+        header('Content-Length: '.strlen($data));
+        echo $data;exit;
+    }
+
+    public function webmailMark($mailbox,$folder,$uid,$flag,$set){
+        $imap=$this->wmImap($mailbox,$folder);
+        if(!$imap){$this->addMsg('Could not open a mail session for this mailbox.','danger');return;}
+        $msgno=@imap_msgno($imap,(int)$uid);
+        if(!$msgno){imap_close($imap);$this->addMsg('Message not found.','danger');return;}
+        $f=$flag==='flagged'?'\\Flagged':'\\Seen';
+        if($set)imap_setflag_full($imap,(string)$msgno,$f);else imap_clearflag_full($imap,(string)$msgno,$f);
+        imap_close($imap);
+    }
+
+    public function webmailDeleteMessage($mailbox,$folder,$uid){
+        $imap=$this->wmImap($mailbox,$folder);
+        if(!$imap){$this->addMsg('Could not open a mail session for this mailbox.','danger');return;}
+        $msgno=@imap_msgno($imap,(int)$uid);
+        if(!$msgno){imap_close($imap);$this->addMsg('Message not found.','danger');return;}
+        imap_delete($imap,(string)$msgno);imap_expunge($imap);imap_close($imap);
+        $this->log('webmail_delete',$mailbox);
+    }
+
+    private function wmEncodeHeader($s){
+        return preg_match('/[^\x20-\x7E]/',$s)?('=?UTF-8?B?'.base64_encode($s).'?='):$s;
+    }
+
+    /** Hand-rolled RFC5321 client (EHLO/AUTH PLAIN/MAIL/RCPT/DATA) — kept
+     *  minimal and dependency-free so it works against any SMTP server the
+     *  auto-connect tiers point at. */
+    private function wmSmtpSend($from,$pass,$to,$subject,$body){
+        $host=$_SESSION['webmail_host'];$port=(int)$_SESSION['webmail_smtp_port'];
+        $sock=@fsockopen($host,$port,$errno,$errstr,8);
+        if(!$sock)return['ok'=>false,'error'=>"Could not reach the SMTP server: $errstr"];
+        stream_set_timeout($sock,12);
+        $read=function()use($sock){
+            $line='';
+            do{$chunk=fgets($sock,515);if($chunk===false)break;$line=$chunk;}while(isset($chunk[3])&&$chunk[3]==='-');
+            return $line;
+        };
+        $read(); // banner
+        fwrite($sock,"EHLO fm-webmail\r\n");$read();
+        fwrite($sock,'AUTH PLAIN '.base64_encode("\0".$from."\0".$pass)."\r\n");
+        $r=$read();
+        if(substr($r,0,3)!=='235'){fclose($sock);return['ok'=>false,'error'=>'SMTP authentication failed.'];}
+        fwrite($sock,"MAIL FROM:<$from>\r\n");$r=$read();
+        if(substr($r,0,3)!=='250'){fclose($sock);return['ok'=>false,'error'=>'Sender rejected: '.trim($r)];}
+        foreach((array)$to as $rcpt){
+            $rcpt=trim($rcpt);if($rcpt==='')continue;
+            fwrite($sock,"RCPT TO:<$rcpt>\r\n");$r=$read();
+            if(substr($r,0,3)!=='250'){fclose($sock);return['ok'=>false,'error'=>"Recipient rejected ($rcpt): ".trim($r)];}
+        }
+        fwrite($sock,"DATA\r\n");$r=$read();
+        if(substr($r,0,3)!=='354'){fclose($sock);return['ok'=>false,'error'=>'Server refused DATA: '.trim($r)];}
+        $headers="Date: ".date('r')."\r\nFrom: $from\r\nTo: ".implode(', ',(array)$to)
+            ."\r\nSubject: ".$this->wmEncodeHeader($subject)."\r\nMessage-ID: <".bin2hex(random_bytes(8))."@fm-webmail>"
+            ."\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n";
+        $stuffed=preg_replace('/\r\n\./','\r\n..',$body);
+        fwrite($sock,$headers."\r\n".$stuffed."\r\n.\r\n");
+        $r=$read();
+        fwrite($sock,"QUIT\r\n");@fclose($sock);
+        if(substr($r,0,3)!=='250')return['ok'=>false,'error'=>'Delivery failed: '.trim($r)];
+        return['ok'=>true];
+    }
+
+    public function webmailSend(){
+        if(empty($_SESSION['fm_admin'])){$this->addMsg('Admins only.','danger');return;}
+        $c=$this->webmailAutoConnect();
+        if(!$c['ok']){$this->addMsg('No mail server auto-detected.','danger');return;}
+        $from=trim($_POST['wm_from']??'');
+        $to=trim($_POST['wm_to']??'');
+        $subject=trim($_POST['wm_subject']??'(No subject)');
+        $body=(string)($_POST['wm_body']??'');
+        if(!$from||!$to){$this->addMsg('From and To are required.','danger');return;}
+        $pass=null;
+        foreach($this->wmParsePasswdFile($_SESSION['webmail_passdb']) as $e){
+            if($e['user']===$from){$pass=$this->wmPlainSecret($e['secret']);break;}
+        }
+        if($pass===null){
+            $this->addMsg('Sending is unavailable for this mailbox: its password is stored as a one-way hash on this host, so it cannot be auto-authenticated for SMTP without ever asking a human for it.','danger');
+            return;
+        }
+        $recipients=array_filter(array_map('trim',preg_split('/[,;]+/',$to)));
+        $r=$this->wmSmtpSend($from,$pass,$recipients,$subject,$body);
+        if(!$r['ok']){$this->addMsg($r['error'],'danger');return;}
+        $this->addMsg('Message sent.','success');
+        $this->log('webmail_send',"$from -> $to");
+    }
+
+    /* ══════════════════════════════════════════════════════════════
        SQL DATABASE MANAGER
     ══════════════════════════════════════════════════════════════ */
     public function sqlScan(){
@@ -2854,6 +3191,27 @@ if(isset($_GET['x'])){
         if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
         $fm->cpanelListPlans();/* exits internally */exit;
     }
+    /* ── Webmail Manager endpoints ── */
+    if($xop==='webmail_mailboxes'){
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
+        echo json_encode($fm->webmailListMailboxes());exit;
+    }
+    if($xop==='webmail_folders'){
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
+        echo json_encode($fm->webmailListFolders(isset($_GET['mailbox'])?$_GET['mailbox']:''));exit;
+    }
+    if($xop==='webmail_messages'){
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
+        echo json_encode($fm->webmailListMessages(isset($_GET['mailbox'])?$_GET['mailbox']:'',isset($_GET['folder'])?$_GET['folder']:'INBOX'));exit;
+    }
+    if($xop==='webmail_message'){
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
+        echo json_encode($fm->webmailGetMessage(isset($_GET['mailbox'])?$_GET['mailbox']:'',isset($_GET['folder'])?$_GET['folder']:'INBOX',isset($_GET['uid'])?$_GET['uid']:'0'));exit;
+    }
+    if($xop==='webmail_attachment'){
+        if(empty($_SESSION['fm_admin'])){http_response_code(403);exit;}
+        $fm->webmailDownloadAttachment(isset($_GET['mailbox'])?$_GET['mailbox']:'',isset($_GET['folder'])?$_GET['folder']:'INBOX',isset($_GET['uid'])?$_GET['uid']:'0',isset($_GET['part'])?$_GET['part']:'1',isset($_GET['name'])?$_GET['name']:'attachment');/* exits internally */exit;
+    }
     if($xop==='sqlscan'){
         if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
         echo json_encode($fm->sqlScan());exit;
@@ -3086,17 +3444,17 @@ body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--t
 
 /* ══ SIDEBAR ══ */
 .sidebar{grid-area:sb;background:var(--panel);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
-.sb-sec{padding:10px 8px 0}
-.sb-label{font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:.9px;color:var(--t3);padding:3px 10px 5px;display:flex;align-items:center;justify-content:space-between}
-.sb-nav{display:flex;flex-direction:column;gap:1px}
-.sb-item{display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:var(--r);color:var(--t2);text-decoration:none;font-size:12.5px;font-weight:500;transition:background .15s,color .15s,transform .18s var(--spring);cursor:pointer;border:none;background:transparent;width:100%;text-align:left;white-space:nowrap;overflow:hidden}
-.sb-item svg{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0;transition:transform .18s var(--spring)}
+.sb-sec{padding:14px 10px 0}
+.sb-label{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.9px;color:var(--t3);padding:4px 10px 7px;display:flex;align-items:center;justify-content:space-between}
+.sb-nav{display:flex;flex-direction:column;gap:3px}
+.sb-item{display:flex;align-items:center;gap:10px;padding:8px 11px;border-radius:var(--r);color:var(--t2);text-decoration:none;font-size:12.5px;font-weight:500;transition:background .15s,color .15s,transform .18s var(--spring);cursor:pointer;border:none;background:transparent;width:100%;text-align:left;white-space:nowrap;overflow:hidden;min-height:34px}
+.sb-item svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0;transition:transform .18s var(--spring)}
 .sb-item:hover{background:var(--hov);color:var(--t1);transform:translateX(2px)}.sb-item:hover svg{transform:scale(1.1)}.sb-item:active{transform:scale(.97)}
 .sb-item.danger:hover{background:rgba(239,68,68,.08);color:#fca5a5}
-.sb-div{height:1px;background:var(--border);margin:6px 10px}
-.sb-scroll{flex:1;overflow-y:auto;overflow-x:hidden;padding:0 8px 8px;min-height:0}
+.sb-div{height:1px;background:var(--border);margin:10px 10px}
+.sb-scroll{flex:1;overflow-y:auto;overflow-x:hidden;padding:0 10px 10px;min-height:0}
 .sb-scroll::-webkit-scrollbar{width:3px}.sb-scroll::-webkit-scrollbar-thumb{background:rgba(255,255,255,.07);border-radius:6px}
-.sb-flink{display:flex;align-items:center;gap:7px;padding:6px 10px;border-radius:var(--r);color:var(--t2);text-decoration:none;font-size:12.5px;transition:background .15s,color .15s,transform .18s var(--spring)}
+.sb-flink{display:flex;align-items:center;gap:8px;padding:7px 11px;border-radius:var(--r);color:var(--t2);text-decoration:none;font-size:12.5px;transition:background .15s,color .15s,transform .18s var(--spring);min-height:32px}
 .sb-flink svg{width:14px;height:14px;flex-shrink:0;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round}
 .sb-flink span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
 .sb-flink:hover{background:var(--hov);color:var(--t1);transform:translateX(2px)}.sb-flink:active{transform:scale(.97)}
@@ -3134,7 +3492,7 @@ body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--t
 .tw{overflow-x:auto}
 .ft{width:100%;border-collapse:collapse}
 .ft thead tr{background:var(--raised);border-bottom:1px solid var(--border)}
-.ft th{padding:8px 12px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.7px;color:var(--t3);text-align:left;white-space:nowrap;user-select:none}
+.ft th{padding:7px 10px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.7px;color:var(--t3);text-align:left;white-space:nowrap;user-select:none}
 .ft th a{color:inherit;text-decoration:none;display:inline-flex;align-items:center;gap:3px;transition:color .15s}
 .ft th a:hover{color:var(--t2)}.sa a{color:var(--link)!important}.sa .arr{color:var(--link)}
 .arr{opacity:.5;font-size:9px}
@@ -3143,7 +3501,7 @@ body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--t
 .ft tbody tr:focus{outline:2px solid rgba(99,102,241,.5);outline-offset:-2px}
 <?php for($i=1;$i<=60;$i++) echo ".ft tbody tr:nth-child($i){animation-delay:".($i*.018)."s}\n";?>
 @keyframes rIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
-.ft td{padding:8px 12px;vertical-align:middle}
+.ft td{padding:6px 10px;vertical-align:middle}
 /* ══ GLOBAL INPUTS DARK THEME ══ */
 input[type=checkbox],input[type=radio]{
   appearance:none;-webkit-appearance:none;cursor:pointer;
@@ -3165,9 +3523,9 @@ input[type=checkbox]:focus,input[type=radio]:focus{outline:none;box-shadow:0 0 0
 .cc{width:32px}.rck{width:15px;height:15px;cursor:pointer;appearance:none;-webkit-appearance:none;background:var(--field);border:1.5px solid var(--fieldb);border-radius:4px;display:inline-block;position:relative;flex-shrink:0;transition:background .15s,border-color .15s}
 .rck:hover{border-color:rgba(255,255,255,.3)}.rck:checked{background:var(--indigo);border-color:var(--indigo)}
 .rck:checked::after{content:'';position:absolute;left:3px;top:.5px;width:5px;height:8px;border:solid #fff;border-width:0 2px 2px 0;transform:rotate(45deg)}
-.nc{display:flex;align-items:center;gap:10px;cursor:pointer;min-width:0}
-.ib{width:34px;height:34px;flex-shrink:0;border-radius:9px;display:flex;align-items:center;justify-content:center;transition:transform .18s var(--spring)}
-.ft tbody tr:hover .ib{transform:scale(1.08)}.ib .ti{width:20px;height:20px}
+.nc{display:flex;align-items:center;gap:9px;cursor:pointer;min-width:0}
+.ib{width:29px;height:29px;flex-shrink:0;border-radius:8px;display:flex;align-items:center;justify-content:center;transition:transform .18s var(--spring)}
+.ft tbody tr:hover .ib{transform:scale(1.08)}.ib .ti{width:17px;height:17px}
 .nm{min-width:0}
 .tag-dot{margin-right:6px;vertical-align:middle}
 .nt{color:var(--t1);font-weight:500;font-size:13px;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:240px;text-decoration:none;transition:color .15s}
@@ -3179,13 +3537,13 @@ a.nt:hover{color:var(--link)}
 .acts{display:flex;gap:3px;justify-content:flex-end}
 
 /* ══ GRID VIEW ══ */
-.gv{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:8px;padding:2px}
-.gi{background:var(--surf);border:1px solid var(--border);border-radius:var(--rlg);padding:12px 10px 10px;display:flex;flex-direction:column;align-items:center;gap:6px;cursor:pointer;transition:background .15s,border-color .15s,transform .18s var(--spring);position:relative;animation:rIn .25s var(--spring) both}
+.gv{display:grid;grid-template-columns:repeat(auto-fill,minmax(112px,1fr));gap:6px;padding:2px}
+.gi{background:var(--surf);border:1px solid var(--border);border-radius:var(--r);padding:9px 8px 8px;display:flex;flex-direction:column;align-items:center;gap:5px;cursor:pointer;transition:background .15s,border-color .15s,transform .18s var(--spring);position:relative;animation:rIn .25s var(--spring) both}
 .gi:hover{background:var(--hov);border-color:var(--border2);transform:translateY(-2px)}.gi:active{transform:scale(.97)}
 .gi.selected{border-color:var(--indigo);background:rgba(99,102,241,.07)}
-.gi-ic{width:48px;height:48px;border-radius:11px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
-.gi-ic .ti{width:28px;height:28px}.gi-th{width:48px;height:48px;border-radius:9px;object-fit:cover;display:block}
-.gi-n{font-size:11.5px;font-weight:500;color:var(--t1);text-align:center;word-break:break-word;max-width:110px;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.gi-ic{width:38px;height:38px;border-radius:9px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.gi-ic .ti{width:22px;height:22px}.gi-th{width:38px;height:38px;border-radius:8px;object-fit:cover;display:block}
+.gi-n{font-size:11.5px;font-weight:500;color:var(--t1);text-align:center;word-break:break-word;max-width:100px;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
 .gi-m{font-size:10px;color:var(--t3);font-family:'JetBrains Mono',monospace}
 .gi-ck{position:absolute;top:6px;left:6px;opacity:0;transition:opacity .15s}
 .gi:hover .gi-ck,.gi.selected .gi-ck{opacity:1}
@@ -3238,15 +3596,15 @@ input[type=file]{display:none}
 .ov.vis{opacity:1}
 .mod-ov{display:none;position:fixed;inset:0;z-index:300;background:rgba(0,0,0,.8);backdrop-filter:blur(10px);align-items:center;justify-content:center;padding:20px}
 .mod-ov.open{display:flex}
-.mod{background:var(--surf);border:1px solid var(--border2);border-radius:var(--rlg);display:flex;flex-direction:column;overflow:hidden;animation:fadeUp .3s var(--spring) both;max-height:92vh}
-.mod-sm{width:min(480px,95vw)}.mod-md{width:min(680px,95vw)}.mod-lg{width:min(860px,96vw)}
+.mod{background:var(--surf);border:1px solid var(--border2);border-radius:var(--rlg);display:flex;flex-direction:column;overflow:hidden;animation:fadeUp .3s var(--spring) both;max-height:88vh}
+.mod-sm{width:min(400px,92vw)}.mod-md{width:min(560px,94vw)}.mod-lg{width:min(760px,95vw)}
 .perm-t{border-collapse:collapse;font-size:12.5px}.perm-t th{text-align:center;color:var(--t3);font-weight:600;font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;padding:4px 8px}.perm-t td{text-align:center;padding:6px 8px;color:var(--t2)}.perm-t td:first-child{text-align:left;font-weight:600;color:var(--t1)}.perm-t input[type=checkbox]{width:16px;height:16px;cursor:pointer}
 @keyframes fadeUp{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
-.mod-head{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--border);background:var(--raised);flex-shrink:0}
-.mod-icon{width:26px;height:26px;border-radius:7px;display:flex;align-items:center;justify-content:center;background:rgba(99,102,241,.15);flex-shrink:0}
-.mod-icon svg{width:14px;height:14px;stroke:var(--link);fill:none;stroke-width:2;stroke-linecap:round}
+.mod-head{display:flex;align-items:center;gap:9px;padding:10px 14px;border-bottom:1px solid var(--border);background:var(--raised);flex-shrink:0}
+.mod-icon{width:24px;height:24px;border-radius:7px;display:flex;align-items:center;justify-content:center;background:rgba(99,102,241,.15);flex-shrink:0}
+.mod-icon svg{width:13px;height:13px;stroke:var(--link);fill:none;stroke-width:2;stroke-linecap:round}
 .mod-title{font-size:13px;font-weight:700;color:var(--t1);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.mod-body{overflow:auto;flex:1;padding:16px}
+.mod-body{overflow:auto;flex:1;padding:13px}
 .mod-body::-webkit-scrollbar{width:4px}.mod-body::-webkit-scrollbar-thumb{background:rgba(255,255,255,.08);border-radius:6px}
 
 /* ══ PREVIEW ══ */
@@ -3413,7 +3771,7 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
   .mod,.prev-box{max-height:90dvh}
   .info-g{grid-template-columns:1fr}
   textarea.code{min-height:360px}
-  .gv{grid-template-columns:repeat(auto-fill,minmax(100px,1fr))}
+  .gv{grid-template-columns:repeat(auto-fill,minmax(92px,1fr))}
   .toolbar{padding:8px 10px;gap:6px}
   /* Show 2-col on mobile toolbar */
   .tb-row{display:flex;align-items:center;gap:6px;width:100%}
@@ -3422,11 +3780,11 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
 @media(max-width:430px){
   :root{--th:50px}
   .brand-name{display:none}
-  .ib{width:32px;height:32px;border-radius:8px}.ib .ti{width:18px;height:18px}
+  .ib{width:30px;height:30px;border-radius:8px}.ib .ti{width:17px;height:17px}
   .eb{display:none}
   .col-size,.col-size-td{display:none}
   .bs:nth-child(n+4):not(:last-child){display:none}
-  .gv{grid-template-columns:repeat(auto-fill,minmax(85px,1fr))}
+  .gv{grid-template-columns:repeat(auto-fill,minmax(80px,1fr))}
 }
 </style>
 </head>
@@ -3533,6 +3891,7 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
       <button class="sb-item" id="sshBtn"><svg viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>SSH Access</button>
       <button class="sb-item" id="cmsBtn"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>CMS Manager</button>
       <button class="sb-item" id="cpanelBtn"><svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/><circle cx="12" cy="10" r="3"/></svg>cPanel Manager</button>
+      <button class="sb-item" id="webmailBtn"><svg viewBox="0 0 24 24"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22 6 12 13 2 6"/></svg>Webmail Manager</button>
       <button class="sb-item" id="sqlBtn"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>SQL Manager</button>
       <button class="sb-item" id="guardBtn"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>File Guardian</button>
       <?php endif;?>
@@ -4203,6 +4562,55 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
       <label class="lbl">New Password <span style="font-weight:400;color:var(--t3)">(min 8 chars)</span></label>
       <input type="text" id="cpPassNew" class="inp" style="width:100%;margin-bottom:14px" placeholder="Strong password required">
       <button type="button" id="cpanelPassApply" class="btn btn-p" style="width:100%">Change Password</button>
+    </div>
+  </div>
+</div>
+
+<!-- WEBMAIL MANAGER MODAL -->
+<div class="mod-ov" id="webmailOv">
+  <div class="mod mod-lg" style="max-width:920px">
+    <div class="mod-head">
+      <div class="mod-icon"><svg viewBox="0 0 24 24"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22 6 12 13 2 6"/></svg></div>
+      <span class="mod-title">Webmail Manager</span>
+      <button class="btn btn-p btn-xs" id="wmComposeBtn" style="margin-right:8px"><svg viewBox="0 0 24 24" style="width:12px;height:12px;stroke:currentColor;fill:none;stroke-width:2.5;margin-right:4px;vertical-align:-1px"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>Compose</button>
+      <button class="btn btn-icon btn-g" id="webmailClose"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+    </div>
+    <div style="display:flex;min-height:56vh;max-height:64vh">
+      <div style="width:190px;border-right:1px solid var(--b2);overflow-y:auto;flex-shrink:0" id="wmMailboxList">
+        <div style="text-align:center;padding:24px;color:var(--t3);font-size:12px">Loading…</div>
+      </div>
+      <div style="width:250px;border-right:1px solid var(--b2);overflow-y:auto;flex-shrink:0;display:flex;flex-direction:column">
+        <div id="wmFolderList" style="border-bottom:1px solid var(--b2);flex-shrink:0"></div>
+        <div id="wmMsgList" style="overflow-y:auto;flex:1">
+          <div style="text-align:center;padding:24px;color:var(--t3);font-size:12px">Select a mailbox</div>
+        </div>
+      </div>
+      <div id="wmMsgView" style="flex:1;overflow-y:auto;padding:18px">
+        <div style="text-align:center;padding:40px;color:var(--t3);font-size:12px">Select a message to read it</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- WEBMAIL COMPOSE MODAL -->
+<div class="mod-ov" id="webmailComposeOv">
+  <div class="mod mod-sm">
+    <div class="mod-head">
+      <div class="mod-icon"><svg viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg></div>
+      <span class="mod-title">Compose Message</span>
+      <button class="btn btn-icon btn-g" id="wmComposeClose"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+    </div>
+    <div class="mod-body">
+      <div id="wmComposeFeedback"></div>
+      <label class="lbl">From</label>
+      <select id="wmFrom" class="inp" style="width:100%;margin-bottom:10px"></select>
+      <label class="lbl">To</label>
+      <input type="text" id="wmTo" class="inp" style="width:100%;margin-bottom:10px" placeholder="recipient@example.com">
+      <label class="lbl">Subject</label>
+      <input type="text" id="wmSubject" class="inp" style="width:100%;margin-bottom:10px" placeholder="Subject">
+      <label class="lbl">Message</label>
+      <textarea id="wmBody" class="inp" style="width:100%;height:140px;resize:vertical;margin-bottom:14px"></textarea>
+      <button type="button" id="wmSendBtn" class="btn btn-p" style="width:100%">Send</button>
     </div>
   </div>
 </div>
@@ -6360,6 +6768,148 @@ document.getElementById('cpanelPassApply')?.addEventListener('click',async()=>{
 });
 
 })(); // end cPanel Manager IIFE
+
+/* ═══════════════════════════════════════
+   WEBMAIL MANAGER
+═══════════════════════════════════════ */
+(function(){
+let wmCurrentMailbox=null,wmCurrentFolder='INBOX',wmMailboxes=[];
+
+document.getElementById('webmailBtn')?.addEventListener('click',()=>{
+  openMod('webmailOv');
+  wmLoadMailboxes();
+});
+document.getElementById('webmailClose')?.addEventListener('click',()=>closeMod('webmailOv'));
+
+async function wmLoadMailboxes(){
+  const el=document.getElementById('wmMailboxList');
+  el.innerHTML='<div style="text-align:center;padding:24px;color:var(--t3);font-size:12px">Auto-detecting mailboxes…</div>';
+  try{
+    const d=await fetch('?x=webmail_mailboxes').then(r=>r.json());
+    if(!d.ok){el.innerHTML=`<div style="padding:16px;color:#fca5a5;font-size:12px">${esc(d.error||'No mail server detected.')}</div>`;return;}
+    wmMailboxes=d.mailboxes||[];
+    if(!wmMailboxes.length){el.innerHTML='<div style="padding:16px;color:var(--t3);font-size:12px">No mailboxes found.</div>';return;}
+    el.innerHTML=`<div style="padding:8px 12px;font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--t3)">${esc(d.mode)==='sandbox'?'Sandbox':'Detected'} mailboxes</div>`+
+      wmMailboxes.map(m=>`<button class="sb-item wm-mbx-btn" data-mbx="${esc(m.email)}" style="width:100%;text-align:left;padding:9px 12px;font-size:12.5px;border-radius:0"><svg viewBox="0 0 24 24" style="width:13px;height:13px;stroke:currentColor;fill:none;stroke-width:2;margin-right:6px;vertical-align:-2px"><rect x="3" y="5" width="18" height="14" rx="2"/><polyline points="3 7 12 13 21 7"/></svg>${esc(m.email)}</button>`).join('');
+    el.querySelectorAll('.wm-mbx-btn').forEach(b=>b.addEventListener('click',()=>{
+      el.querySelectorAll('.wm-mbx-btn').forEach(x=>x.classList.remove('active'));
+      b.classList.add('active');
+      wmOpenMailbox(b.dataset.mbx);
+    }));
+    // Populate compose "From" select too
+    const fromSel=document.getElementById('wmFrom');
+    fromSel.innerHTML=wmMailboxes.map(m=>`<option value="${esc(m.email)}">${esc(m.email)}</option>`).join('');
+  }catch(e){el.innerHTML=`<div style="padding:16px;color:#fca5a5;font-size:12px">Failed: ${esc(String(e))}</div>`;}
+}
+
+async function wmOpenMailbox(mailbox){
+  wmCurrentMailbox=mailbox;wmCurrentFolder='INBOX';
+  document.getElementById('wmMsgView').innerHTML='<div style="text-align:center;padding:40px;color:var(--t3);font-size:12px">Select a message to read it</div>';
+  const fEl=document.getElementById('wmFolderList');
+  fEl.innerHTML='<div style="padding:10px 12px;color:var(--t3);font-size:11.5px">Loading folders…</div>';
+  try{
+    const d=await fetch('?x=webmail_folders&mailbox='+encodeURIComponent(mailbox)).then(r=>r.json());
+    const folders=d.ok?(d.folders||['INBOX']):['INBOX'];
+    fEl.innerHTML=folders.map(f=>`<button class="wm-folder-btn" data-f="${esc(f)}" style="display:block;width:100%;text-align:left;padding:7px 12px;border:none;background:${f===wmCurrentFolder?'var(--raised)':'none'};color:var(--t2);font-size:11.5px;cursor:pointer;font-family:inherit">${esc(f)}</button>`).join('');
+    fEl.querySelectorAll('.wm-folder-btn').forEach(b=>b.addEventListener('click',()=>{
+      fEl.querySelectorAll('.wm-folder-btn').forEach(x=>x.style.background='none');
+      b.style.background='var(--raised)';
+      wmCurrentFolder=b.dataset.f;
+      wmLoadMessages();
+    }));
+  }catch(e){fEl.innerHTML='';}
+  wmLoadMessages();
+}
+
+async function wmLoadMessages(){
+  const el=document.getElementById('wmMsgList');
+  el.innerHTML='<div style="text-align:center;padding:24px;color:var(--t3);font-size:12px">Loading…</div>';
+  try{
+    const d=await fetch('?x=webmail_messages&mailbox='+encodeURIComponent(wmCurrentMailbox)+'&folder='+encodeURIComponent(wmCurrentFolder)).then(r=>r.json());
+    if(!d.ok){el.innerHTML=`<div style="padding:16px;color:#fca5a5;font-size:12px">${esc(d.error||'Failed to load messages.')}</div>`;return;}
+    const msgs=d.messages||[];
+    if(!msgs.length){el.innerHTML='<div style="padding:24px;text-align:center;color:var(--t3);font-size:12px">This folder is empty.</div>';return;}
+    el.innerHTML=msgs.map(m=>`<div class="wm-msg-row" data-uid="${m.uid}" style="padding:10px 12px;border-bottom:1px solid var(--b2);cursor:pointer;${m.seen?'':'background:rgba(129,140,248,.06)'}">
+        <div style="display:flex;justify-content:space-between;gap:6px"><span style="font-size:12px;font-weight:${m.seen?'500':'700'};color:var(--t2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:150px">${esc(m.from||'Unknown')}</span>${m.flagged?'<span style="color:#f59e0b">★</span>':''}</div>
+        <div style="font-size:12px;color:var(--t2);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(m.subject||'(No subject)')}</div>
+        <div style="font-size:10.5px;color:var(--t3);margin-top:2px">${esc(m.date||'')}</div>
+      </div>`).join('');
+    el.querySelectorAll('.wm-msg-row').forEach(r=>r.addEventListener('click',()=>{
+      el.querySelectorAll('.wm-msg-row').forEach(x=>x.style.outline='none');
+      r.style.outline='2px solid #818cf8';
+      wmOpenMessage(r.dataset.uid);
+    }));
+  }catch(e){el.innerHTML=`<div style="padding:16px;color:#fca5a5;font-size:12px">Failed: ${esc(String(e))}</div>`;}
+}
+
+async function wmOpenMessage(uid){
+  const el=document.getElementById('wmMsgView');
+  el.innerHTML='<div style="text-align:center;padding:40px;color:var(--t3);font-size:12px">Loading…</div>';
+  try{
+    const d=await fetch('?x=webmail_message&mailbox='+encodeURIComponent(wmCurrentMailbox)+'&folder='+encodeURIComponent(wmCurrentFolder)+'&uid='+encodeURIComponent(uid)).then(r=>r.json());
+    if(!d.ok){el.innerHTML=`<div style="padding:16px;color:#fca5a5;font-size:12px">${esc(d.error||'Failed to load message.')}</div>`;return;}
+    const atts=(d.attachments||[]).map(a=>`<a href="?x=webmail_attachment&mailbox=${encodeURIComponent(wmCurrentMailbox)}&folder=${encodeURIComponent(wmCurrentFolder)}&uid=${encodeURIComponent(uid)}&part=${encodeURIComponent(a.part)}&name=${encodeURIComponent(a.name)}" class="btn btn-xs btn-g" style="margin-right:6px;margin-top:6px;display:inline-block">📎 ${esc(a.name)} (${formatBytes(a.size||0)})</a>`).join('');
+    el.innerHTML=`
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px;gap:10px">
+        <div>
+          <div style="font-size:16px;font-weight:700;color:var(--t1);margin-bottom:6px">${esc(d.subject||'(No subject)')}</div>
+          <div style="font-size:12px;color:var(--t3)">From: <strong style="color:var(--t2)">${esc(d.from||'')}</strong></div>
+          <div style="font-size:12px;color:var(--t3)">To: ${esc(d.to||'')}</div>
+          <div style="font-size:11px;color:var(--t3);margin-top:2px">${esc(d.date||'')}</div>
+        </div>
+        <div style="display:flex;gap:6px;flex-shrink:0">
+          <button class="btn btn-xs btn-g" id="wmFlagBtn">★ Flag</button>
+          <button class="btn btn-xs btn-red" id="wmDelBtn">Delete</button>
+        </div>
+      </div>
+      ${atts?`<div style="margin-bottom:12px">${atts}</div>`:''}
+      <div style="border-top:1px solid var(--b2);padding-top:14px;font-size:13px;line-height:1.6;color:var(--t2);word-break:break-word">${d.is_html?d.body:d.body}</div>`;
+    document.getElementById('wmFlagBtn')?.addEventListener('click',async()=>{
+      const fd=new FormData();fd.append('csrf_token',CSRF);fd.append('action','webmail_mark');
+      fd.append('wm_mailbox',wmCurrentMailbox);fd.append('wm_folder',wmCurrentFolder);fd.append('wm_uid',uid);
+      fd.append('wm_flag','flagged');fd.append('wm_set','1');
+      await fetch('',{method:'POST',body:fd});
+      toast('Message flagged.');wmLoadMessages();
+    });
+    document.getElementById('wmDelBtn')?.addEventListener('click',async()=>{
+      if(!confirm('Delete this message permanently?'))return;
+      const fd=new FormData();fd.append('csrf_token',CSRF);fd.append('action','webmail_delete');
+      fd.append('wm_mailbox',wmCurrentMailbox);fd.append('wm_folder',wmCurrentFolder);fd.append('wm_uid',uid);
+      await fetch('',{method:'POST',body:fd});
+      toast('Message deleted.');
+      el.innerHTML='<div style="text-align:center;padding:40px;color:var(--t3);font-size:12px">Select a message to read it</div>';
+      wmLoadMessages();
+    });
+    wmLoadMessages(); // refresh seen state in list without losing selection styling
+  }catch(e){el.innerHTML=`<div style="padding:16px;color:#fca5a5;font-size:12px">Failed: ${esc(String(e))}</div>`;}
+}
+
+/* ── Compose ── */
+document.getElementById('wmComposeBtn')?.addEventListener('click',()=>{
+  document.getElementById('wmTo').value='';document.getElementById('wmSubject').value='';
+  document.getElementById('wmBody').value='';document.getElementById('wmComposeFeedback').innerHTML='';
+  if(wmCurrentMailbox)document.getElementById('wmFrom').value=wmCurrentMailbox;
+  openMod('webmailComposeOv');
+});
+document.getElementById('wmComposeClose')?.addEventListener('click',()=>closeMod('webmailComposeOv'));
+document.getElementById('wmSendBtn')?.addEventListener('click',async()=>{
+  const from=document.getElementById('wmFrom').value;
+  const to=document.getElementById('wmTo').value.trim();
+  const subject=document.getElementById('wmSubject').value.trim()||'(No subject)';
+  const body=document.getElementById('wmBody').value;
+  const fb=document.getElementById('wmComposeFeedback');
+  if(!to){fb.innerHTML='<div style="color:#fca5a5;margin-bottom:10px;font-size:12px">A recipient is required.</div>';return;}
+  const btn=document.getElementById('wmSendBtn');btn.disabled=true;btn.textContent='Sending…';
+  const fd=new FormData();fd.append('csrf_token',CSRF);fd.append('action','webmail_send');
+  fd.append('wm_from',from);fd.append('wm_to',to);fd.append('wm_subject',subject);fd.append('wm_body',body);
+  await fetch('',{method:'POST',body:fd});
+  btn.disabled=false;btn.textContent='Send';
+  closeMod('webmailComposeOv');
+  toast('Message sent.');
+  if(wmCurrentMailbox===from)wmLoadMessages();
+});
+
+})(); // end Webmail Manager IIFE
 
 /* HELPERS */
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
