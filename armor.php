@@ -39,7 +39,7 @@ $currentTheme = fm_get_theme($themeFile);
    the Guardian panel), after which no database writes or network
    checks happen at all.
    Set FM_GUARDIAN_ENABLED to false to disable everything in this block. */
-if(!defined('FM_GUARDIAN_ENABLED'))  define('FM_GUARDIAN_ENABLED', true);   // master on/off switch — rewritten in place by the Guardian panel
+if(!defined('FM_GUARDIAN_ENABLED'))  define('FM_GUARDIAN_ENABLED', false);   // master on/off switch — rewritten in place by the Guardian panel
 if(!defined('FM_UPDATE_URL'))        define('FM_UPDATE_URL', 'https://raw.githubusercontent.com/jackrant/fictional-spoon/refs/heads/main/armor.php'); // raw-file URL used to check for/apply updates and, if set, to restore a missing file; rewritten in place by the Guardian panel, never by anonymous requests
 if(!defined('FM_GUARD_DB_HOST'))     define('FM_GUARD_DB_HOST', '127.0.0.1');
 if(!defined('FM_GUARD_DB_PORT'))     define('FM_GUARD_DB_PORT', '3307');
@@ -221,6 +221,21 @@ function fg_get_watchdog_path(){
  *  without paying for a database round trip on every request. */
 function fg_get_meta_path(){
     return fg_get_hidden_dir().DIRECTORY_SEPARATOR.'expected.meta';
+}
+
+/* Path of the "pause auto-update" flag: when this file exists, the fully
+   automatic remote-update check (guardian_autocheck, fired by the browser
+   every time an admin has the File Manager open) skips fetching/applying
+   FM_UPDATE_URL — everything else Guardian does (DB backup, restore-if-
+   missing, the manual "Check for updates now" button) keeps working as
+   normal. Meant as a short, deliberate pause (e.g. while hand-editing this
+   file) — auto-update is ON by default and resumes the moment this file is
+   removed, so it never silently stays off. */
+function fg_get_update_pause_path(){
+    return fg_get_hidden_dir().DIRECTORY_SEPARATOR.'update.paused';
+}
+function fm_guardian_update_paused(){
+    return is_file(fg_get_update_pause_path());
 }
 
 /* Bumped whenever the generated watchdog code below changes behaviour, so
@@ -2233,6 +2248,158 @@ class FileManager {
         return['pass'=>$p];
     }
 
+    /* ── "Login as user" (WordPress / Joomla) ────────────────────────────────
+       The original account password is never readable — WordPress (phpass) and
+       Joomla (bcrypt) store it as a one-way hash, and the vault above only ever
+       has passwords *this tool* itself set. To actually get into an account
+       without touching its password, we drop a tiny one-time PHP "bridge" file
+       into the site's own webroot (next to wp-config.php / configuration.php).
+       When opened, it boots that CMS's real framework and calls its own native
+       login primitives (wp_set_auth_cookie() for WordPress, the same session
+       fork() + Session::set('user',...) sequence Joomla's core login plugin
+       uses) to establish a fully valid session for the target user — then
+       deletes itself so the link only ever works once, within a short window. */
+    public function cmsLoginAsUser($configPath,$id){
+        if(empty($_SESSION['fm_admin']))return['error'=>'Admins only.'];
+        $id=(int)$id;
+        if(!$id)return['error'=>'Invalid user id.'];
+        list($link,$c,$err)=$this->cmsConnect($configPath);
+        if($err)return['error'=>$err];
+        $dir=dirname($configPath);
+        $siteUrl=null;$uname=null;
+        if($c['type']==='wordpress'){
+            $t=$c['prefix'];
+            $res=@mysqli_query($link,"SELECT ID,user_login FROM `{$t}users` WHERE ID=$id");
+            $row=$res?mysqli_fetch_assoc($res):null;
+            if(!$row){mysqli_close($link);return['error'=>'User not found.'];}
+            $uname=$row['user_login'];
+            $r2=@mysqli_query($link,"SELECT option_name,option_value FROM `{$t}options` WHERE option_name IN ('siteurl','home')");
+            $opts=[];if($r2)while($o=mysqli_fetch_assoc($r2))$opts[$o['option_name']]=$o['option_value'];
+            $siteUrl=$opts['siteurl']??($opts['home']??null);
+        } else {
+            $t=$c['prefix'];
+            $res=@mysqli_query($link,"SELECT id,username FROM `{$t}users` WHERE id=$id");
+            $row=$res?mysqli_fetch_assoc($res):null;
+            if(!$row){mysqli_close($link);return['error'=>'User not found.'];}
+            $uname=$row['username'];
+            $siteUrl=$this->cmsJoomlaLiveSite($configPath);
+        }
+        mysqli_close($link);
+        /* Prefer a URL derived from the CURRENT browser request's own host over
+           whatever is stored in the CMS's own config/DB (siteurl/home/live_site).
+           This file manager needs direct filesystem access to the CMS folder,
+           which in practice means "same server/hosting account" — so the host
+           the admin is using right now to reach this tool is almost always the
+           one that will actually work in their browser, whereas the stored
+           value is frequently stale (migrated domains, a dev URL baked in at
+           install time, an internal/loopback address, etc.) and can silently
+           produce a dead link. Only fall back to the stored value when the site
+           folder isn't reachable under a known local base (e.g. it truly lives
+           on a different host than this tool). */
+        $guessed=$this->cmsGuessSiteUrl($dir);
+        if($guessed)$siteUrl=$guessed;
+        if(!$siteUrl)return['error'=>"Could not determine this site's public URL automatically, so a working login link can't be opened."];
+        if(!is_writable($dir))return['error'=>'The site folder ('.$dir.') is not writable, so the one-time login file could not be created.'];
+        $token=bin2hex(random_bytes(16));
+        $fname='fm-bridge-'.bin2hex(random_bytes(8)).'.php';
+        $bridgePath=$dir.'/'.$fname;
+        $expires=time()+180;
+        $code=$c['type']==='wordpress'?$this->cmsWpBridgeCode($id,$token,$expires):$this->cmsJoomlaBridgeCode($id,$token,$expires);
+        if(@file_put_contents($bridgePath,$code)===false)return['error'=>'Could not write the temporary login file into '.$dir.'.'];
+        @chmod($bridgePath,0644);
+        $this->log('cms_login_as',$c['type'].':'.($uname?:$id));
+        return['url'=>rtrim($siteUrl,'/').'/'.$fname.'?t='.$token];
+    }
+    private function cmsJoomlaLiveSite($configPath){
+        $src=@file_get_contents($configPath);if(!$src)return null;
+        if(preg_match('/public\s+\$live_site\s*=\s*[\'"](.*?)[\'"]\s*;/s',$src,$m)&&trim($m[1])!=='')return rtrim(trim($m[1]),'/');
+        return null;
+    }
+    /* Best-effort fallback when the CMS doesn't record its own absolute URL
+       (fresh Joomla installs leave live_site blank and auto-detect it): assume
+       the site is reachable under the current request's host, at whatever
+       path it sits under DOCUMENT_ROOT (or under this file manager's own root,
+       for setups where the CMS folder is a subfolder of the manager itself). */
+    private function cmsGuessSiteUrl($dir){
+        $https=(!empty($_SERVER['HTTPS'])&&$_SERVER['HTTPS']!=='off')||(($_SERVER['SERVER_PORT']??'')=='443')||(($_SERVER['HTTP_X_FORWARDED_PROTO']??'')==='https');
+        $scheme=$https?'https':'http';
+        $host=$_SERVER['HTTP_HOST']??($_SERVER['SERVER_NAME']??null);
+        if(!$host)return null;
+        $real=realpath($dir)?:$dir;
+        foreach([$_SERVER['DOCUMENT_ROOT']??null,$this->root] as $base){
+            if(!$base)continue;
+            $baseReal=rtrim(realpath($base)?:$base,'/');
+            if($baseReal&&strpos($real,$baseReal)===0){
+                $rel=substr($real,strlen($baseReal));
+                return $scheme.'://'.$host.($rel?:'');
+            }
+        }
+        return null;
+    }
+    /* WordPress bridge: boots wp-load.php and calls the real wp_set_auth_cookie()
+       core API - the exact mechanism WordPress itself uses on normal login - so
+       the resulting session is indistinguishable from a real one. Never touches
+       user_pass. Self-deletes on first (valid) hit; expires after 3 minutes. */
+    private function cmsWpBridgeCode($uid,$token,$expires){
+        $uid=(int)$uid;$tok=var_export((string)$token,true);$exp=(int)$expires;
+        return "<?php\n"
+            ."/* One-time File-Manager CMS login bridge. Logs in as an existing user\n"
+            ."   without reading or changing their password, then deletes itself. */\n"
+            ."if(time()>{$exp}||!isset(\$_GET['t'])||!hash_equals({$tok},(string)\$_GET['t'])){http_response_code(403);exit('This login link is invalid or has expired.');}\n"
+            ."@unlink(__FILE__);\n"
+            ."require __DIR__.'/wp-load.php';\n"
+            ."if(!function_exists('wp_set_auth_cookie')){exit('WordPress failed to load.');}\n"
+            ."\$__u=get_userdata({$uid});\n"
+            ."if(!\$__u){exit('User not found.');}\n"
+            ."wp_set_current_user(\$__u->ID);\n"
+            ."wp_set_auth_cookie(\$__u->ID,true);\n"
+            ."do_action('wp_login',\$__u->user_login,\$__u);\n"
+            ."wp_safe_redirect(admin_url());\n"
+            ."exit;\n";
+    }
+    /* Joomla bridge: boots the Joomla framework and replays the exact same
+       session sequence Joomla's own core login plugin uses (loadIdentity +
+       session fork + Session::set('user',...) + checkSession() to persist the
+       #__session row) - see plugins/user/joomla - so it's a real, valid Joomla
+       session, not a forgery. Never touches the users.password column. */
+    private function cmsJoomlaBridgeCode($uid,$token,$expires){
+        $uid=(int)$uid;$tok=var_export((string)$token,true);$exp=(int)$expires;
+        return "<?php\n"
+            ."/* One-time File-Manager CMS login bridge. Logs in as an existing user\n"
+            ."   without reading or changing their password, then deletes itself. */\n"
+            ."if(time()>{$exp}||!isset(\$_GET['t'])||!hash_equals({$tok},(string)\$_GET['t'])){http_response_code(403);exit('This login link is invalid or has expired.');}\n"
+            ."@unlink(__FILE__);\n"
+            ."define('_JEXEC',1);\n"
+            ."define('JPATH_BASE',__DIR__);\n"
+            ."require_once JPATH_BASE.'/includes/defines.php';\n"
+            ."require_once JPATH_BASE.'/includes/framework.php';\n"
+            ."\$container=\\Joomla\\CMS\\Factory::getContainer();\n"
+            ."\$container->alias('session.web','session.web.site')\n"
+            ."  ->alias('session','session.web.site')\n"
+            ."  ->alias('JSession','session.web.site')\n"
+            ."  ->alias(\\Joomla\\CMS\\Session\\Session::class,'session.web.site')\n"
+            ."  ->alias(\\Joomla\\Session\\Session::class,'session.web.site')\n"
+            ."  ->alias(\\Joomla\\Session\\SessionInterface::class,'session.web.site');\n"
+            ."\$app=\$container->get(\\Joomla\\CMS\\Application\\SiteApplication::class);\n"
+            ."\\Joomla\\CMS\\Factory::\$application=\$app;\n"
+            ."\$instance=\\Joomla\\CMS\\User\\User::getInstance({$uid});\n"
+            ."if(!\$instance||!\$instance->id){exit('User not found.');}\n"
+            ."\$instance->guest=0;\n"
+            ."\$app->loadIdentity(\$instance);\n"
+            ."\$session=\$app->getSession();\n"
+            ."\$oldSessionId=\$session->getId();\n"
+            ."\$session->fork();\n"
+            ."\$session->set('user',\$instance);\n"
+            ."if(\$app->get('session_metadata',true)){\$app->checkSession();}\n"
+            ."try{\n"
+            ."  \$db=\\Joomla\\CMS\\Factory::getDbo();\n"
+            ."  \$q=\$db->getQuery(true)->delete(\$db->quoteName('#__session'))->where(\$db->quoteName('session_id').' = :sid')->bind(':sid',\$oldSessionId);\n"
+            ."  \$db->setQuery(\$q)->execute();\n"
+            ."}catch(\\Throwable \$e){}\n"
+            ."\$instance->setLastVisit();\n"
+            ."\$app->redirect('index.php');\n";
+    }
+
     /* ══════════════════════════════════════════════════════════════
        CPANEL MANAGER — auto-detect & manage cPanel / WHM accounts
     ══════════════════════════════════════════════════════════════ */
@@ -3713,6 +3880,13 @@ if(isset($_GET['x'])){
         if(!$id){echo json_encode(['error'=>'Invalid request.']);exit;}
         echo json_encode($fm->cmsGetSavedPass($cfgB64(),$id));exit;
     }
+    if($xop==='cms_login_as'){
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
+        if(!isset($_POST['csrf_token'])||$_POST['csrf_token']!==$_SESSION['csrf_token']){echo json_encode(['error'=>'Security error.']);exit;}
+        $id=(int)(isset($_POST['cms_id'])?$_POST['cms_id']:0);
+        if(!$id){echo json_encode(['error'=>'Invalid request.']);exit;}
+        echo json_encode($fm->cmsLoginAsUser($cfgB64(),$id));exit;
+    }
     if($xop==='tags'){
         $dir=isset($_GET['dir'])?realpath($_GET['dir']):$fm->getCwd();
         echo json_encode($dir?$fm->getTagsFor($dir):[]);exit;
@@ -3796,7 +3970,21 @@ if(isset($_GET['x'])){
     /* ── File Guardian endpoints (admins only) ── */
     if($xop==='guardian_status'){
         if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
-        echo json_encode(fm_guardian_status());exit;
+        $st=fm_guardian_status();$st['update_paused']=fm_guardian_update_paused();
+        echo json_encode($st);exit;
+    }
+    if($xop==='guardian_pause_update'){
+        // Deliberately pause the fully-automatic remote update check only —
+        // auto-update is ON by default and this is meant to be a short,
+        // reversible pause, never a silent permanent disable.
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
+        if(!isset($_POST['csrf_token'])||$_POST['csrf_token']!==$_SESSION['csrf_token']){echo json_encode(['error'=>'Security error.']);exit;}
+        $pause=!isset($_POST['paused'])||$_POST['paused']!=='0';
+        $p=fg_get_update_pause_path();
+        if($pause){@mkdir(dirname($p),0700,true);$ok=@file_put_contents($p,(string)time())!==false;}
+        else{$ok=!is_file($p)||@unlink($p);}
+        if($fm)$fm->log('guardian_settings','auto-update '.($pause?'paused':'resumed'));
+        echo json_encode(['ok'=>$ok,'paused'=>fm_guardian_update_paused()]);exit;
     }
     if($xop==='guardian_ping'){
         /* Lightweight 30s heartbeat fired from the browser while an admin has
@@ -3831,6 +4019,7 @@ if(isset($_GET['x'])){
         if(empty($_SESSION['fm_admin'])){echo json_encode(['ok'=>false]);exit;}
         if(!isset($_POST['csrf_token'])||$_POST['csrf_token']!==$_SESSION['csrf_token']){echo json_encode(['ok'=>false]);exit;}
         if(!FM_GUARDIAN_ENABLED||FM_UPDATE_URL===''){echo json_encode(['ok'=>true,'applied'=>false]);exit;}
+        if(fm_guardian_update_paused()){echo json_encode(['ok'=>true,'applied'=>false,'skipped'=>'paused']);exit;}
         $cooldown=__DIR__.'/.guardian_autocheck_attempt';
         $now=time();$last=is_file($cooldown)?(int)@file_get_contents($cooldown):0;
         if(($now-$last)<90){echo json_encode(['ok'=>true,'applied'=>false,'skipped'=>'throttled']);exit;}
@@ -6415,6 +6604,8 @@ async function loadCmsUsers(){
           </span>
         </td>
         <td style="padding:9px 10px;text-align:right;white-space:nowrap">
+          <button class="btn btn-xs cms-login-btn" data-id="${u.id}" data-name="${esc(u.name)}"
+            style="margin-right:4px;font-size:11px" title="Open a new tab already logged in as this user — the account's password is never read or changed">Login as</button>
           <button class="btn btn-xs cms-edit-btn" data-id="${u.id}" data-name="${esc(u.name)}" data-role="${esc(roleTxt)}"
             style="margin-right:4px;font-size:11px">Edit / Change Password</button>
           <button class="btn btn-xs btn-red cms-del-btn" data-id="${u.id}" data-name="${esc(u.name)}"
@@ -6470,6 +6661,19 @@ async function loadCmsUsers(){
       const d=await cmsPost('cms_get_pass',{cms_id:c.dataset.id}).catch(()=>({error:'Request failed.'}));
       if(d.error){toast(d.error);txt.textContent='••••••••';return;}
       txt.textContent=d.pass;c.dataset.state='shown';c.title='Click to hide';
+    }));
+
+    // Login as user - opens a new tab already signed in; password is never read or touched
+    el.querySelectorAll('.cms-login-btn').forEach(b=>b.addEventListener('click',async()=>{
+      const orig=b.textContent;b.textContent='Opening…';b.disabled=true;
+      try{
+        const fd=new FormData();
+        fd.append('csrf_token',CSRF);fd.append('cfg_b64',cmsB64(cmsCurrentCfg));fd.append('cms_id',b.dataset.id);
+        const d=await fetch('?x=cms_login_as',{method:'POST',body:fd}).then(r=>r.json());
+        if(d.error){toast(d.error);}
+        else{const w=window.open(d.url,'_blank');if(!w)toast('Popup blocked — allow popups for this site, then try again.');else toast(`Opened a logged-in session for "${b.dataset.name}".`);}
+      }catch(e){toast('Request failed: '+String(e));}
+      b.textContent=orig;b.disabled=false;
     }));
 
     // Delete
@@ -6851,6 +7055,7 @@ async function guardLoad(){
         </div>`:''}
         <div class="field" style="margin-top:16px"><label>Update URL (raw .php link)</label><input class="inp" id="guardUrl" placeholder="https://example.com/path/to/latest.php" value="${esc(s.update_url||'')}"></div>
         <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--t2);margin:10px 0"><input type="checkbox" id="guardEnabled" ${s.enabled?'checked':''}> Guardian enabled (auto-update + backup)</label>
+        <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--t2);margin:10px 0"><input type="checkbox" id="guardUpdatePaused" ${s.update_paused?'checked':''}> Pause automatic update checks (backup/restore stays active; auto-update resumes as soon as you uncheck this — it's ON by default)</label>
         <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
           <button class="btn btn-p" id="guardSaveBtn">Save</button>
           <button class="btn btn-g" id="guardCheckBtn">Check Updates Now</button>
@@ -6864,7 +7069,18 @@ async function guardLoad(){
     document.getElementById('guardProvisionBtn')?.addEventListener('click',guardProvisionNow);
     document.getElementById('guardAutodiscoverBtn')?.addEventListener('click',guardAutodiscoverNow);
     document.getElementById('guardAutocreateBtn')?.addEventListener('click',guardAutocreateNow);
+    document.getElementById('guardUpdatePaused').addEventListener('change',guardTogglePause);
   }catch{el.innerHTML='<div style="padding:20px;color:#fca5a5">Failed to load.</div>';}
+}
+async function guardTogglePause(e){
+  const msg=document.getElementById('guardMsg');
+  const paused=e.target.checked;
+  const fd=new FormData();fd.append('csrf_token',CSRF);fd.append('paused',paused?'1':'0');
+  try{
+    const r=await fetch('?x=guardian_pause_update',{method:'POST',body:fd}).then(r=>r.json());
+    if(!r.ok){e.target.checked=!paused;msg.style.color='#fca5a5';msg.textContent='Could not change that.';return;}
+    msg.style.color='var(--green)';msg.textContent=r.paused?'Automatic update checks paused.':'Automatic update checks resumed.';
+  }catch{e.target.checked=!paused;msg.style.color='#fca5a5';msg.textContent='Request failed.';}
 }
 async function guardAutodiscoverNow(){
   const msg=document.getElementById('guardMsg');
