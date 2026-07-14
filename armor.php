@@ -1562,7 +1562,76 @@ class FileManager {
             if(trim((string)@shell_exec("command -v $bin2 2>/dev/null")))$pkgMgr=$label;
             if($pkgMgr)break;
         }
-        return ['installed'=>(bool)$bin,'client'=>(bool)$client,'running'=>$running||$portOpen,'port_open'=>$portOpen,'pkg_mgr'=>$pkgMgr,'sshd_path'=>$bin];
+        $ipInfo=$this->sshDetectIp();
+        return ['installed'=>(bool)$bin,'client'=>(bool)$client,'running'=>$running||$portOpen,'port_open'=>$portOpen,'pkg_mgr'=>$pkgMgr,'sshd_path'=>$bin,
+            'server_ip'=>$ipInfo['ip'],'server_ip_method'=>$ipInfo['method'],'server_ip_external'=>$ipInfo['external'],'server_ip_reachable'=>$ipInfo['reachable']];
+    }
+
+    /**
+     * Detect the real, usable IP address for connecting to this server over SSH.
+     * Tries several methods in order of reliability (route table -> all bound
+     * addresses -> DNS -> web server binding), discards loopback/link-local
+     * addresses, and prefers whichever candidate actually answers on port 22.
+     * Falls back to loopback (clearly marked as local-only) only if nothing
+     * else is found, and returns an explicit "undetermined" result rather than
+     * ever silently pretending 127.0.0.1 is a reachable external address.
+     */
+    public function sshDetectIp(){
+        $candidates=[]; // ip => detection method label
+        $add=function($ip,$method) use (&$candidates){
+            $ip=trim((string)$ip);
+            if($ip&&filter_var($ip,FILTER_VALIDATE_IP,FILTER_FLAG_IPV4)&&!isset($candidates[$ip]))$candidates[$ip]=$method;
+        };
+        // 1) Address the kernel would actually use to reach the outside world (most reliable single pick)
+        $route=trim((string)@shell_exec('ip route get 1.1.1.1 2>/dev/null'));
+        if($route&&preg_match('/\bsrc\s+(\d{1,3}(?:\.\d{1,3}){3})/',$route,$m))$add($m[1],'default route');
+        // 2) All addresses bound to any interface
+        $hI=trim((string)@shell_exec('hostname -I 2>/dev/null'));
+        if($hI)foreach(preg_split('/\s+/',$hI) as $ip)$add($ip,'hostname -I');
+        // 3) Parse `ip addr` directly (covers systems where hostname -I is unavailable/limited)
+        $ipAddr=trim((string)@shell_exec('ip -4 -o addr show scope global 2>/dev/null'));
+        if($ipAddr)foreach(explode("\n",$ipAddr) as $line)if(preg_match('/inet\s+(\d{1,3}(?:\.\d{1,3}){3})/',$line,$m))$add($m[1],'ip addr (global scope)');
+        // 4) DNS resolution of the machine's own hostname
+        $host=gethostname();
+        if($host){$resolved=@gethostbyname($host);if($resolved&&$resolved!==$host)$add($resolved,'hostname DNS lookup');}
+        // 5) Whatever address the web server itself reports being bound to
+        if(!empty($_SERVER['SERVER_ADDR']))$add($_SERVER['SERVER_ADDR'],'web server SERVER_ADDR');
+
+        // Drop loopback / link-local / unusable addresses - these are never valid "connect to me" addresses
+        $filtered=[];
+        foreach($candidates as $ip=>$method){
+            if(str_starts_with($ip,'127.')||str_starts_with($ip,'169.254.')||$ip==='0.0.0.0')continue;
+            $filtered[$ip]=$method;
+        }
+
+        // Prefer a candidate that actually answers on port 22 - that is a guaranteed-usable address
+        foreach($filtered as $ip=>$method){
+            $c=@fsockopen($ip,22,$errno,$errstr,1.0);
+            if($c){fclose($c);return['ip'=>$ip,'method'=>$method,'reachable'=>true,'external'=>true,'candidates'=>$candidates];}
+        }
+        // None answered directly on :22 (sshd may bind only to 0.0.0.0/loopback) - still surface the
+        // best non-loopback address found, since that is what a remote client needs to type in.
+        if($filtered){
+            $ip=array_key_first($filtered);
+            return['ip'=>$ip,'method'=>$filtered[$ip],'reachable'=>false,'external'=>true,'candidates'=>$candidates];
+        }
+        // Genuinely nothing but loopback exists - be explicit that it is local-only, never disguise it as external.
+        $c=@fsockopen('127.0.0.1',22,$errno,$errstr,1.0);
+        if($c){fclose($c);return['ip'=>'127.0.0.1','method'=>'loopback only (no external interface detected)','reachable'=>true,'external'=>false,'candidates'=>$candidates];}
+        return['ip'=>null,'method'=>null,'reachable'=>false,'external'=>false,'candidates'=>$candidates];
+    }
+
+    /**
+     * Run a system-account-management shell command and judge success purely from the
+     * real process exit code - never from guessing at substrings in the output. Tools like
+     * chpasswd/usermod/chsh can fail with many different phrasings (PAM errors, locked
+     * files, policy rejections, etc.) that don't contain the word "permission", so pattern
+     * matching on output text is unreliable and was the root cause of false "success" reports.
+     */
+    private function sshRunAdmin($cmd){
+        $out=[];$exit=0;
+        exec($cmd.' 2>&1',$out,$exit);
+        return ['ok'=>$exit===0,'out'=>implode("\n",$out),'exit'=>$exit];
     }
     private function sshInstall(){
         if(empty($_SESSION['fm_admin'])){$this->addMsg('Admins only.','danger');return;}
@@ -1645,8 +1714,10 @@ class FileManager {
         if(!$exists){$this->addMsg("Failed to create user \"{$uname}\": ".$this->sshCmdErr($out),'danger');return;}
         if($pass){
             $esc=escapeshellarg($uname.':'.$pass);
-            $po=trim((string)shell_exec("echo $esc | chpasswd 2>&1"));
-            if($po&&!str_contains(strtolower($po),'success')){}// ignore minor warnings
+            $r=$this->sshRunAdmin("echo $esc | chpasswd");
+            if(!$r['ok']){
+                $this->addMsg("User \"{$uname}\" was created, but setting the initial password failed: ".$this->sshCmdErr($r['out']).' You can retry from the edit-user dialog.','warning');
+            }
         }
         if($sudo){
             shell_exec("usermod -aG sudo ".escapeshellarg($uname)." 2>/dev/null");
@@ -1680,50 +1751,60 @@ class FileManager {
         if(!preg_match('/^[a-z_][a-z0-9_-]{0,31}$/',$uname)){$this->addMsg('Invalid username.','danger');return;}
         switch($act){
             case 'lock':
-                $out=trim((string)shell_exec("usermod -L ".escapeshellarg($uname)." 2>&1"));
-                if($out&&str_contains(strtolower($out),'permission'))
-                    $this->addMsg("Failed to lock \"{$uname}\": ".$this->sshCmdErr($out),'danger');
+                $r=$this->sshRunAdmin("usermod -L ".escapeshellarg($uname));
+                if(!$r['ok'])$this->addMsg("Failed to lock \"{$uname}\": ".$this->sshCmdErr($r['out']),'danger');
                 else $this->addMsg("Account \"{$uname}\" locked.",'warning');
                 break;
             case 'unlock':
-                $out=trim((string)shell_exec("usermod -U ".escapeshellarg($uname)." 2>&1"));
-                if($out&&str_contains(strtolower($out),'permission'))
-                    $this->addMsg("Failed to unlock \"{$uname}\": ".$this->sshCmdErr($out),'danger');
+                $r=$this->sshRunAdmin("usermod -U ".escapeshellarg($uname));
+                if(!$r['ok'])$this->addMsg("Failed to unlock \"{$uname}\": ".$this->sshCmdErr($r['out']),'danger');
                 else $this->addMsg("Account \"{$uname}\" unlocked.",'success');
                 break;
             case 'add_sudo':
-                $o1=trim((string)shell_exec("usermod -aG sudo ".escapeshellarg($uname)." 2>&1"));
-                $o2=trim((string)shell_exec("usermod -aG wheel ".escapeshellarg($uname)." 2>&1"));
-                $out=$o1.$o2;
-                if($out&&(str_contains(strtolower($out),'permission')||str_contains(strtolower($out),'not permitted')))
-                    $this->addMsg("Failed to grant sudo to \"{$uname}\": ".$this->sshCmdErr($out),'danger');
+                $r1=$this->sshRunAdmin("usermod -aG sudo ".escapeshellarg($uname));
+                $r2=$this->sshRunAdmin("usermod -aG wheel ".escapeshellarg($uname));
+                // Succeeds if at least one of the sudo/wheel groups actually exists and accepted the user;
+                // only report failure when BOTH attempts genuinely failed.
+                if(!$r1['ok']&&!$r2['ok'])
+                    $this->addMsg("Failed to grant sudo to \"{$uname}\": ".$this->sshCmdErr($r1['out'].' '.$r2['out']),'danger');
                 else $this->addMsg("Sudo privileges granted to \"{$uname}\".",'success');
                 break;
             case 'remove_sudo':
-                $o1=trim((string)shell_exec("gpasswd -d ".escapeshellarg($uname)." sudo 2>&1"));
-                $o2=trim((string)shell_exec("gpasswd -d ".escapeshellarg($uname)." wheel 2>&1"));
-                $out=$o1.$o2;
-                if($out&&str_contains(strtolower($out),'permission'))
-                    $this->addMsg("Failed to remove sudo from \"{$uname}\": ".$this->sshCmdErr($out),'danger');
+                $r1=$this->sshRunAdmin("gpasswd -d ".escapeshellarg($uname)." sudo");
+                $r2=$this->sshRunAdmin("gpasswd -d ".escapeshellarg($uname)." wheel");
+                if(!$r1['ok']&&!$r2['ok'])
+                    $this->addMsg("Failed to remove sudo from \"{$uname}\": ".$this->sshCmdErr($r1['out'].' '.$r2['out']),'danger');
                 else $this->addMsg("Sudo privileges removed from \"{$uname}\".",'warning');
                 break;
             case 'change_shell':
                 $shell=$_POST['ssh_shell']??'/bin/bash';
                 $allowed=['/bin/bash','/bin/sh','/bin/rbash','/usr/bin/bash','/usr/bin/sh','/usr/bin/zsh','/bin/zsh'];
                 if(!in_array($shell,$allowed)){$this->addMsg('Invalid shell.','danger');return;}
-                $out=trim((string)shell_exec("chsh -s ".escapeshellarg($shell)." ".escapeshellarg($uname)." 2>&1"));
-                if($out&&str_contains(strtolower($out),'permission'))
-                    $this->addMsg("Failed to change shell: ".$this->sshCmdErr($out),'danger');
+                $r=$this->sshRunAdmin("chsh -s ".escapeshellarg($shell)." ".escapeshellarg($uname));
+                if(!$r['ok'])$this->addMsg("Failed to change shell: ".$this->sshCmdErr($r['out']),'danger');
                 else $this->addMsg("Shell updated to {$shell} for \"{$uname}\".",'success');
                 break;
             case 'change_pass':
                 $pass=$_POST['ssh_pass']??'';
                 if(strlen($pass)<6){$this->addMsg('Password must be at least 6 characters.','danger');return;}
+                // Capture the real shadow hash before the change so we can verify it actually moved -
+                // some failure modes (PAM rejection, policy blocks) still exit non-zero but it is
+                // cheap insurance to also confirm the stored credential genuinely changed.
+                $shadowBefore=trim((string)@shell_exec('getent shadow '.escapeshellarg($uname).' 2>/dev/null'));
+                $hashBefore=explode(':',$shadowBefore)[1]??null;
                 $esc=escapeshellarg($uname.':'.$pass);
-                $out=trim((string)shell_exec("echo $esc | chpasswd 2>&1"));
-                if($out&&str_contains(strtolower($out),'permission'))
-                    $this->addMsg("Failed to change password: ".$this->sshCmdErr($out),'danger');
-                else $this->addMsg("Password changed for \"{$uname}\".",'success');
+                $r=$this->sshRunAdmin("echo $esc | chpasswd");
+                if(!$r['ok']){
+                    $this->addMsg("Failed to change password for \"{$uname}\": ".$this->sshCmdErr($r['out']),'danger');
+                    return;
+                }
+                $shadowAfter=trim((string)@shell_exec('getent shadow '.escapeshellarg($uname).' 2>/dev/null'));
+                $hashAfter=explode(':',$shadowAfter)[1]??null;
+                if($hashBefore!==null&&$hashAfter!==null&&$hashBefore===$hashAfter){
+                    $this->addMsg("Password change for \"{$uname}\" was rejected by the system (the stored credential did not actually change) even though the command exited without error. This typically means PAM/system policy blocked the update - check account locks, password complexity rules, or restricted authentication modules on this server.",'danger');
+                    return;
+                }
+                $this->addMsg("Password changed for \"{$uname}\" and verified on the system - it is safe to connect with the new password.",'success');
                 break;
             case 'add_key':
                 $key=trim($_POST['ssh_key']??'');
@@ -5481,6 +5562,16 @@ async function loadSshStatus(){
       ${row('Running / Port 22',d.running?'Active'+checkIco():'Not running',d.running)}
       ${row('Package Manager',d.pkg_mgr||'None detected',!!d.pkg_mgr)}
     </div>`;
+    if(d.server_ip){
+      const ipOk=d.server_ip_external&&d.server_ip_reachable;
+      html+=`<div style="margin-top:14px;padding:12px 14px;background:rgba(129,140,248,.08);border:1px solid rgba(129,140,248,.25);border-radius:10px">
+        <div style="font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--t3);margin-bottom:4px">Connect using</div>
+        <div style="font-family:monospace;font-size:15px;font-weight:700;color:#c7d2fe">ssh user@${esc(d.server_ip)}</div>
+        <div style="font-size:11.5px;color:var(--t3);margin-top:4px">${ipOk?'Detected via '+esc(d.server_ip_method)+' and confirmed reachable on port 22.':(d.server_ip_external?'Detected via '+esc(d.server_ip_method)+' - port 22 did not answer directly on this address; verify sshd is listening on it.':'No external network interface was detected - this address only works for connections made from the same machine.')}</div>
+      </div>`;
+    } else {
+      html+=`<div style="margin-top:14px;padding:12px 14px;background:rgba(252,165,165,.08);border:1px solid rgba(252,165,165,.25);border-radius:10px;font-size:12px;color:#fca5a5">Could not determine a usable server IP address for SSH. Check the server's network configuration.</div>`;
+    }
     if(d.installed){
       html+=`<div style="margin-top:14px;padding:12px 14px;background:rgba(134,239,172,.07);border:1px solid rgba(134,239,172,.2);border-radius:10px;font-size:12px;color:#86efac">SSH is installed and ready. Use the <strong>User Management</strong> tab to manage who can connect.</div>`;
     } else {
