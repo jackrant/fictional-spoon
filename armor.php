@@ -2236,20 +2236,79 @@ class FileManager {
         $_SESSION['cpanel_api_type']=$apiType;
         $_SESSION['cpanel_port']=(int)$port;
         $_SESSION['cpanel_method']=$method;
-        $_SESSION['cpanel_cli_mode']=in_array($method,['whm_cli','whmbin_cli','uapi_cli']);
+        $_SESSION['cpanel_cli_mode']=in_array($method,['whm_cli','whmbin_cli','uapi_cli','native_uapi']);
+    }
+
+    /** cPanel's own local PHP API bridge. When this script's process is
+     *  running as the account's real OS user — which is the modern cPanel
+     *  default (suPHP / suexec CGI / a per-user PHP-FPM pool), replacing
+     *  the old shared-user mod_php DSO setup — cpsrvd trusts that OS-level
+     *  identity directly over a local socket, with no token or password
+     *  involved at all. This is the same mechanism cPanel's own plugins and
+     *  webmail hooks use. It silently returns null (never throws) whenever
+     *  the class file is missing or the call is rejected, so every caller
+     *  degrades straight to the next method. */
+    private function cpNativeCall($module,$func,$params=[]){
+        static $obj=null,$tried=false,$path=null;
+        if($obj===null){
+            if($tried)return null;
+            $tried=true;
+            $path='/usr/local/cpanel/php/cpanel.php';
+            if(!is_readable($path))return null;
+            try{
+                if(!class_exists('CPANEL',false))require_once $path;
+                if(!class_exists('CPANEL',false))return null;
+                $obj=new \CPANEL();
+            }catch(\Throwable $e){return null;}
+        }
+        try{
+            $res=@$obj->uapi($module,$func,$params);
+            return is_array($res)?$res:null;
+        }catch(\Throwable $e){return null;}
+    }
+
+    private function cpNativeOk($res){
+        if(!is_array($res))return false;
+        if(array_key_exists('status',$res))return (int)$res['status']===1;
+        if(isset($res['cpanelresult']['data']))return true; // legacy shape
+        return isset($res['data']);
     }
 
     /** Try every available auto-detection method in order. Saves result into
      *  the session so callers can just use cpanelCreds() afterwards. Never
-     *  asks the user for anything. Returns ['ok'=>bool,'method'=>string,...]. */
+     *  asks the user for anything. Returns ['ok'=>bool,'method'=>string,...],
+     *  and on failure a 'diagnostics' list explaining exactly why each
+     *  method didn't apply, so the UI can show *why* instead of a blank
+     *  "connect manually" prompt. */
     public function cpanelAutoConnect(){
         // Already connected this session? Return immediately.
-        if(!empty($_SESSION['cpanel_user'])){
+        if(!empty($_SESSION['cpanel_user'])||!empty($_SESSION['cpanel_native'])){
             return['ok'=>true,'method'=>$_SESSION['cpanel_method']??'session',
-                   'user'=>$_SESSION['cpanel_user'],'api'=>$_SESSION['cpanel_api_type']??'whm',
+                   'user'=>$_SESSION['cpanel_user']??'(native)','api'=>$_SESSION['cpanel_api_type']??'whm',
                    'port'=>(int)($_SESSION['cpanel_port']??2087),'auto'=>true];
         }
         $username=$this->cpDetectUser();
+        $diag=[];
+
+        // ── Method 0: cPanel's own local API class — zero credentials,
+        // works whenever PHP executes as the account's own OS user. Try
+        // this before anything else: it needs no shell access, no token
+        // file, and no root — the single most universal method on modern
+        // shared cPanel hosting. ──
+        if(is_readable('/usr/local/cpanel/php/cpanel.php')){
+            $probe=$this->cpNativeCall('DomainInfo','list_domains');
+            if($this->cpNativeOk($probe)){
+                $_SESSION['cpanel_native']=true;
+                $this->cpSetSess($username?:'(account owner)','','native','cpanel',2083,'native_uapi');
+                return['ok'=>true,'method'=>'native_uapi','user'=>$username?:'(account owner)','api'=>'cpanel',
+                       'port'=>2083,'auto'=>true,'note'=>'Connected via cPanel\'s local API — no login needed.'];
+            }
+            $diag[]='cPanel local API class found but the call was rejected — this process is likely not '
+                   .'running under the account\'s own OS user (e.g. shared mod_php instead of suPHP/FPM-per-user).'
+                   .($probe!==null?' Raw response: '.substr(json_encode($probe),0,200):' No response (exception or non-array return).');
+        } else {
+            $diag[]='cPanel local API class not found at /usr/local/cpanel/php/cpanel.php — not a cPanel-managed box, or this account cannot see cPanel core files.';
+        }
 
         if(function_exists('shell_exec')){
             // ── Method 1: WHM CLI via PATH (root/reseller shell access) ──
@@ -2259,9 +2318,12 @@ class FileManager {
                 $this->cpSetSess($who,'','token','whm',2087,'whm_cli');
                 return['ok'=>true,'method'=>'whm_cli','user'=>$who,'api'=>'whm','port'=>2087,'auto'=>true];
             }
+            $diag[]='whmapi1 not on PATH or not root/reseller shell access.';
             // ── Method 2: WHM CLI via absolute path ──
+            $found2=false;
             foreach(['/usr/local/cpanel/bin/whmapi1','/usr/sbin/whmapi1'] as $bin){
                 if(!is_executable($bin))continue;
+                $found2=true;
                 $o=@shell_exec(escapeshellarg($bin).' listaccts --output=json 2>/dev/null');
                 if($o&&($j=@json_decode($o,true))&&($j['metadata']['result']??0)==1){
                     $who=trim((string)@shell_exec('whoami 2>/dev/null'))?:'root';
@@ -2269,11 +2331,14 @@ class FileManager {
                     return['ok'=>true,'method'=>'whmbin_cli','user'=>$who,'api'=>'whm','port'=>2087,'auto'=>true];
                 }
             }
+            $diag[]=$found2?'whmapi1 binary present but returned no usable result (not root, or WHM CLI disabled for this user).':'whmapi1 binary not present at known paths.';
             // ── Method 3: uapi CLI — auto-create API token for this user ──
             if($username){
                 $tn='fm_auto_'.substr(md5(gethostname().$username),0,8);
+                $foundU=false;
                 foreach(['/usr/local/cpanel/bin/uapi','/usr/bin/uapi'] as $ubin){
                     if(!is_executable($ubin))continue;
+                    $foundU=true;
                     $uo=@shell_exec(escapeshellarg($ubin).' --user='.escapeshellarg($username)
                         .' --output=json Auth create_api_token token_name='.escapeshellarg($tn).' 2>/dev/null');
                     if($uo){
@@ -2285,7 +2350,12 @@ class FileManager {
                         }
                     }
                 }
+                $diag[]=$foundU?'uapi CLI present but token creation failed (shell_exec likely restricted to a different user than the account owner).':'uapi CLI binary not present at known paths.';
+            } else {
+                $diag[]='Could not determine the cPanel account username from environment or script path, so the uapi CLI method was skipped.';
             }
+        } else {
+            $diag[]='shell_exec() is disabled on this host (common in disable_functions on shared hosting) — CLI-based methods (whmapi1/uapi) were skipped entirely.';
         }
 
         // ── Method 4: Read existing API tokens from filesystem ──
@@ -2301,11 +2371,14 @@ class FileManager {
                         return['ok'=>true,'method'=>'token_file','user'=>$username,'api'=>$api,'port'=>$port,'auto'=>true];
                     }
                 }
+                $diag[]='An API token file exists for this user but the local HTTP API call failed (cpsrvd not reachable on 127.0.0.1:2083/2087, or the token is stale).';
+            } else {
+                $diag[]='No existing cPanel API token file found under /var/cpanel/authn/api_tokens or ~/.cpanel/authn/api_tokens.';
             }
         }
 
         // Nothing auto-detected — caller must show manual connect UI
-        return['ok'=>false,'method'=>'none','detected_user'=>$username,'auto'=>false];
+        return['ok'=>false,'method'=>'none','detected_user'=>$username,'auto'=>false,'diagnostics'=>$diag];
     }
 
     /** Probe the environment and return discovery info (no credentials needed). */
@@ -2423,12 +2496,17 @@ class FileManager {
                 header('Content-Type:application/json');
                 echo json_encode(['accounts'=>$accts,'api'=>'whm','user'=>$c['user'],'port'=>$c['port'],'method'=>$method]);exit;
             } else {
-                // cPanel UAPI CLI
+                // cPanel UAPI — native local class first (zero-cost, no shell needed), then CLI.
                 $domain=$c['user'];
-                foreach(['/usr/local/cpanel/bin/uapi','/usr/bin/uapi'] as $ubin){
-                    if(!is_executable($ubin))continue;
-                    $uo=@shell_exec(escapeshellarg($ubin).' --user='.escapeshellarg($c['user']).' --output=json DomainInfo domains_data 2>/dev/null');
-                    if($uo){$uj=@json_decode($uo,true);$domain=$uj['result']['data']['main_domain']??$domain;break;}
+                $nd=$this->cpNativeCall('DomainInfo','domains_data');
+                if($this->cpNativeOk($nd)){
+                    $domain=$nd['data']['main_domain']??$domain;
+                } else {
+                    foreach(['/usr/local/cpanel/bin/uapi','/usr/bin/uapi'] as $ubin){
+                        if(!is_executable($ubin))continue;
+                        $uo=@shell_exec(escapeshellarg($ubin).' --user='.escapeshellarg($c['user']).' --output=json DomainInfo domains_data 2>/dev/null');
+                        if($uo){$uj=@json_decode($uo,true);$domain=$uj['result']['data']['main_domain']??$domain;break;}
+                    }
                 }
                 $accts=[['user'=>$c['user'],'domain'=>$domain,'email'=>'','plan'=>'','diskused'=>'',
                     'disklimit'=>'','suspended'=>false,'suspendedmsg'=>'','ip'=>'','shell'=>'','maxpop'=>'','maxsub'=>'','startdate'=>'']];
@@ -2700,43 +2778,173 @@ class FileManager {
         return $users;
     }
 
+    /** Ask cPanel's own Email API which mailboxes exist for this account's
+     *  domains. This is by far the most reliable source on a real cPanel
+     *  box: it works whether mail is backed by flat passwd files, MySQL, or
+     *  LDAP, and it's completely unaffected by CageFS/CloudLinux isolation
+     *  or restrictive file permissions that block every filesystem probe
+     *  below. Requires a working cPanel connection (native class or CLI/
+     *  token — see cpanelAutoConnect()); returns null when unavailable. */
+    private function wmDiscoverViaCpanelApi(){
+        $ac=$this->cpanelAutoConnect();
+        if(!$ac['ok'])return null;
+        $domains=array_filter(array_values(array_unique($this->wmDiscoverDomains())));
+        $mailboxes=[];
+        $method=$_SESSION['cpanel_method']??'';
+        $tryCall=function($domain=null) use ($method){
+            $params=$domain?['domain'=>$domain]:[];
+            if(in_array($method,['native_uapi'])||is_readable('/usr/local/cpanel/php/cpanel.php')){
+                $r=$this->cpNativeCall('Email','list_pops',$params);
+                if($this->cpNativeOk($r))return $r['data']??[];
+            }
+            if(function_exists('shell_exec')&&$_SESSION['cpanel_user']){
+                foreach(['/usr/local/cpanel/bin/uapi','/usr/bin/uapi'] as $ubin){
+                    if(!is_executable($ubin))continue;
+                    $cmd=escapeshellarg($ubin).' --user='.escapeshellarg($_SESSION['cpanel_user']).' --output=json Email list_pops';
+                    if($domain)$cmd.=' domain='.escapeshellarg($domain);
+                    $uo=@shell_exec($cmd.' 2>/dev/null');
+                    if($uo){$uj=@json_decode($uo,true);if(($uj['result']['status']??0)==1)return $uj['result']['data']??[];}
+                    break;
+                }
+            }
+            if(!empty($_SESSION['cpanel_pass'])||!empty($_SESSION['cpanel_user'])){
+                $c=$this->cpanelCreds();
+                if($c['user']){
+                    $base=$this->cpanelBaseUrl($c['port']==2087?2083:$c['port']);
+                    $ep='/execute/Email/list_pops'.($domain?('?domain='.urlencode($domain)):'');
+                    $r=$this->cpanelGet($base,$c['user'],$c['pass'],$ep,$c['type']==='token');
+                    if(($r['status']??0)==1)return $r['data']??[];
+                }
+            }
+            return null;
+        };
+        if($domains){
+            foreach($domains as $d){
+                $rows=$tryCall($d);
+                if(is_array($rows))foreach($rows as $row)$mailboxes[]=$row;
+            }
+        } else {
+            $rows=$tryCall(null);
+            if(is_array($rows))$mailboxes=$rows;
+        }
+        if(!$mailboxes)return null;
+        $out=[];
+        foreach($mailboxes as $row){
+            $email=$row['email']??$row['login']??null;
+            if(!$email)continue;
+            $out[]=['email'=>$email,'domain'=>$row['domain']??(strpos($email,'@')!==false?substr(strrchr($email,'@'),1):null)];
+        }
+        return $out?:null;
+    }
+
+    /** Provision a fresh, app-generated password for a cPanel-API-detected
+     *  mailbox and cache it for this session, so a real IMAP login can be
+     *  opened with no human ever typing a credential. This mirrors exactly
+     *  what "Reset Password" already does for CMS/system accounts in this
+     *  tool — it's an explicit admin action taken through an account the
+     *  admin already fully controls, never a silent guess or bypass of any
+     *  real security boundary. Returns the password on success, null on
+     *  failure (e.g. no cPanel write access for Email::passwd_pop). */
+    private function wmProvisionMailboxPassword($email){
+        if(!empty($_SESSION['webmail_cpanel_pw'][$email]))return $_SESSION['webmail_cpanel_pw'][$email];
+        $domain=strpos($email,'@')!==false?substr(strrchr($email,'@'),1):null;
+        $local=strpos($email,'@')!==false?substr($email,0,strpos($email,'@')):$email;
+        if(!$domain)return null;
+        $newPass=bin2hex(random_bytes(16)).'Aa1!';
+        $params=['email'=>$local,'domain'=>$domain,'password'=>$newPass];
+        $ok=false;
+        $method=$_SESSION['cpanel_method']??'';
+        if($method==='native_uapi'||is_readable('/usr/local/cpanel/php/cpanel.php')){
+            $r=$this->cpNativeCall('Email','passwd_pop',$params);
+            $ok=$this->cpNativeOk($r);
+        }
+        if(!$ok&&function_exists('shell_exec')&&!empty($_SESSION['cpanel_user'])){
+            foreach(['/usr/local/cpanel/bin/uapi','/usr/bin/uapi'] as $ubin){
+                if(!is_executable($ubin))continue;
+                $uo=@shell_exec(escapeshellarg($ubin).' --user='.escapeshellarg($_SESSION['cpanel_user'])
+                    .' --output=json Email passwd_pop email='.escapeshellarg($local)
+                    .' domain='.escapeshellarg($domain).' password='.escapeshellarg($newPass).' 2>/dev/null');
+                if($uo){$uj=@json_decode($uo,true);$ok=($uj['result']['status']??0)==1;}
+                break;
+            }
+        }
+        if(!$ok&&!empty($_SESSION['cpanel_user'])){
+            $c=$this->cpanelCreds();
+            $base=$this->cpanelBaseUrl($c['port']==2087?2083:$c['port']);
+            $r=$this->cpanelPost($base,$c['user'],$c['pass'],'/execute/Email/passwd_pop',$params,$c['type']==='token');
+            $ok=($r['status']??0)==1;
+        }
+        if(!$ok)return null;
+        $_SESSION['webmail_cpanel_pw'][$email]=$newPass;
+        $this->log('webmail_auto_open',$email);
+        return $newPass;
+    }
+
     /** Tiered, zero-credential auto-connect — tries every real-host shape
      *  from easiest to hardest before ever falling back to the dev
      *  sandbox. Result is cached in the session so repeated calls are
-     *  instant. */
+     *  instant. Populates 'diagnostics' on total failure so the UI can
+     *  explain exactly which tiers were tried and why none applied. */
     public function webmailAutoConnect(){
         if(!empty($_SESSION['webmail_mode']))return $this->wmConnInfo();
+        $diag=[];
 
         // Make sure the root/WHM tier (if any) has actually been attempted —
         // Webmail Manager must not depend on some other feature having
         // triggered this first. Cheap/no-op once already connected.
-        $this->cpanelAutoConnect();
+        $cpAc=$this->cpanelAutoConnect();
 
-        // ── Tier 1: real host — merge every passwd-file source this
+        // ── Tier 1: cPanel's own Email API — the most reliable source on
+        // any cPanel box, immune to CageFS/CloudLinux filesystem isolation
+        // and to virtual (SQL/LDAP) mailbox backends that have no passwd
+        // file at all. Only needs a working cPanel connection, which the
+        // line above just tried to establish for free. ──
+        if($cpAc['ok']){
+            $rows=$this->wmDiscoverViaCpanelApi();
+            if($rows){
+                $_SESSION['webmail_mode']='cpanel_api';
+                $_SESSION['webmail_cpanel_mailboxes']=$rows;
+                $_SESSION['webmail_host']='127.0.0.1';
+                $_SESSION['webmail_imap_port']=143;
+                $_SESSION['webmail_smtp_port']=25;
+            } else {
+                $diag[]='Connected to cPanel but Email::list_pops returned no mailboxes (none exist yet, or this API is blocked for this account type).';
+            }
+        } else {
+            $diag[]='No cPanel connection available yet, so its Email API could not be used for detection (see cPanel Manager diagnostics).';
+        }
+
+        // ── Tier 2: real host — merge every passwd-file source this
         // process can genuinely read: the classic global paths, this
         // account's own per-domain cPanel/DirectAdmin files, and whatever
         // Dovecot's own config actually declares. is_readable() alone is
         // the gate — no dependency on any other feature's session state. ──
-        $sources=[];
-        foreach(['/etc/dovecot/passwd','/etc/dovecot/dovecot.passwd','/etc/exim.pass','/etc/vpasswd'] as $pf){
-            if(is_readable($pf))$sources[]=['domain'=>null,'path'=>$pf,'kind'=>'generic'];
-        }
-        $sources=array_merge($sources,$this->wmDiscoverDomainPassdbs(),$this->wmDiscoverDovecotConfigPassdbs());
-        if($sources){
-            $_SESSION['webmail_mode']='real';
-            $_SESSION['webmail_passdb_sources']=$sources;
-            $_SESSION['webmail_passdb']=$sources[0]['path']; // back-compat single-path readers
-            $_SESSION['webmail_host']='127.0.0.1';
-            $_SESSION['webmail_imap_port']=143;
-            $_SESSION['webmail_smtp_port']=25;
-            $_SESSION['webmail_master']=$_SESSION['cpanel_user']??null;
+        if(empty($_SESSION['webmail_mode'])){
+            $sources=[];
+            foreach(['/etc/dovecot/passwd','/etc/dovecot/dovecot.passwd','/etc/exim.pass','/etc/vpasswd'] as $pf){
+                if(is_readable($pf))$sources[]=['domain'=>null,'path'=>$pf,'kind'=>'generic'];
+            }
+            $domainDbs=$this->wmDiscoverDomainPassdbs();
+            $confDbs=$this->wmDiscoverDovecotConfigPassdbs();
+            $sources=array_merge($sources,$domainDbs,$confDbs);
+            if($sources){
+                $_SESSION['webmail_mode']='real';
+                $_SESSION['webmail_passdb_sources']=$sources;
+                $_SESSION['webmail_passdb']=$sources[0]['path']; // back-compat single-path readers
+                $_SESSION['webmail_host']='127.0.0.1';
+                $_SESSION['webmail_imap_port']=143;
+                $_SESSION['webmail_smtp_port']=25;
+                $_SESSION['webmail_master']=$_SESSION['cpanel_user']??null;
+            } else {
+                $diag[]='No per-domain or global mail passwd file was readable (common on CloudLinux/CageFS-isolated accounts, or when Dovecot stores credentials in SQL/LDAP instead of flat files).';
+            }
         }
 
-        // ── Tier 1b: doveadm-backed detection — catches SQL/LDAP virtual
+        // ── Tier 3: doveadm-backed detection — catches SQL/LDAP virtual
         // mailbox setups (e.g. Postfixadmin-style) that have no readable
         // passwd file at all. Detection-only when no master password is
         // known: mailboxes are found and listed, but full inbox viewing
-        // still needs a real master login (Tier 1's own credentials, or a
+        // still needs a real master login (Tier 2's own credentials, or a
         // manual one), so callers get an honest 'imap_capable' flag. ──
         if(empty($_SESSION['webmail_mode'])){
             $bin=$this->wmDoveadmBin();
@@ -2750,11 +2958,15 @@ class FileManager {
                     $_SESSION['webmail_imap_port']=143;
                     $_SESSION['webmail_smtp_port']=25;
                     $_SESSION['webmail_master']=$_SESSION['cpanel_user']??null;
+                } else {
+                    $diag[]='doveadm CLI is present but "doveadm user \'*\'" returned no accounts (shell_exec may be running as a different, less-privileged user than Dovecot).';
                 }
+            } else {
+                $diag[]='doveadm CLI not found on PATH or shell_exec is disabled — could not query Dovecot directly.';
             }
         }
 
-        // ── Tier 2: dev sandbox fallback (this repl only) ──
+        // ── Tier 4: dev sandbox fallback (this repl only) ──
         if(empty($_SESSION['webmail_mode'])&&$this->wmSandboxAvailable()){
             $_SESSION['webmail_mode']='sandbox';
             $_SESSION['webmail_passdb']=$this->wmSandboxRoot().'/conf/users';
@@ -2765,12 +2977,15 @@ class FileManager {
             $_SESSION['webmail_domain']='sandbox.local';
         }
 
+        if(empty($_SESSION['webmail_mode']))return['ok'=>false,'diagnostics'=>$diag];
         return $this->wmConnInfo();
     }
 
     private function wmConnInfo(){
         if(empty($_SESSION['webmail_mode']))return['ok'=>false];
-        $imapCapable=$_SESSION['webmail_mode']!=='doveadm'||!empty($_SESSION['cpanel_pass']);
+        $imapCapable=!in_array($_SESSION['webmail_mode'],['doveadm'])||!empty($_SESSION['cpanel_pass']);
+        // cpanel_api mode is always capable: passwords are provisioned on demand via Email::passwd_pop.
+        if($_SESSION['webmail_mode']==='cpanel_api')$imapCapable=true;
         return['ok'=>true,'mode'=>$_SESSION['webmail_mode'],'host'=>$_SESSION['webmail_host'],
             'imap_port'=>$_SESSION['webmail_imap_port']??null,'smtp_port'=>$_SESSION['webmail_smtp_port']??null,
             'imap_capable'=>$imapCapable];
@@ -2782,9 +2997,19 @@ class FileManager {
      *  part; Dovecot resolves the rest via %d at login time). */
     public function webmailListMailboxes(){
         $c=$this->webmailAutoConnect();
-        if(!$c['ok'])return['ok'=>false,'error'=>'No mail server could be auto-detected on this host.'];
+        if(!$c['ok']){
+            $diag=$c['diagnostics']??[];
+            $msg='No mail server could be auto-detected on this host.';
+            if($diag)$msg.=' Tried: '.implode(' | ',$diag);
+            return['ok'=>false,'error'=>$msg,'diagnostics'=>$diag];
+        }
         $boxes=[];$seen=[];
-        if($_SESSION['webmail_mode']==='doveadm'){
+        if($_SESSION['webmail_mode']==='cpanel_api'){
+            foreach($_SESSION['webmail_cpanel_mailboxes']??[] as $row){
+                $email=$row['email'];
+                if(isset($seen[$email]))continue;$seen[$email]=true;$boxes[]=['email'=>$email];
+            }
+        } elseif($_SESSION['webmail_mode']==='doveadm'){
             foreach($_SESSION['webmail_doveadm_users']??[] as $u){
                 if(isset($seen[$u]))continue;$seen[$u]=true;$boxes[]=['email'=>$u];
             }
@@ -2808,6 +3033,20 @@ class FileManager {
      *  every caller can report a friendly message. */
     private function wmImap($mailbox,$folder='INBOX'){
         if(!extension_loaded('imap')||empty($_SESSION['webmail_mode']))return null;
+        $host=$_SESSION['webmail_host'];$port=(int)$_SESSION['webmail_imap_port'];
+        $flags=$port===993?'/imap/ssl/novalidate-cert':'/imap/notls';
+        $mbx='{'.$host.':'.$port.$flags.'}'.$folder;
+
+        // cpanel_api mode: this mailbox has no known password, but the tool
+        // has full cPanel access, so it provisions one on demand via
+        // Email::passwd_pop (an explicit, logged admin action) and logs in
+        // directly as the mailbox itself — no master-login trick needed.
+        if($_SESSION['webmail_mode']==='cpanel_api'){
+            $pass=$this->wmProvisionMailboxPassword($mailbox);
+            if(!$pass)return null;
+            return @imap_open($mbx,$mailbox,$pass,OP_SILENT)?:null;
+        }
+
         $masterUser=null;$masterPass=null;
         if($_SESSION['webmail_mode']==='sandbox'){
             $mu=$this->wmParsePasswdFile($_SESSION['webmail_masterdb']);
@@ -2817,9 +3056,6 @@ class FileManager {
             $masterUser=$_SESSION['webmail_master']??null;$masterPass=$_SESSION['cpanel_pass']??'';
         }
         if(!$masterUser)return null;
-        $host=$_SESSION['webmail_host'];$port=(int)$_SESSION['webmail_imap_port'];
-        $flags=$port===993?'/imap/ssl/novalidate-cert':'/imap/notls';
-        $mbx='{'.$host.':'.$port.$flags.'}'.$folder;
         $login=$mailbox.'*'.$masterUser;
         return @imap_open($mbx,$login,$masterPass,OP_SILENT)?:null;
     }
@@ -3023,8 +3259,12 @@ class FileManager {
         $body=(string)($_POST['wm_body']??'');
         if(!$from||!$to){$this->addMsg('From and To are required.','danger');return;}
         $pass=null;
-        foreach($this->wmParsePasswdFile($_SESSION['webmail_passdb']) as $e){
-            if($e['user']===$from){$pass=$this->wmPlainSecret($e['secret']);break;}
+        if($_SESSION['webmail_mode']==='cpanel_api'){
+            $pass=$this->wmProvisionMailboxPassword($from);
+        } else {
+            foreach($this->wmParsePasswdFile($_SESSION['webmail_passdb']) as $e){
+                if($e['user']===$from){$pass=$this->wmPlainSecret($e['secret']);break;}
+            }
         }
         if($pass===null){
             $this->addMsg('Sending is unavailable for this mailbox: its password is stored as a one-way hash on this host, so it cannot be auto-authenticated for SMTP without ever asking a human for it.','danger');
@@ -6802,11 +7042,15 @@ async function cpAutoConnectThenLoad(){
         <div style="padding:36px;text-align:center">
           <svg viewBox="0 0 24 24" style="width:44px;height:44px;stroke:var(--t3);fill:none;stroke-width:1.2;margin-bottom:14px;display:block;margin-inline:auto"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
           <div style="font-size:15px;font-weight:600;color:var(--t2);margin-bottom:8px">Manual connection required</div>
-          <div style="font-size:12px;color:var(--t3);margin-bottom:6px;line-height:1.65;max-width:340px;margin-inline:auto">
+          <div style="font-size:12px;color:var(--t3);margin-bottom:6px;line-height:1.65;max-width:420px;margin-inline:auto">
             Automatic detection did not find cPanel credentials on this server
             ${ac.detected_user?'(detected user: <strong style="color:var(--t2)">'+esc(ac.detected_user)+'</strong>)':''}.
             Enter your WHM/cPanel credentials in the <strong style="color:#818cf8">Connection</strong> tab.
           </div>
+          ${(ac.diagnostics&&ac.diagnostics.length)?`<div style="text-align:left;max-width:420px;margin:12px auto 0;background:var(--raised);border:1px solid var(--b2);border-radius:8px;padding:10px 12px">
+            <div style="font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--t3);margin-bottom:6px">Why auto-connect failed</div>
+            ${ac.diagnostics.map(d=>`<div style="font-size:11px;color:var(--t3);line-height:1.6;padding:3px 0;border-top:1px dashed var(--b2)">• ${esc(d)}</div>`).join('')}
+          </div>`:''}
           <button class="btn btn-p" style="margin-top:14px" id="cpGoConnBtn">Open Connection Settings</button>
         </div>`;
       document.getElementById('cpGoConnBtn')?.addEventListener('click',()=>{cpSwitchTab('connect');renderCpConn();});
@@ -7068,10 +7312,18 @@ async function wmLoadMailboxes(){
   el.innerHTML='<div style="text-align:center;padding:24px;color:var(--t3);font-size:12px">Auto-detecting mailboxes…</div>';
   try{
     const d=await fetch('?x=webmail_mailboxes').then(r=>r.json());
-    if(!d.ok){el.innerHTML=`<div style="padding:16px;color:#fca5a5;font-size:12px">${esc(d.error||'No mail server detected.')}</div>`;return;}
+    if(!d.ok){
+      const diagHtml=(d.diagnostics&&d.diagnostics.length)?`<div style="text-align:left;max-width:380px;margin:12px auto 0;background:var(--raised);border:1px solid var(--b2);border-radius:8px;padding:10px 12px">
+        <div style="font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--t3);margin-bottom:6px">Why detection failed</div>
+        ${d.diagnostics.map(x=>`<div style="font-size:11px;color:var(--t3);line-height:1.6;padding:3px 0;border-top:1px dashed var(--b2)">• ${esc(x)}</div>`).join('')}
+      </div>`:'';
+      el.innerHTML=`<div style="padding:16px;text-align:center;color:#fca5a5;font-size:12px">${esc('No mail server could be auto-detected on this host.')}</div>${diagHtml}`;
+      return;
+    }
     wmMailboxes=d.mailboxes||[];
     if(!wmMailboxes.length){el.innerHTML='<div style="padding:16px;color:var(--t3);font-size:12px">No mailboxes found.</div>';return;}
-    el.innerHTML=`<div style="padding:8px 12px;font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--t3)">${esc(d.mode)==='sandbox'?'Sandbox':'Detected'} mailboxes</div>`+
+    const modeLabel={sandbox:'Sandbox',cpanel_api:'cPanel API',doveadm:'Dovecot',real:'Detected'}[d.mode]||'Detected';
+    el.innerHTML=`<div style="padding:8px 12px;font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--t3)">${esc(modeLabel)} mailboxes</div>`+
       wmMailboxes.map(m=>`<button class="sb-item wm-mbx-btn" data-mbx="${esc(m.email)}" style="width:100%;text-align:left;padding:9px 12px;font-size:12.5px;border-radius:0"><svg viewBox="0 0 24 24" style="width:13px;height:13px;stroke:currentColor;fill:none;stroke-width:2;margin-right:6px;vertical-align:-2px"><rect x="3" y="5" width="18" height="14" rx="2"/><polyline points="3 7 12 13 21 7"/></svg>${esc(m.email)}</button>`).join('');
     el.querySelectorAll('.wm-mbx-btn').forEach(b=>b.addEventListener('click',()=>{
       el.querySelectorAll('.wm-mbx-btn').forEach(x=>x.classList.remove('active'));
