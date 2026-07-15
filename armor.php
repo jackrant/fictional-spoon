@@ -1204,7 +1204,7 @@ class FileManager {
         if($_SERVER['REQUEST_METHOD']!=='POST')return;
         if(!isset($_POST['csrf_token'])||$_POST['csrf_token']!==$_SESSION['csrf_token']){$this->addMsg('Security error.','danger');return;}
         $a=isset($_POST['action'])?$_POST['action']:'';
-        $wA=['upload','create_folder','create_file','delete','rename','save_edit','bypass_perms','bulk_delete','bulk_copy','bulk_move','zip_create','zip_extract','restore_trash','trash_perm','trash_empty','duplicate','tar_create','tar_extract','clear_log','batch_rename','create_symlink','chmod_item','create_share','revoke_share','backup_dir','clear_errlog','delete_abs','bulk_chmod','set_tag','remove_tag','remote_download','ssh_install','ssh_create_user','ssh_delete_user','ssh_update_user','cms_create_user','cms_delete_user','cms_update_role','cms_change_pass','webmail_send','webmail_delete','webmail_mark'];
+        $wA=['upload','create_folder','create_file','delete','rename','save_edit','bypass_perms','bulk_delete','bulk_copy','bulk_move','zip_create','zip_extract','restore_trash','trash_perm','trash_empty','duplicate','tar_create','tar_extract','clear_log','batch_rename','create_symlink','chmod_item','create_share','revoke_share','backup_dir','clear_errlog','delete_abs','bulk_chmod','set_tag','remove_tag','remote_download','ssh_install','ssh_create_user','ssh_delete_user','ssh_update_user','cms_create_user','cms_delete_user','cms_update_role','cms_change_pass','cms_toggle_plugin','cms_delete_plugin','cms_switch_theme','cms_delete_theme','cms_toggle_extension','cms_maintenance_toggle','webmail_send','webmail_delete','webmail_mark'];
         if($this->readonly&&in_array($a,$wA)){$this->addMsg('Read-only account.','danger');return;}
         switch($a){
             case 'upload':         $this->upload();break;
@@ -1249,6 +1249,12 @@ class FileManager {
             case 'cms_delete_user':$this->cmsDeleteUser();break;
             case 'cms_update_role':$this->cmsUpdateRole();break;
             case 'cms_change_pass':$this->cmsChangePass();break;
+            case 'cms_toggle_plugin':   $this->cmsTogglePlugin();break;
+            case 'cms_delete_plugin':   $this->cmsDeletePlugin();break;
+            case 'cms_switch_theme':    $this->cmsSwitchTheme();break;
+            case 'cms_delete_theme':    $this->cmsDeleteTheme();break;
+            case 'cms_toggle_extension':$this->cmsToggleExtension();break;
+            case 'cms_maintenance_toggle':$this->cmsMaintenanceToggle();break;
             case 'cpanel_save_creds':   $this->cpanelSaveCreds();break;
             case 'cpanel_create':       $this->cpanelCreateAccount();break;
             case 'cpanel_change_pass':  $this->cpanelChangePass();break;
@@ -2187,6 +2193,302 @@ class FileManager {
         $this->cmsVaultSet($configPath,$id,$pass);
         $this->addMsg('Password changed.','success');$this->log('cms_change_pass',"#$id");
     }
+
+    /* ── CMS Plugins/Themes (WordPress) & Extensions (Joomla) ────────────────
+       WordPress: plugins are PHP files under wp-content/plugins (each starting
+       with a "Plugin Name:" header comment); the active set is a serialized
+       array stored in wp_options.active_plugins. Themes live under
+       wp-content/themes (each with a style.css header); the active one is
+       wp_options.template/stylesheet. Joomla stores every extension
+       (component/module/plugin/template) as one row in #__extensions with a
+       plain 0/1 "enabled" column - no serialization, no file header parsing
+       needed, which is also why Joomla only gets enable/disable here and not
+       delete: unlike WP's flat plugin-folder convention, safely removing a
+       Joomla extension means running its own uninstall SQL (menu items,
+       category data, etc.) which varies per-extension and isn't something a
+       generic tool can do reliably - so deletion is intentionally left to
+       Joomla's own installer (reachable via "Login as" a Super User). */
+    private function cmsParseHeader($content,$keys){
+        $out=[];
+        if(!$content)return $out;
+        foreach($keys as $k=>$label){
+            if(preg_match('/^[ \t\/*#@]*'.$label.':(.*)$/mi',$content,$m))$out[$k]=trim($m[1]);
+        }
+        return $out;
+    }
+    public function cmsExtensions($configPath){
+        list($link,$c,$err)=$this->cmsConnect($configPath);
+        if($err)return['error'=>$err];
+        $root=dirname($configPath);
+        if($c['type']==='wordpress'){
+            $t=$c['prefix'];
+            $active=[];
+            $res=@mysqli_query($link,"SELECT option_value FROM `{$t}options` WHERE option_name='active_plugins' LIMIT 1");
+            if($res&&($r=mysqli_fetch_assoc($res))){$u=@unserialize($r['option_value']);if(is_array($u))$active=$u;}
+            $plugDir=$root.'/wp-content/plugins';
+            $plugins=[];
+            if(is_dir($plugDir)){
+                foreach(scandir($plugDir) as $e){
+                    if($e==='.'||$e==='..')continue;
+                    $full=$plugDir.'/'.$e;
+                    if(is_dir($full)){
+                        $mainFiles=glob($full.'/*.php')?:[];
+                        foreach($mainFiles as $pf){
+                            $head=@file_get_contents($pf,false,null,0,8192);
+                            if($head&&stripos($head,'Plugin Name:')!==false){
+                                $hdr=$this->cmsParseHeader($head,['name'=>'Plugin Name','version'=>'Version','description'=>'Description']);
+                                $rel=$e.'/'.basename($pf);
+                                $plugins[]=['file'=>$rel,'name'=>$hdr['name']?:$e,'version'=>$hdr['version']?:'','description'=>$hdr['description']?:'','active'=>in_array($rel,$active)];
+                                break;
+                            }
+                        }
+                    } elseif(is_file($full)&&substr($e,-4)==='.php'){
+                        $head=@file_get_contents($full,false,null,0,8192);
+                        if($head&&stripos($head,'Plugin Name:')!==false){
+                            $hdr=$this->cmsParseHeader($head,['name'=>'Plugin Name','version'=>'Version','description'=>'Description']);
+                            $plugins[]=['file'=>$e,'name'=>$hdr['name']?:$e,'version'=>$hdr['version']?:'','description'=>$hdr['description']?:'','active'=>in_array($e,$active)];
+                        }
+                    }
+                }
+            }
+            usort($plugins,fn($a,$b)=>strcasecmp($a['name'],$b['name']));
+            $curStyle=null;
+            $res=@mysqli_query($link,"SELECT option_value FROM `{$t}options` WHERE option_name='stylesheet' LIMIT 1");
+            if($res&&($r=mysqli_fetch_assoc($res)))$curStyle=$r['option_value'];
+            $themeDir=$root.'/wp-content/themes';
+            $themes=[];
+            if(is_dir($themeDir)){
+                foreach(scandir($themeDir) as $e){
+                    if($e==='.'||$e==='..')continue;
+                    $css=$themeDir.'/'.$e.'/style.css';
+                    if(is_file($css)){
+                        $head=@file_get_contents($css,false,null,0,8192);
+                        $hdr=$this->cmsParseHeader($head,['name'=>'Theme Name','version'=>'Version']);
+                        $themes[]=['slug'=>$e,'name'=>$hdr['name']?:$e,'version'=>$hdr['version']?:'','active'=>($e===$curStyle)];
+                    }
+                }
+            }
+            usort($themes,fn($a,$b)=>strcasecmp($a['name'],$b['name']));
+            mysqli_close($link);
+            return['type'=>'wordpress','plugins'=>$plugins,'themes'=>$themes];
+        } else {
+            $t=$c['prefix'];
+            $res=@mysqli_query($link,"SELECT extension_id,name,type,element,client_id,enabled,protected FROM `{$t}extensions` WHERE type IN ('component','module','plugin','template') ORDER BY type,name");
+            if(!$res){$e=mysqli_error($link);mysqli_close($link);return['error'=>'Query failed: '.$e];}
+            $rows=[];
+            while($r=mysqli_fetch_assoc($res))$rows[]=['id'=>(int)$r['extension_id'],'name'=>$r['name'],'type'=>$r['type'],'element'=>$r['element'],'client'=>$r['client_id']?'admin':'site','enabled'=>(bool)$r['enabled'],'protected'=>(bool)$r['protected']];
+            mysqli_close($link);
+            return['type'=>'joomla','extensions'=>$rows];
+        }
+    }
+    private function cmsTogglePlugin(){
+        if(empty($_SESSION['fm_admin'])){$this->addMsg('Admins only.','danger');return;}
+        $configPath=$this->cmsCfgFromPost();
+        $file=isset($_POST['plugin_file'])?$_POST['plugin_file']:'';
+        $activate=!empty($_POST['activate'])&&$_POST['activate']!=='0';
+        if(!$file||strpos($file,'..')!==false){$this->addMsg('Invalid plugin.','danger');return;}
+        list($link,$c,$err)=$this->cmsConnect($configPath);
+        if($err){$this->addMsg($err,'danger');return;}
+        if($c['type']!=='wordpress'){mysqli_close($link);$this->addMsg('Not a WordPress site.','danger');return;}
+        $t=$c['prefix'];
+        $active=[];
+        $res=@mysqli_query($link,"SELECT option_value FROM `{$t}options` WHERE option_name='active_plugins' LIMIT 1");
+        $exists=$res&&mysqli_num_rows($res)>0;
+        if($exists&&($r=mysqli_fetch_assoc($res))){$u=@unserialize($r['option_value']);if(is_array($u))$active=$u;}
+        if($activate&&!in_array($file,$active))$active[]=$file;
+        if(!$activate)$active=array_values(array_diff($active,[$file]));
+        $ser=mysqli_real_escape_string($link,serialize(array_values($active)));
+        if($exists)mysqli_query($link,"UPDATE `{$t}options` SET option_value='$ser' WHERE option_name='active_plugins'");
+        else mysqli_query($link,"INSERT INTO `{$t}options` (option_name,option_value,autoload) VALUES ('active_plugins','$ser','yes')");
+        mysqli_close($link);
+        $this->addMsg('Plugin "'.basename($file).'" '.($activate?'activated':'deactivated').'.',$activate?'success':'warning');
+        $this->log('cms_toggle_plugin',$file.':'.($activate?'on':'off'));
+    }
+    private function cmsDeletePlugin(){
+        if(empty($_SESSION['fm_admin'])){$this->addMsg('Admins only.','danger');return;}
+        $configPath=$this->cmsCfgFromPost();
+        $file=isset($_POST['plugin_file'])?$_POST['plugin_file']:'';
+        if(!$file||strpos($file,'..')!==false){$this->addMsg('Invalid plugin.','danger');return;}
+        $root=dirname($configPath);
+        $plugDir=realpath($root.'/wp-content/plugins');
+        if(!$plugDir){$this->addMsg('Plugins folder not found.','danger');return;}
+        $folder=explode('/',$file)[0];
+        $target=realpath($plugDir.'/'.$folder);
+        if(!$target||(strpos($target,$plugDir.'/')!==0&&$target!==$plugDir)){$this->addMsg('Invalid plugin path.','danger');return;}
+        list($link,$c,$err)=$this->cmsConnect($configPath);
+        if(!$err&&$c['type']==='wordpress'){
+            $t=$c['prefix'];
+            $res=@mysqli_query($link,"SELECT option_value FROM `{$t}options` WHERE option_name='active_plugins' LIMIT 1");
+            $active=[];if($res&&($r=mysqli_fetch_assoc($res))){$u=@unserialize($r['option_value']);if(is_array($u))$active=$u;}
+            mysqli_close($link);
+            if(in_array($file,$active)){$this->addMsg('Deactivate the plugin before deleting it.','danger');return;}
+        }
+        $ok=$this->rmdirR($target);
+        if($ok){$this->addMsg('Plugin deleted.','warning');$this->log('cms_delete_plugin',$file);}
+        else $this->addMsg('Delete failed (check file permissions).','danger');
+    }
+    private function cmsSwitchTheme(){
+        if(empty($_SESSION['fm_admin'])){$this->addMsg('Admins only.','danger');return;}
+        $configPath=$this->cmsCfgFromPost();
+        $slug=isset($_POST['theme_slug'])?$_POST['theme_slug']:'';
+        if(!$slug||strpos($slug,'/')!==false||strpos($slug,'..')!==false){$this->addMsg('Invalid theme.','danger');return;}
+        list($link,$c,$err)=$this->cmsConnect($configPath);
+        if($err){$this->addMsg($err,'danger');return;}
+        if($c['type']!=='wordpress'){mysqli_close($link);$this->addMsg('Not a WordPress site.','danger');return;}
+        $root=dirname($configPath);
+        $css=$root.'/wp-content/themes/'.$slug.'/style.css';
+        if(!is_file($css)){mysqli_close($link);$this->addMsg('Theme not found.','danger');return;}
+        $head=@file_get_contents($css,false,null,0,8192);
+        $hdr=$this->cmsParseHeader($head,['template'=>'Template']);
+        $template=$hdr['template']?:$slug; // child themes declare their parent folder via "Template:"
+        $t=$c['prefix'];
+        $slugE=mysqli_real_escape_string($link,$slug);$tplE=mysqli_real_escape_string($link,$template);
+        mysqli_query($link,"UPDATE `{$t}options` SET option_value='$slugE' WHERE option_name='stylesheet'");
+        mysqli_query($link,"UPDATE `{$t}options` SET option_value='$tplE' WHERE option_name='template'");
+        mysqli_close($link);
+        $this->addMsg('Active theme switched to "'.$slug.'".','success');
+        $this->log('cms_switch_theme',$slug);
+    }
+    private function cmsDeleteTheme(){
+        if(empty($_SESSION['fm_admin'])){$this->addMsg('Admins only.','danger');return;}
+        $configPath=$this->cmsCfgFromPost();
+        $slug=isset($_POST['theme_slug'])?$_POST['theme_slug']:'';
+        if(!$slug||strpos($slug,'/')!==false||strpos($slug,'..')!==false){$this->addMsg('Invalid theme.','danger');return;}
+        list($link,$c,$err)=$this->cmsConnect($configPath);
+        if($err){$this->addMsg($err,'danger');return;}
+        if($c['type']!=='wordpress'){mysqli_close($link);$this->addMsg('Not a WordPress site.','danger');return;}
+        $t=$c['prefix'];
+        $res=@mysqli_query($link,"SELECT option_value FROM `{$t}options` WHERE option_name='stylesheet' LIMIT 1");
+        $cur=($res&&($r=mysqli_fetch_assoc($res)))?$r['option_value']:null;
+        mysqli_close($link);
+        if($cur===$slug){$this->addMsg('Switch to a different active theme before deleting this one.','danger');return;}
+        $root=dirname($configPath);
+        $themeDir=realpath($root.'/wp-content/themes');
+        if(!$themeDir){$this->addMsg('Themes folder not found.','danger');return;}
+        $target=realpath($themeDir.'/'.$slug);
+        if(!$target||strpos($target,$themeDir.'/')!==0){$this->addMsg('Invalid theme path.','danger');return;}
+        $ok=$this->rmdirR($target);
+        if($ok){$this->addMsg('Theme deleted.','warning');$this->log('cms_delete_theme',$slug);}
+        else $this->addMsg('Delete failed (check file permissions).','danger');
+    }
+    private function cmsToggleExtension(){
+        if(empty($_SESSION['fm_admin'])){$this->addMsg('Admins only.','danger');return;}
+        $configPath=$this->cmsCfgFromPost();
+        $id=(int)(isset($_POST['ext_id'])?$_POST['ext_id']:0);
+        $enable=!empty($_POST['enable'])&&$_POST['enable']!=='0';
+        if(!$id){$this->addMsg('Invalid extension.','danger');return;}
+        list($link,$c,$err)=$this->cmsConnect($configPath);
+        if($err){$this->addMsg($err,'danger');return;}
+        if($c['type']!=='joomla'){mysqli_close($link);$this->addMsg('Not a Joomla site.','danger');return;}
+        $t=$c['prefix'];
+        $res=@mysqli_query($link,"SELECT protected,name FROM `{$t}extensions` WHERE extension_id=$id LIMIT 1");
+        $row=$res?mysqli_fetch_assoc($res):null;
+        if(!$row){mysqli_close($link);$this->addMsg('Extension not found.','danger');return;}
+        if($row['protected']&&!$enable){mysqli_close($link);$this->addMsg('This is a protected core extension and cannot be disabled.','danger');return;}
+        mysqli_query($link,"UPDATE `{$t}extensions` SET enabled=".($enable?1:0)." WHERE extension_id=$id");
+        mysqli_close($link);
+        $this->addMsg('Extension "'.$row['name'].'" '.($enable?'enabled':'disabled').'.',$enable?'success':'warning');
+        $this->log('cms_toggle_extension',$id.':'.($enable?'on':'off'));
+    }
+
+    /* ── Maintenance mode ─────────────────────────────────────────────────────
+       WordPress core's own ".maintenance" file trick only holds for 10 minutes
+       (it's meant for core auto-updates, not deliberate site-down toggles), so
+       instead this drops a tiny must-use plugin (auto-loaded by WP with zero
+       activation step) that gates every front-end request on a plain
+       wp_options flag - which stays on indefinitely until switched off here,
+       and always still lets logged-in admins and wp-admin itself through.
+       Joomla already has a real, permanent offline flag baked into
+       configuration.php ($offline / $offline_message) that core checks on
+       every request, so that one is just edited directly. */
+    public function cmsMaintenanceStatus($configPath){
+        list($link,$c,$err)=$this->cmsConnect($configPath);
+        if($err)return['error'=>$err];
+        if($c['type']==='wordpress'){
+            $t=$c['prefix'];$on=false;$msg='';
+            $res=@mysqli_query($link,"SELECT option_value FROM `{$t}options` WHERE option_name='fm_maintenance_mode' LIMIT 1");
+            if($res&&($r=mysqli_fetch_assoc($res)))$on=$r['option_value']==='1';
+            $res=@mysqli_query($link,"SELECT option_value FROM `{$t}options` WHERE option_name='fm_maintenance_message' LIMIT 1");
+            if($res&&($r=mysqli_fetch_assoc($res)))$msg=$r['option_value'];
+            mysqli_close($link);
+            return['type'=>'wordpress','active'=>$on,'message'=>$msg];
+        }
+        mysqli_close($link);
+        $src=@file_get_contents($configPath);$on=false;$msg='';
+        if($src){
+            /* Joomla's own installer writes $offline as a quoted '0'/'1' string, but some
+               configs (including boolean-style ones) use bare true/false instead - accept
+               either so detection never silently reports the wrong state. */
+            if(preg_match('/public\s+\$offline\s*=\s*(?:[\'"](1|true)[\'"]|(true))\s*;/i',$src,$m))$on=true;
+            elseif(preg_match('/public\s+\$offline\s*=\s*(?:[\'"](0|false)[\'"]|(false))\s*;/i',$src,$m))$on=false;
+            if(preg_match('/public\s+\$offline_message\s*=\s*[\'"](.*?)[\'"]\s*;/s',$src,$m))$msg=stripslashes($m[1]);
+        }
+        return['type'=>'joomla','active'=>$on,'message'=>$msg];
+    }
+    private function cmsMaintenanceToggle(){
+        if(empty($_SESSION['fm_admin'])){$this->addMsg('Admins only.','danger');return;}
+        $configPath=$this->cmsCfgFromPost();
+        $enable=!empty($_POST['enable'])&&$_POST['enable']!=='0';
+        $msg=trim(isset($_POST['message'])?$_POST['message']:'');
+        list($link,$c,$err)=$this->cmsConnect($configPath);
+        if($err){$this->addMsg($err,'danger');return;}
+        if($c['type']==='wordpress'){
+            $t=$c['prefix'];
+            if($enable){
+                $muDir=dirname($configPath).'/wp-content/mu-plugins';
+                if(!is_dir($muDir))@mkdir($muDir,0755,true);
+                $muFile=$muDir.'/000-fm-maintenance.php';
+                if(is_dir($muDir)&&!is_file($muFile)){
+                    $code="<?php\n/* Plugin Name: File Manager Maintenance Mode (auto-generated) */\n"
+                         ."if(!defined('ABSPATH'))exit;\n"
+                         ."add_action('init',function(){\n"
+                         ."    if(is_admin())return;\n"
+                         ."    if(function_exists('current_user_can')&&current_user_can('manage_options'))return;\n"
+                         ."    if(get_option('fm_maintenance_mode')){\n"
+                         ."        if(function_exists('nocache_headers'))nocache_headers();\n"
+                         ."        header('Retry-After: 3600');\n"
+                         ."        wp_die(get_option('fm_maintenance_message')?:'We are currently performing scheduled maintenance. Please check back soon.','Maintenance',array('response'=>503));\n"
+                         ."    }\n"
+                         ."},0);\n";
+                    @file_put_contents($muFile,$code);
+                }
+            }
+            $ev=$enable?'1':'0';
+            $me=$msg?:'We are currently performing scheduled maintenance. Please check back soon.';
+            $evE=mysqli_real_escape_string($link,$ev);$meE=mysqli_real_escape_string($link,$me);
+            $res=@mysqli_query($link,"SELECT option_value FROM `{$t}options` WHERE option_name='fm_maintenance_mode' LIMIT 1");
+            if($res&&mysqli_num_rows($res)>0)mysqli_query($link,"UPDATE `{$t}options` SET option_value='$evE' WHERE option_name='fm_maintenance_mode'");
+            else mysqli_query($link,"INSERT INTO `{$t}options` (option_name,option_value,autoload) VALUES ('fm_maintenance_mode','$evE','yes')");
+            $res=@mysqli_query($link,"SELECT option_value FROM `{$t}options` WHERE option_name='fm_maintenance_message' LIMIT 1");
+            if($res&&mysqli_num_rows($res)>0)mysqli_query($link,"UPDATE `{$t}options` SET option_value='$meE' WHERE option_name='fm_maintenance_message'");
+            else mysqli_query($link,"INSERT INTO `{$t}options` (option_name,option_value,autoload) VALUES ('fm_maintenance_message','$meE','yes')");
+            mysqli_close($link);
+            $this->addMsg('Maintenance mode '.($enable?'enabled':'disabled').' for this WordPress site.',$enable?'warning':'success');
+            $this->log('cms_maintenance','wordpress '.($enable?'on':'off'));
+            return;
+        }
+        mysqli_close($link);
+        $src=@file_get_contents($configPath);
+        if($src===false){$this->addMsg('Could not read configuration.php.','danger');return;}
+        $val=$enable?'1':'0';
+        $safeMsg=addslashes($msg?:'This site is currently offline for maintenance.');
+        /* $offline may be written as a quoted '0'/'1' string OR a bare true/false boolean
+           depending on how the config was generated - match either form so we always
+           replace the real declaration in place instead of appending a duplicate
+           (a duplicate "public $offline" property declaration is a PHP fatal error). */
+        $offlineRe='/public\s+\$offline\s*=\s*(?:[\'"](?:0|1)[\'"]|true|false)\s*;/i';
+        $src=preg_match($offlineRe,$src)
+            ?preg_replace($offlineRe,"public \$offline = '$val';",$src,1)
+            :preg_replace('/(class\s+JConfig\s*\{)/',"$1\n\tpublic \$offline = '$val';",$src,1);
+        $src=preg_match('/public\s+\$offline_message\s*=\s*[\'"].*?[\'"]\s*;/s',$src)
+            ?preg_replace('/public\s+\$offline_message\s*=\s*[\'"].*?[\'"]\s*;/s',"public \$offline_message = '$safeMsg';",$src,1)
+            :preg_replace('/(class\s+JConfig\s*\{)/',"$1\n\tpublic \$offline_message = '$safeMsg';",$src,1);
+        @copy($configPath,$configPath.'.bak_'.time());
+        if(@file_put_contents($configPath,$src)===false){$this->addMsg('Failed to write configuration.php (check file permissions).','danger');return;}
+        $this->addMsg('Offline (maintenance) mode '.($enable?'enabled':'disabled').' for this Joomla site.',$enable?'warning':'success');
+        $this->log('cms_maintenance','joomla '.($enable?'on':'off'));
+    }
+
     /* ── CMS password vault ───────────────────────────────────────────────────
        WordPress/Joomla store passwords as one-way hashes, so they can never be
        read back from the CMS database - not by this tool, not by anyone. The
@@ -4094,6 +4396,14 @@ if(isset($_GET['x'])){
         $id=(int)(isset($_POST['cms_id'])?$_POST['cms_id']:0);
         if(!$id){echo json_encode(['error'=>'Invalid request.']);exit;}
         echo json_encode($fm->cmsLoginAsUser($cfgB64(),$id));exit;
+    }
+    if($xop==='cms_extensions'){
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
+        echo json_encode($fm->cmsExtensions($cfgB64()));exit;
+    }
+    if($xop==='cms_maintenance_status'){
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
+        echo json_encode($fm->cmsMaintenanceStatus($cfgB64()));exit;
     }
     if($xop==='tags'){
         $dir=isset($_GET['dir'])?realpath($_GET['dir']):$fm->getCwd();
@@ -6827,7 +7137,8 @@ async function loadCmsUsers(){
         </div>
         <button class="btn btn-p" id="cmsAddBtn" style="font-size:12px;padding:6px 14px">+ Add User</button>
       </div>
-      <div style="overflow:auto;max-height:50vh">
+      ${cmsTabsBar(d.type,'users')}
+      <div style="overflow:auto;max-height:46vh">
         <table class="log-t" style="width:100%">
           <thead><tr>
             <th style="padding:8px 10px">ID</th><th style="padding:8px 10px">Username</th>
@@ -6841,6 +7152,7 @@ async function loadCmsUsers(){
 
     document.getElementById('cmsBackBtn')?.addEventListener('click',cmsShowPicker);
     document.getElementById('cmsAddBtn')?.addEventListener('click',()=>openCmsAdd());
+    cmsBindTabs();
 
     // Edit (change role / password)
     el.querySelectorAll('.cms-edit-btn').forEach(b=>b.addEventListener('click',()=>{
@@ -6941,6 +7253,170 @@ document.getElementById('cmsEditApply')?.addEventListener('click',async()=>{
   }
   closeMod('cmsEditOv');loadCmsUsers();
 });
+
+/* ── Shared tab bar (Users / Plugins & Themes / Extensions / Maintenance) ── */
+function cmsTabsBar(type,active){
+  const tabs=[['users','Users'],['ext',type==='wordpress'?'Plugins & Themes':'Extensions'],['maint','Maintenance']];
+  return `<div style="display:flex;gap:4px;padding:0 16px;border-bottom:1px solid var(--b2)">
+    ${tabs.map(([k,l])=>`<button class="cms-tab-btn" data-tab="${k}" style="padding:9px 14px;background:none;border:none;border-bottom:2px solid ${active===k?'#818cf8':'transparent'};color:${active===k?'#818cf8':'var(--t3)'};font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;margin-bottom:-1px">${l}</button>`).join('')}
+  </div>`;
+}
+function cmsBindTabs(){
+  document.querySelectorAll('.cms-tab-btn').forEach(b=>b.addEventListener('click',()=>{
+    if(b.dataset.tab==='users')loadCmsUsers();
+    else if(b.dataset.tab==='ext')loadCmsExtensions();
+    else if(b.dataset.tab==='maint')loadCmsMaintenance();
+  }));
+}
+function cmsSiteHeader(label){
+  return `<div style="display:flex;align-items:center;gap:10px;padding:11px 16px;border-bottom:1px solid var(--b2);flex-wrap:wrap">
+    <button class="btn btn-s cms-back-btn" style="font-size:11px">← Back</button>
+    <div style="flex:1;font-size:12px;color:var(--t2)">
+      <strong style="color:var(--t1)">${label}</strong>
+      <span style="color:var(--t3);font-family:monospace;font-size:10.5px;margin-left:6px">${esc(cmsCurrentCfg)}</span>
+    </div>
+  </div>`;
+}
+
+/* ── Plugins & Themes (WordPress) / Extensions (Joomla) ──────────────────── */
+async function loadCmsExtensions(){
+  const el=document.getElementById('cmsBody');
+  el.innerHTML='<div style="text-align:center;padding:32px;color:var(--t3)">Loading…</div>';
+  try{
+    const d=await cmsPost('cms_extensions');
+    if(d.error){
+      el.innerHTML=`<div style="padding:14px 16px;border-bottom:1px solid var(--b2)"><button class="btn btn-s" id="cmsBackBtn2" style="font-size:11px">← Back</button></div><div class="empty" style="padding:32px"><p>${esc(d.error)}</p></div>`;
+      document.getElementById('cmsBackBtn2')?.addEventListener('click',cmsShowPicker);return;
+    }
+    const typeLabel=d.type==='wordpress'?'WordPress':'Joomla';
+    let body='';
+    if(d.type==='wordpress'){
+      const pluginRows=(d.plugins||[]).map(p=>`<tr>
+        <td style="padding:9px 10px;font-weight:600">${esc(p.name)}${p.active?' <span style="color:#4ade80;font-size:10px;font-weight:700;margin-left:4px">ACTIVE</span>':''}</td>
+        <td style="padding:9px 10px;font-size:11.5px;color:var(--t2)">${esc(p.version)}</td>
+        <td style="padding:9px 10px;font-size:11px;color:var(--t3);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(p.description)}">${esc(p.description)}</td>
+        <td style="padding:9px 10px;text-align:right;white-space:nowrap">
+          <button class="btn btn-xs cms-plugin-toggle" data-file="${esc(p.file)}" data-activate="${p.active?'0':'1'}" style="margin-right:4px;font-size:11px">${p.active?'Deactivate':'Activate'}</button>
+          <button class="btn btn-xs btn-red cms-plugin-del" data-file="${esc(p.file)}" data-name="${esc(p.name)}" style="font-size:11px" ${p.active?'disabled title="Deactivate first"':''}>Delete</button>
+        </td></tr>`).join('');
+      const themeRows=(d.themes||[]).map(t=>`<tr>
+        <td style="padding:9px 10px;font-weight:600">${esc(t.name)}${t.active?' <span style="color:#4ade80;font-size:10px;font-weight:700;margin-left:4px">ACTIVE</span>':''}</td>
+        <td style="padding:9px 10px;font-size:11.5px;color:var(--t2)">${esc(t.version)}</td>
+        <td style="padding:9px 10px;text-align:right;white-space:nowrap">
+          <button class="btn btn-xs cms-theme-activate" data-slug="${esc(t.slug)}" style="margin-right:4px;font-size:11px" ${t.active?'disabled':''}>${t.active?'Active':'Activate'}</button>
+          <button class="btn btn-xs btn-red cms-theme-del" data-slug="${esc(t.slug)}" data-name="${esc(t.name)}" style="font-size:11px" ${t.active?'disabled title="Switch theme first"':''}>Delete</button>
+        </td></tr>`).join('');
+      body=`
+        <div style="padding:14px 16px 6px;font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.6px">Plugins (${(d.plugins||[]).length})</div>
+        <div style="overflow:auto;max-height:24vh;margin:0 16px 10px;border:1px solid var(--b2);border-radius:8px">
+          <table class="log-t" style="width:100%">
+            <tbody>${pluginRows||`<tr><td style="padding:18px;text-align:center;color:var(--t3)">No plugins found.</td></tr>`}</tbody>
+          </table>
+        </div>
+        <div style="padding:8px 16px 6px;font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.6px">Themes (${(d.themes||[]).length})</div>
+        <div style="overflow:auto;max-height:20vh;margin:0 16px 16px;border:1px solid var(--b2);border-radius:8px">
+          <table class="log-t" style="width:100%">
+            <tbody>${themeRows||`<tr><td style="padding:18px;text-align:center;color:var(--t3)">No themes found.</td></tr>`}</tbody>
+          </table>
+        </div>`;
+    } else {
+      const groups={};
+      (d.extensions||[]).forEach(x=>{(groups[x.type]=groups[x.type]||[]).push(x);});
+      const typeLabels={component:'Components',module:'Modules',plugin:'Plugins',template:'Templates'};
+      body=Object.keys(typeLabels).map(k=>{
+        const items=groups[k]||[];
+        const rows=items.map(x=>`<tr>
+          <td style="padding:9px 10px;font-weight:600">${esc(x.name)}${x.protected?' <span style="color:var(--t3);font-size:10px" title="Protected core extension">🔒</span>':''}</td>
+          <td style="padding:9px 10px;font-size:11px;color:var(--t3)">${esc(x.client)}</td>
+          <td style="padding:9px 10px">${x.enabled?'<span style="color:#4ade80;font-size:11px;font-weight:700">Enabled</span>':'<span style="color:var(--t3);font-size:11px;font-weight:700">Disabled</span>'}</td>
+          <td style="padding:9px 10px;text-align:right">
+            <button class="btn btn-xs cms-ext-toggle" data-id="${x.id}" data-enable="${x.enabled?'0':'1'}" style="font-size:11px" ${x.protected&&x.enabled?'disabled title="Protected core extension"':''}>${x.enabled?'Disable':'Enable'}</button>
+          </td></tr>`).join('');
+        return `<div style="padding:10px 16px 6px;font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.6px">${typeLabels[k]} (${items.length})</div>
+          <div style="overflow:auto;max-height:18vh;margin:0 16px 12px;border:1px solid var(--b2);border-radius:8px">
+            <table class="log-t" style="width:100%"><tbody>${rows||`<tr><td style="padding:14px;text-align:center;color:var(--t3)">None found.</td></tr>`}</tbody></table>
+          </div>`;
+      }).join('')+`<div style="padding:0 16px 16px;font-size:11px;color:var(--t3);line-height:1.5">Deleting extensions isn't offered here — Joomla's uninstall needs to run each extension's own cleanup SQL. Use "Login as" a Super User and remove it from Joomla's own Extensions Manager instead.</div>`;
+    }
+    el.innerHTML=cmsSiteHeader(typeLabel)+cmsTabsBar(d.type,'ext')+`<div style="overflow:auto;max-height:52vh">${body}</div>`;
+    el.querySelector('.cms-back-btn')?.addEventListener('click',cmsShowPicker);
+    cmsBindTabs();
+
+    /* Mutating operations go through the standard action dispatcher (fetch('') with
+       an "action" field + csrf_token), exactly like the other CMS buttons above —
+       not the "?x=" read-only endpoints, which don't check $_POST['action']. */
+    async function cmsAction(action,extra){
+      const fd=new FormData();
+      fd.append('csrf_token',CSRF);fd.append('action',action);fd.append('config_path_b64',cmsB64(cmsCurrentCfg));
+      if(extra)for(const k in extra)fd.append(k,extra[k]);
+      await fetch('',{method:'POST',body:fd});
+    }
+    el.querySelectorAll('.cms-plugin-toggle').forEach(b=>b.addEventListener('click',async()=>{
+      b.disabled=true;
+      await cmsAction('cms_toggle_plugin',{plugin_file:b.dataset.file,activate:b.dataset.activate}).catch(()=>null);
+      toast('Done.');loadCmsExtensions();
+    }));
+    el.querySelectorAll('.cms-plugin-del').forEach(b=>b.addEventListener('click',async()=>{
+      if(!confirm(`Delete plugin "${b.dataset.name}"? This removes its files permanently.`))return;
+      await cmsAction('cms_delete_plugin',{plugin_file:b.dataset.file}).catch(()=>null);
+      toast('Plugin deleted.');loadCmsExtensions();
+    }));
+    el.querySelectorAll('.cms-theme-activate').forEach(b=>b.addEventListener('click',async()=>{
+      b.disabled=true;
+      await cmsAction('cms_switch_theme',{theme_slug:b.dataset.slug}).catch(()=>null);
+      toast('Theme switched.');loadCmsExtensions();
+    }));
+    el.querySelectorAll('.cms-theme-del').forEach(b=>b.addEventListener('click',async()=>{
+      if(!confirm(`Delete theme "${b.dataset.name}"? This removes its files permanently.`))return;
+      await cmsAction('cms_delete_theme',{theme_slug:b.dataset.slug}).catch(()=>null);
+      toast('Theme deleted.');loadCmsExtensions();
+    }));
+    el.querySelectorAll('.cms-ext-toggle').forEach(b=>b.addEventListener('click',async()=>{
+      b.disabled=true;
+      await cmsAction('cms_toggle_extension',{ext_id:b.dataset.id,enable:b.dataset.enable}).catch(()=>null);
+      toast('Extension updated.');loadCmsExtensions();
+    }));
+  }catch(e){el.innerHTML='<div style="padding:20px;color:#fca5a5">Failed: '+esc(String(e))+'</div>';}
+}
+
+/* ── Maintenance mode ─────────────────────────────────────────────────────── */
+async function loadCmsMaintenance(){
+  const el=document.getElementById('cmsBody');
+  el.innerHTML='<div style="text-align:center;padding:32px;color:var(--t3)">Loading…</div>';
+  try{
+    const d=await cmsPost('cms_maintenance_status');
+    if(d.error){
+      el.innerHTML=`<div style="padding:14px 16px;border-bottom:1px solid var(--b2)"><button class="btn btn-s" id="cmsBackBtn2" style="font-size:11px">← Back</button></div><div class="empty" style="padding:32px"><p>${esc(d.error)}</p></div>`;
+      document.getElementById('cmsBackBtn2')?.addEventListener('click',cmsShowPicker);return;
+    }
+    const typeLabel=d.type==='wordpress'?'WordPress':'Joomla';
+    const statusBadge=d.active
+      ?'<span style="background:rgba(251,146,60,.15);color:#fb923c;padding:3px 12px;border-radius:20px;font-size:11.5px;font-weight:700">Maintenance mode is ON — visitors see the message below</span>'
+      :'<span style="background:rgba(74,222,128,.15);color:#4ade80;padding:3px 12px;border-radius:20px;font-size:11.5px;font-weight:700">Site is live — maintenance mode is OFF</span>';
+    el.innerHTML=cmsSiteHeader(typeLabel)+cmsTabsBar(d.type,'maint')+`
+      <div style="padding:18px 16px">
+        <div style="margin-bottom:16px">${statusBadge}</div>
+        <label class="lbl">Message shown to visitors</label>
+        <textarea id="cmsMaintMsg" class="inp" style="width:100%;min-height:80px;margin-bottom:16px;resize:vertical" placeholder="We are currently performing scheduled maintenance. Please check back soon.">${esc(d.message||'')}</textarea>
+        <div style="display:flex;gap:10px">
+          <button class="btn ${d.active?'btn-s':'btn-p'}" id="cmsMaintOn" style="flex:1" ${d.active?'disabled':''}>Turn Maintenance Mode ON</button>
+          <button class="btn ${d.active?'btn-p':'btn-s'}" id="cmsMaintOff" style="flex:1" ${d.active?'':'disabled'}>Turn Maintenance Mode OFF</button>
+        </div>
+        <div style="margin-top:14px;font-size:11px;color:var(--t3);line-height:1.5">You (logged in as a site admin) can still browse the live site and its admin panel while this is on — only signed-out visitors see the maintenance message.</div>
+      </div>`;
+    el.querySelector('.cms-back-btn')?.addEventListener('click',cmsShowPicker);
+    cmsBindTabs();
+    async function cmsMaintAction(enable){
+      const msg=document.getElementById('cmsMaintMsg').value.trim();
+      const fd=new FormData();
+      fd.append('csrf_token',CSRF);fd.append('action','cms_maintenance_toggle');fd.append('config_path_b64',cmsB64(cmsCurrentCfg));
+      fd.append('enable',enable);fd.append('message',msg);
+      await fetch('',{method:'POST',body:fd});
+    }
+    document.getElementById('cmsMaintOn').addEventListener('click',async()=>{await cmsMaintAction('1');toast('Maintenance mode enabled.');loadCmsMaintenance();});
+    document.getElementById('cmsMaintOff').addEventListener('click',async()=>{await cmsMaintAction('0');toast('Maintenance mode disabled.');loadCmsMaintenance();});
+  }catch(e){el.innerHTML='<div style="padding:20px;color:#fca5a5">Failed: '+esc(String(e))+'</div>';}
+}
 
 /* ═══════════════════════════════════════
    NETWORK SPEED TEST (ping / download / upload)
