@@ -2489,7 +2489,16 @@ class FileManager {
             ."wp_set_current_user(\$__u->ID);\n"
             ."wp_set_auth_cookie(\$__u->ID,true);\n"
             ."do_action('wp_login',\$__u->user_login,\$__u);\n"
-            ."wp_safe_redirect(admin_url());\n"
+            // Redirect to a HOST-RELATIVE path only. admin_url()/wp_safe_redirect()
+            // would rebuild an absolute URL from WordPress's own stored siteurl/home
+            // option, which is frequently stale on multi-domain shared hosting and
+            // does not necessarily match the domain that just successfully served
+            // this bridge file (the one our probe already proved reachable). Using
+            // only the path portion keeps the browser on the exact host/scheme it
+            // used to load this file, so the redirect can never 404 from a
+            // domain mismatch.
+            ."\$__path=wp_parse_url(admin_url(),PHP_URL_PATH)?:'/wp-admin/';\n"
+            ."header('Location: '.\$__path);\n"
             ."exit;\n";
     }
     /* Joomla bridge: boots the Joomla framework and replays the exact same
@@ -2532,7 +2541,16 @@ class FileManager {
             ."  \$db->setQuery(\$q)->execute();\n"
             ."}catch(\\Throwable \$e){}\n"
             ."\$instance->setLastVisit();\n"
-            ."\$app->redirect('index.php');\n";
+            // Redirect with a bare relative path via a raw header, not
+            // $app->redirect(). Joomla's own redirect()/Uri::root() will
+            // rebuild an absolute URL from $live_site in configuration.php
+            // when it's set, which is frequently stale on multi-domain shared
+            // hosting and does not necessarily match the domain that just
+            // successfully served this bridge file (the one our probe already
+            // proved reachable). A bare relative Location keeps the browser on
+            // the exact host/scheme it used to load this file.
+            ."header('Location: index.php');\n"
+            ."exit;\n";
     }
 
     /* ══════════════════════════════════════════════════════════════
