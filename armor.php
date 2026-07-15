@@ -2481,6 +2481,24 @@ class FileManager {
             ."/* One-time File-Manager CMS login bridge. Logs in as an existing user\n"
             ."   without reading or changing their password, then deletes itself. */\n"
             ."if(time()>{$exp}||!isset(\$_GET['t'])||!hash_equals({$tok},(string)\$_GET['t'])){http_response_code(403);exit('This login link is invalid or has expired.');}\n"
+            // Two-step confirm. Messaging apps (WhatsApp/Telegram/Slack/etc.)
+            // and some mail/security scanners fetch a shared link server-side
+            // to build a preview *before* the human ever clicks it. If the
+            // very first GET both consumed the token and deleted this file,
+            // that automated fetch — not the real user — burns the one-time
+            // link, and the human's actual click 404s on a file that's
+            // already gone. So the first GET (no &go=1) only renders a plain
+            // page with a real link the human has to click; nothing is
+            // touched yet, so it's harmless no matter how many times a
+            // preview bot hits it. Only the second GET (&go=1, from an
+            // actual click) deletes the file and logs the user in — bots
+            // essentially never parse HTML and follow a second link just to
+            // build a preview.
+            ."if(!isset(\$_GET['go'])){\n"
+            ."  \$__self=basename(__FILE__).'?t='.rawurlencode((string)\$_GET['t']).'&go=1';\n"
+            ."  echo '<!doctype html><meta name=\"robots\" content=\"noindex\"><body style=\"font-family:sans-serif;text-align:center;margin-top:15vh\"><p>Click to continue to the dashboard.</p><p><a href=\"'.htmlspecialchars(\$__self,ENT_QUOTES).'\" style=\"padding:10px 20px;background:#2271b1;color:#fff;border-radius:4px;text-decoration:none\">Continue</a></p></body>';\n"
+            ."  exit;\n"
+            ."}\n"
             ."@unlink(__FILE__);\n"
             // Buffer everything from here on. Loading WordPress (deprecation
             // notices from old plugins/themes, a stray BOM/whitespace in a
