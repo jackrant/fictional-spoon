@@ -2482,10 +2482,22 @@ class FileManager {
             ."   without reading or changing their password, then deletes itself. */\n"
             ."if(time()>{$exp}||!isset(\$_GET['t'])||!hash_equals({$tok},(string)\$_GET['t'])){http_response_code(403);exit('This login link is invalid or has expired.');}\n"
             ."@unlink(__FILE__);\n"
+            // Buffer everything from here on. Loading WordPress (deprecation
+            // notices from old plugins/themes, a stray BOM/whitespace in a
+            // wp-config.php some host support team hand-edited, etc.) or
+            // firing the wp_login hook (arbitrary third-party plugin
+            // callbacks) can print bytes to the browser before we ever get
+            // to header(). If that happens, header() silently fails and the
+            // visitor is stuck staring at this raw bridge file's leaked
+            // output instead of being redirected — the "weird page" that
+            // isn't part of the real site. Buffering lets us always discard
+            // that noise and either send a real redirect or fall back to an
+            // HTML/JS redirect, so the visitor never sees this file's guts.
+            ."ob_start();\n"
             ."require __DIR__.'/wp-load.php';\n"
-            ."if(!function_exists('wp_set_auth_cookie')){exit('WordPress failed to load.');}\n"
+            ."if(!function_exists('wp_set_auth_cookie')){while(ob_get_level())ob_end_clean();exit('WordPress failed to load.');}\n"
             ."\$__u=get_userdata({$uid});\n"
-            ."if(!\$__u){exit('User not found.');}\n"
+            ."if(!\$__u){while(ob_get_level())ob_end_clean();exit('User not found.');}\n"
             ."wp_set_current_user(\$__u->ID);\n"
             ."wp_set_auth_cookie(\$__u->ID,true);\n"
             ."do_action('wp_login',\$__u->user_login,\$__u);\n"
@@ -2498,7 +2510,10 @@ class FileManager {
             // used to load this file, so the redirect can never 404 from a
             // domain mismatch.
             ."\$__path=wp_parse_url(admin_url(),PHP_URL_PATH)?:'/wp-admin/';\n"
-            ."header('Location: '.\$__path);\n"
+            ."while(ob_get_level())ob_end_clean();\n"
+            ."if(!headers_sent()){header('Location: '.\$__path);exit;}\n"
+            ."\$__esc=htmlspecialchars(\$__path,ENT_QUOTES);\n"
+            ."echo '<!doctype html><meta http-equiv=\"refresh\" content=\"0;url='.\$__esc.'\"><script>location.replace('.json_encode(\$__path).');</script><a href=\"'.\$__esc.'\">Continue</a>';\n"
             ."exit;\n";
     }
     /* Joomla bridge: boots the Joomla framework and replays the exact same
