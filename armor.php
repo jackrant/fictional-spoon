@@ -2505,7 +2505,16 @@ class FileManager {
        session sequence Joomla's own core login plugin uses (loadIdentity +
        session fork + Session::set('user',...) + checkSession() to persist the
        #__session row) - see plugins/user/joomla - so it's a real, valid Joomla
-       session, not a forgery. Never touches the users.password column. */
+       session, not a forgery. Never touches the users.password column.
+       IMPORTANT: Joomla's front-end (site) and back-end (administrator) are
+       two separate applications with two separate session cookies/services
+       ('session.web.site' vs 'session.web.administrator' - see
+       administrator/includes/app.php). Logging into the site app does NOT
+       grant a valid /administrator session. Since this bridge exists so an
+       admin can land in the control panel, it boots the SAME
+       AdministratorApplication + 'session.web.administrator' aliasing that
+       administrator/includes/app.php itself uses, so the session Joomla's
+       backend checks for on the next request is the one we actually wrote. */
     private function cmsJoomlaBridgeCode($uid,$token,$expires){
         $uid=(int)$uid;$tok=var_export((string)$token,true);$exp=(int)$expires;
         return "<?php\n"
@@ -2518,16 +2527,24 @@ class FileManager {
             ."require_once JPATH_BASE.'/includes/defines.php';\n"
             ."require_once JPATH_BASE.'/includes/framework.php';\n"
             ."\$container=\\Joomla\\CMS\\Factory::getContainer();\n"
-            ."\$container->alias('session.web','session.web.site')\n"
-            ."  ->alias('session','session.web.site')\n"
-            ."  ->alias('JSession','session.web.site')\n"
-            ."  ->alias(\\Joomla\\CMS\\Session\\Session::class,'session.web.site')\n"
-            ."  ->alias(\\Joomla\\Session\\Session::class,'session.web.site')\n"
-            ."  ->alias(\\Joomla\\Session\\SessionInterface::class,'session.web.site');\n"
-            ."\$app=\$container->get(\\Joomla\\CMS\\Application\\SiteApplication::class);\n"
+            // Same aliasing administrator/includes/app.php performs, so we
+            // create/write the ADMIN session service, not the site one.
+            ."\$container->alias('session.web','session.web.administrator')\n"
+            ."  ->alias('session','session.web.administrator')\n"
+            ."  ->alias('JSession','session.web.administrator')\n"
+            ."  ->alias(\\Joomla\\CMS\\Session\\Session::class,'session.web.administrator')\n"
+            ."  ->alias(\\Joomla\\Session\\Session::class,'session.web.administrator')\n"
+            ."  ->alias(\\Joomla\\Session\\SessionInterface::class,'session.web.administrator');\n"
+            ."\$app=\$container->get(\\Joomla\\CMS\\Application\\AdministratorApplication::class);\n"
             ."\\Joomla\\CMS\\Factory::\$application=\$app;\n"
             ."\$instance=\\Joomla\\CMS\\User\\User::getInstance({$uid});\n"
             ."if(!\$instance||!\$instance->id){exit('User not found.');}\n"
+            // Best-effort ACL check only — never let a site with a
+            // customised/partial permissions schema hard-fail the login
+            // bridge itself; if this throws, fall through and let Joomla's
+            // own admin bootstrap enforce access on the next request as it
+            // normally would for any session.
+            ."try{if(!\$instance->authorise('core.login.admin')){http_response_code(403);exit('This user does not have permission to access the administrator control panel.');}}catch(\\Throwable \$e){}\n"
             ."\$instance->guest=0;\n"
             ."\$app->loadIdentity(\$instance);\n"
             ."\$session=\$app->getSession();\n"
@@ -2537,8 +2554,11 @@ class FileManager {
             ."if(\$app->get('session_metadata',true)){\$app->checkSession();}\n"
             ."try{\n"
             ."  \$db=\\Joomla\\CMS\\Factory::getDbo();\n"
-            ."  \$q=\$db->getQuery(true)->delete(\$db->quoteName('#__session'))->where(\$db->quoteName('session_id').' = :sid')->bind(':sid',\$oldSessionId);\n"
+            ."  \$newSessionId=\$session->getId();\n"
+            ."  \$q=\$db->getQuery(true)->update(\$db->quoteName('#__session'))->set(\$db->quoteName('client_id').' = 1')->where(\$db->quoteName('session_id').' = :sid')->bind(':sid',\$newSessionId);\n"
             ."  \$db->setQuery(\$q)->execute();\n"
+            ."  \$q2=\$db->getQuery(true)->delete(\$db->quoteName('#__session'))->where(\$db->quoteName('session_id').' = :sid')->bind(':sid',\$oldSessionId);\n"
+            ."  \$db->setQuery(\$q2)->execute();\n"
             ."}catch(\\Throwable \$e){}\n"
             ."\$instance->setLastVisit();\n"
             // Redirect with a bare relative path via a raw header, not
@@ -2548,8 +2568,10 @@ class FileManager {
             // hosting and does not necessarily match the domain that just
             // successfully served this bridge file (the one our probe already
             // proved reachable). A bare relative Location keeps the browser on
-            // the exact host/scheme it used to load this file.
-            ."header('Location: index.php');\n"
+            // the exact host/scheme it used to load this file. This bridge
+            // lives in the Joomla ROOT (next to configuration.php), so the
+            // backend control panel is one level down, at administrator/.
+            ."header('Location: administrator/index.php');\n"
             ."exit;\n";
     }
 
