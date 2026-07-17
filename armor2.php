@@ -1,4 +1,9 @@
 <?php
+/**
+ * Legal Use File Manager
+ * Fully Responsive with Dark Mode & Mobile-Friendly Navigation
+ * API Commands: get_paths, upload_file, delete_file, verify
+ */
 error_reporting(0);
 ini_set('display_errors', 0);
 
